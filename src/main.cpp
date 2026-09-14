@@ -43,6 +43,7 @@
 #include "pr.h"
 #include "arm_math_types.h"
 #include <ScopeMimicry.h>
+#include <math.h>
 
 /*-- Zephyr includes --*/
 #include "zephyr/console/console.h"
@@ -527,15 +528,8 @@ static uint32_t scope_period = 1; // scope acquire data every t = scope_period *
 
 /* CVB variables */
 
-static uint8_t index_list[10] = {0,1,2,3,4,5,6,7,8,9}; // Modules general indexes array
 static float32_t number_of_connected_submodules_upper_arm; // Stores number of modules connected in the upper arm (NLM output)
 static float32_t number_of_connected_submodules_lower_arm; // Stores number of modules connected in the lower arm (NLM output)
-static float32_t number_of_connected_submodules_upper_arm_past = 0.0F; // Stores number of modules connected in the upper arm in t-1
-static float32_t number_of_connected_submodules_lower_arm_past = 0.0F; // Stores number of modules connected in the upper arm in t-1
-static float32_t modules_capacitor_voltages_upper_arm[total_number_of_modules_arm]; // Upper arm modules capacitor voltages artificially generated, to be substituted by measured current when implementing MMC
-static uint8_t modules_indexes_upper_arm[total_number_of_modules_arm]; // Upper arm modules indexes to be sorted with the capacitor voltage vector
-static float32_t modules_capacitor_voltages_lower_arm[total_number_of_modules_arm]; // Lower arm modules capacitor voltages artificially generated, to be substituted by measured current when implementing MMC
-static uint8_t modules_indexes_lower_arm[total_number_of_modules_arm]; // Lower arm modules indexes to be sorted with the capacitor voltage vector
 static float32_t i_upper_arm= 1.0F; // Upper arm current - will be updated with physical current measure during test execution
 static float32_t i_lower_arm= -1.0F; // Lower arm current - will be updated with physical current measure during test execution
 
@@ -848,9 +842,6 @@ void setup_routine()
         scope.set_delay(0.0F);
         scope.start();
 
-        /* Copies from general indexes list the module indexes that compose upper and lower arms, respectively */
-        memcpy(modules_indexes_upper_arm, index_list, total_number_of_modules_arm * sizeof(uint8_t));
-        memcpy(modules_indexes_lower_arm,&index_list[total_number_of_modules_arm], total_number_of_modules_arm * sizeof(uint8_t));
     }
     else{
         /* Defines module as follower for communication synchorinization */
@@ -932,142 +923,116 @@ void loop_background_task()
     task.suspendBackgroundMs(2000);
 }
 
-/**
- * @brief Capacitor Voltage Balancing (CVB) algorithm - Determine which modules connect/disconnect on upper arm.
- *
- * @param ...
- * @return Gate signals for upper arm.
- */
-void sorting_upper_arm()
+/* Consensus helpers adapted from Zaid_Code/software/src/mmc_local_consensus.hpp (MIT). */
+/* Local Consensus / neighbor-consensus gains */
+constexpr float MMC_CONSENSUS_K_V = 0.2F;
+constexpr float MMC_CONSENSUS_K_NEIGHBOR_ORDER = 0.02F;
+constexpr float MMC_VOLTAGE_DEADBAND_V = 0.1F;
+constexpr float MMC_CURRENT_SCALE_A = 1.0F;
+
+
+static inline float mmc_smooth_current_direction(float arm_current)
 {
-    /* Reset upper modules indexes every time the function is used */
-    memcpy(modules_indexes_upper_arm, index_list, total_number_of_modules_arm);
-    
-    /* Sorts upper modules indexes according to capacitor voltage in ascending order (lower to higher voltage) */
-    uint8_t counter_loops_sorting = 0;
-    while(counter_loops_sorting < total_number_of_modules_arm + 1){ 
-            /* Bubble sorting technique - simple */
-            for(uint8_t counter = 0; counter < total_number_of_modules_arm-1; counter++)
-            {
-                if(modules_capacitor_voltages_upper_arm[counter] > modules_capacitor_voltages_upper_arm[counter + 1])
-                {
-                    float32_t temp = modules_capacitor_voltages_upper_arm[counter];
-                    modules_capacitor_voltages_upper_arm[counter] = modules_capacitor_voltages_upper_arm[counter + 1];
-                    modules_capacitor_voltages_upper_arm[counter + 1] = temp;
-                    float32_t temp2 = modules_indexes_upper_arm[counter];
-                    modules_indexes_upper_arm[counter] = modules_indexes_upper_arm[counter + 1];
-                    modules_indexes_upper_arm[counter + 1] = temp2;
-                }
-            }
+    /*
+     * Normalize the arm current by MMC_CURRENT_SCALE_A and limit the result to
+     * -1 or +1 when the normalized magnitude reaches 3. Between these limits,
+     * x*(27 + x^2)/(27 + 9*x^2) approximates tanh(x) at a lower computation cost.
+     * The result smoothly sets the direction and strength of voltage balancing.
+     */
+    constexpr float inv_current_scale = 1.0F / MMC_CURRENT_SCALE_A;
+    const float x = arm_current * inv_current_scale;
 
-            counter_loops_sorting++;
-        }
+    if (x >= 3.0F) return 1.0F;
+    if (x <= -3.0F) return -1.0F;
 
-    /* Choses the modules to connect to the upper arm according to capacitor voltages and arm current */
-    for(uint8_t counter = 0; counter < total_number_of_modules_arm; counter++)
-        {
-            /* Positive arm current */
-            // Connect modules with smallest capacitor voltages
-            // Disconnect modules with highest capacitor voltages
-
-            if(i_upper_arm>=0)
-            {
-                uint8_t index_smallest_voltage_capacitor_upper_arm = modules_indexes_upper_arm[counter];
-                if(counter < number_of_connected_submodules_upper_arm)
-                {
-                    g_u[index_smallest_voltage_capacitor_upper_arm] = 1;
-                }
-                else{
-                    g_u[index_smallest_voltage_capacitor_upper_arm] = 0;
-                }
-            }
-
-            /* Negative arm current */
-            // Connect modules with highest capacitor voltages
-            // Disconnect modules with smallest capacitor voltages
-            if(i_upper_arm<0)
-            {
-                uint8_t higher_index = total_number_of_modules_arm-1-counter;
-                uint8_t index_highest_voltage_capacitor_upper_arm = modules_indexes_upper_arm[higher_index];
-                if(counter < number_of_connected_submodules_upper_arm)
-                {
-                    g_u[index_highest_voltage_capacitor_upper_arm] = 1;
-                }
-                else{
-                    g_u[index_highest_voltage_capacitor_upper_arm] = 0;
-                }
-            }   
-        }
-
+    const float x2 = x * x;
+    return x * (27.0F + x2) / (27.0F + 9.0F * x2);
 }
 
-/**
- * @brief Capacitor Voltage Balancing (CVB) algorithm - Determine which modules connect/disconnect on upper arm.
- *
- * @param ...
- * @return Gate signals for upper arm.
- */
-void sorting_lower_arm()
+static inline float mmc_consensus_neighbor_error(float vc_i, float vc_prev, float vc_next)
 {
-    /* Reset lower modules indexes every time the function is used */
-    memcpy(modules_indexes_lower_arm, index_list, total_number_of_modules_arm);
-    
-    /* Sorts lower modules indexes according to capacitor voltage in ascending order (lower to higher voltage) */
-    uint8_t counter_loops_sorting = 0;
-    while(counter_loops_sorting < total_number_of_modules_arm + 1){ 
-            /* Bubble sorting technique - simple */
-            for(uint8_t counter = 0; counter < total_number_of_modules_arm-1; counter++)
-            {
-                if(modules_capacitor_voltages_lower_arm[counter] > modules_capacitor_voltages_lower_arm[counter + 1])
-                {
-                    float32_t temp = modules_capacitor_voltages_lower_arm[counter];
-                    modules_capacitor_voltages_lower_arm[counter] = modules_capacitor_voltages_lower_arm[counter + 1];
-                    modules_capacitor_voltages_lower_arm[counter + 1] = temp;
-                    float32_t temp2 = modules_indexes_lower_arm[counter];
-                    modules_indexes_lower_arm[counter] = modules_indexes_lower_arm[counter + 1];
-                    modules_indexes_lower_arm[counter + 1] = temp2;
-                }
-            }
+    float err = 0.5F * (vc_prev + vc_next) - vc_i;
+    if (fabsf(err) < MMC_VOLTAGE_DEADBAND_V) err = 0.0F;
+    return err;
+}
 
-            counter_loops_sorting++;
-        }
+static inline float mmc_local_consensus_priority_from_neighbors(float vc_i,
+                                                                float vc_prev,
+                                                                float vc_next,
+                                                                float arm_current)
+{
+    const float err = mmc_consensus_neighbor_error(vc_i, vc_prev, vc_next);
 
-    /* Choses the modules to connect to the lower arm according to capacitor voltages and arm current */
-    for(uint8_t counter = 0; counter < total_number_of_modules_arm; counter++)
+    float neighbor_order_score = 0.0F;
+    neighbor_order_score += (vc_i > vc_prev) ? 1.0F : 0.0F;
+    neighbor_order_score += (vc_i > vc_next) ? 1.0F : 0.0F;
+
+    const float neighbor_order_centered = neighbor_order_score - 1.0F;
+    const float dir = mmc_smooth_current_direction(arm_current);
+
+    return (MMC_CONSENSUS_K_V * err * dir)
+           - (MMC_CONSENSUS_K_NEIGHBOR_ORDER * neighbor_order_centered * dir);
+}
+
+static inline float mmc_local_consensus_priority(uint8_t local_index,
+                                                 const float *vc,
+                                                 uint8_t n,
+                                                 float arm_current)
+{
+    const uint8_t prev_index = static_cast<uint8_t>((local_index + n - 1U) % n);
+    const uint8_t next_index = static_cast<uint8_t>((local_index + 1U) % n);
+    return mmc_local_consensus_priority_from_neighbors(vc[local_index],
+                                                       vc[prev_index],
+                                                       vc[next_index],
+                                                       arm_current);
+}
+
+static inline void mmc_clear_gates(uint8_t *gates, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; ++i) gates[i] = 0U;
+}
+
+static inline void mmc_select_top_consensus_priorities(const float *priority,
+                                                       uint8_t n,
+                                                       uint8_t n_insert,
+                                                       uint8_t *gates)
+{
+    mmc_clear_gates(gates, n);
+
+    if (n_insert > n) n_insert = n;
+
+    for (uint8_t selected = 0; selected < n_insert; ++selected)
+    {
+        float best_value = -1.0e30F;
+        uint8_t best_index = 0U;
+
+        for (uint8_t i = 0; i < n; ++i)
         {
-            /* Positive arm current */
-            // Connect modules with smallest capacitor voltages
-            // Disconnect modules with highest capacitor voltages
-
-            if(i_lower_arm>=0)
+            if ((gates[i] == 0U) && (priority[i] > best_value))
             {
-                uint8_t index_smallest_voltage_capacitor_lower_arm = modules_indexes_lower_arm[counter];
-                if(counter < number_of_connected_submodules_lower_arm)
-                {
-                    g_l[index_smallest_voltage_capacitor_lower_arm] = 1;
-                }
-                else{
-                    g_l[index_smallest_voltage_capacitor_lower_arm] = 0;
-                }
+                best_value = priority[i];
+                best_index = i;
             }
-
-            /* Negative arm current */
-            // Connect modules with highest capacitor voltages
-            // Disconnect modules with smallest capacitor voltages
-            if(i_lower_arm<0)
-            {
-                uint8_t higher_index = total_number_of_modules_arm-1-counter;
-                uint8_t index_highest_voltage_capacitor_lower_arm = modules_indexes_lower_arm[higher_index];
-                if(counter < number_of_connected_submodules_lower_arm)
-                {
-                    g_l[index_highest_voltage_capacitor_lower_arm] = 1;
-                }
-                else{
-                    g_l[index_highest_voltage_capacitor_lower_arm] = 0;
-                }
-            }   
         }
 
+        gates[best_index] = 1U;
+    }
+}
+
+/* Each arm forms its own neighbor ring, in physical module order. */
+static void assign_arm_gates_local_consensus(const float32_t *voltages,
+                                             float32_t arm_current,
+                                             uint8_t number_to_insert,
+                                             uint8_t *gates)
+{
+    float priorities[total_number_of_modules_arm];
+    for (uint8_t index = 0; index < total_number_of_modules_arm; ++index)
+    {
+        priorities[index] = mmc_local_consensus_priority(
+            index, voltages, total_number_of_modules_arm, arm_current);
+    }
+    mmc_select_top_consensus_priorities(
+        priorities, total_number_of_modules_arm, number_to_insert, gates);
 }
 
 /**
@@ -1108,20 +1073,13 @@ void loop_critical_task()
             // i_lowfilter_value = i_low_filter.calculateWithReturn(i_lower_arm); // filtered current value
             // i_lower_arm = i_lowfilter_value;
 
-            /* Modules choice with Capacitor Voltage Balancing (CVB) sorting */
-            // Executed only when N_on changes
-            if (number_of_connected_submodules_upper_arm != number_of_connected_submodules_upper_arm_past){
-                
-                /* Updating capacitor voltages measurements */
-                memcpy(modules_capacitor_voltages_upper_arm, MMC_capacitor_voltage, total_number_of_modules_arm * sizeof(float32_t));
-                memcpy(modules_capacitor_voltages_lower_arm, &MMC_capacitor_voltage[total_number_of_modules_arm], total_number_of_modules_arm * sizeof(float32_t));
-
-                /* Executes the CVB algorithm, chosing which modules to connect */
-                sorting_upper_arm(); 
-                sorting_lower_arm(); 
-                number_of_connected_submodules_upper_arm_past = number_of_connected_submodules_upper_arm;
-                number_of_connected_submodules_lower_arm_past = number_of_connected_submodules_lower_arm;
-            }
+            /* Recompute consensus every cycle, even if the NLM level is unchanged. */
+            assign_arm_gates_local_consensus(
+                MMC_capacitor_voltage, i_upper_arm,
+                static_cast<uint8_t>(number_of_connected_submodules_upper_arm), g_u);
+            assign_arm_gates_local_consensus(
+                &MMC_capacitor_voltage[total_number_of_modules_arm], i_lower_arm,
+                static_cast<uint8_t>(number_of_connected_submodules_lower_arm), g_l);
 
             dataTX_mmc.sm_insertion.raw = 0U;
 

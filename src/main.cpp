@@ -18,7 +18,7 @@
  */
 
 /**
- * @brief  Distributed MMC voltage balancing. SM1 computes the insertion counts.
+ * @brief  Distributed MMC voltage balancing. SM1 broadcasts the sine reference.
  *         This research was funded in whole by the French National Research Agency (ANR) under the project CARROTS "ANR-24-CE05-0920-01".
  *
  * @author Ayoub Farah Hassan <ayoub.farah-hassan@laas.fr>
@@ -135,6 +135,24 @@ constexpr float32_t Cap_voltage_SCALE = Vcap_expected*2; //[V] Scale for 12-bit 
 constexpr float32_t Arm_current_SCALE = i_expected*2; //[A] Scale for 12-bit current measurements
 constexpr float32_t Arm_current_OFFSET = i_expected; //[A] Offset for signed current measurements
 
+// Signed transport of sin(angle), without the modulation amplitude m.
+// -32768 is reserved as invalid; all boards decode the same quantized reference.
+constexpr int16_t MMC_SINE_REFERENCE_MAX = 32767;
+constexpr int16_t MMC_SINE_REFERENCE_INVALID = -32768;
+
+static inline int16_t mmc_encode_sine_reference(float32_t sine)
+{
+    if (!isfinite(sine)) return MMC_SINE_REFERENCE_INVALID;
+    if (sine >= 1.0F) return MMC_SINE_REFERENCE_MAX;
+    if (sine <= -1.0F) return -MMC_SINE_REFERENCE_MAX;
+    return static_cast<int16_t>(roundf(sine * MMC_SINE_REFERENCE_MAX));
+}
+
+static inline float32_t mmc_decode_sine_reference(int16_t raw)
+{
+    return static_cast<float32_t>(raw) / MMC_SINE_REFERENCE_MAX;
+}
+
 /**
  * @brief Encode an capacitor voltage into the 12-bit transport format.
  *
@@ -217,17 +235,17 @@ void loop_communication_task();
 
 /* --------------USER VARIABLES DECLARATIONS------------------- */
 
-// Only known boards can participate; SM1 also computes the insertion counts.
+// Only known boards can participate; SM1 generates the common sine reference.
 uint8_t module_ID = detect_module_id();
 static uint8_t module_command = 0;
 static bool power_requested = false; // SM1: a new 'p' is required after every fault.
 static volatile char requested_command = 0; // Console publishes; control consumes.
 
-// One frame per module. Only SM1's insertion counts are used as a command.
+// One frame per module. Only SM1's sine reference is used as a command.
+// The first two bytes replace the old insertion counts: update all boards together.
 struct MMC_frame_t
 {
-    uint8_t n_insert_upper;
-    uint8_t n_insert_lower;
+    int16_t sine_reference_raw;
     uint16_t cycle_id;
     uint16_t capacitor_voltage_raw : 12;
     uint16_t arm_current_raw : 12;
@@ -303,13 +321,36 @@ static float32_t i_lower_arm= -1.0F; // Lower arm current - will be updated with
 uint8_t g_u[total_number_of_modules_arm]; // Gate signals to send to the upper modules
 uint8_t g_l[total_number_of_modules_arm]; // Gate signals to send to the lower modules
 /* NLM */
-static float32_t m = 1; // Modulation amplitude
-static float32_t a = 1; // Modulation dc part
+static float32_t m = 1; // Modulation amplitude: identical on every board
+static float32_t a = 1; // Modulation dc part: identical on every board
 static float32_t angle;
 static const float w0 = 2 * PI * f0; // Angular frequency
 
 static float32_t modulation_signal_upper; //[pu] Modulation output upper voltage
 static float32_t modulation_signal_lower; //[pu] Modulation output lower voltage
+
+// NLM runs on every board, including SM1, using the completed round's reference.
+static bool mmc_compute_insertion_counts(int16_t sine_reference_raw,
+                                         uint8_t &n_insert_upper,
+                                         uint8_t &n_insert_lower)
+{
+    if (sine_reference_raw == MMC_SINE_REFERENCE_INVALID) return false;
+
+    const float32_t sine = mmc_decode_sine_reference(sine_reference_raw);
+    modulation_signal_upper = (a + m * sine) / 2.0F;
+    modulation_signal_lower = (a - m * sine) / 2.0F;
+    const float32_t upper = roundf(total_number_of_modules_arm * modulation_signal_upper);
+    const float32_t lower = roundf(total_number_of_modules_arm * modulation_signal_lower);
+    // Preserve the insertion-count bounds check after moving NLM off the sender.
+    // This form also rejects non-finite results before converting them to uint8_t.
+    if (!(upper >= 0.0F && upper <= total_number_of_modules_arm &&
+          lower >= 0.0F && lower <= total_number_of_modules_arm))
+        return false;
+
+    n_insert_upper = static_cast<uint8_t>(upper);
+    n_insert_lower = static_cast<uint8_t>(lower);
+    return true;
+}
 
 /* --------------SETUP FUNCTIONS------------------------------- */
 
@@ -394,8 +435,7 @@ static bool begin_cycle(const MMC_frame_t &frame)
     }
     if (frame.status == IDLE)
         communication_fault = 0; // SM1 has cancelled POWER; prepare a fresh acquisition.
-    if (frame.status > POWER || frame.n_insert_upper > total_number_of_modules_arm ||
-        frame.n_insert_lower > total_number_of_modules_arm)
+    if (frame.status > POWER || frame.sine_reference_raw == MMC_SINE_REFERENCE_INVALID)
         communication_fault = COMMUNICATION_ERROR;
 
     cycle_command = frame;
@@ -766,22 +806,32 @@ void loop_critical_task()
     // A POWER request first collects a round; PWM starts at the following tick.
     mode = round_complete && cycle_command.status == POWER && !communication_fault &&
            (module_ID != MMC_SM1 || power_requested) ? POWERMODE : IDLEMODE;
+    uint8_t n_insert_upper = 0;
+    uint8_t n_insert_lower = 0;
+    if (mode == POWERMODE &&
+        !mmc_compute_insertion_counts(cycle_command.sine_reference_raw,
+                                     n_insert_upper, n_insert_lower))
+    {
+        communication_fault = COMMUNICATION_ERROR;
+        power_requested = false;
+        mode = IDLEMODE;
+    }
     if (mode == POWERMODE)
     {
         i_upper_arm = MMC_arm_current[0] - 0.8F;
         i_lower_arm = MMC_arm_current[5] + 0.19F;
-        number_of_connected_submodules_upper_arm = cycle_command.n_insert_upper;
-        number_of_connected_submodules_lower_arm = cycle_command.n_insert_lower;
+        number_of_connected_submodules_upper_arm = n_insert_upper;
+        number_of_connected_submodules_lower_arm = n_insert_lower;
         if (mmc_is_upper_arm_module(module_ID))
         {
             assign_arm_gates_local_consensus(MMC_capacitor_voltage, i_upper_arm,
-                cycle_command.n_insert_upper, g_u);
+                n_insert_upper, g_u);
             module_command = g_u[module_ID - MMC_SM1];
         }
         else
         {
             assign_arm_gates_local_consensus(&MMC_capacitor_voltage[total_number_of_modules_arm],
-                i_lower_arm, cycle_command.n_insert_lower, g_l);
+                i_lower_arm, n_insert_lower, g_l);
             module_command = g_l[module_ID - MMC_SM6];
         }
         if (module_ID == MMC_SM1)
@@ -804,10 +854,7 @@ void loop_critical_task()
         if (power_requested)
         {
             angle = ot_modulo_2pi(angle + w0 * Ts);
-            modulation_signal_upper = (a + m * ot_sin(angle)) / 2.0F;
-            modulation_signal_lower = (a - m * ot_sin(angle)) / 2.0F;
-            next_command.n_insert_upper = static_cast<uint8_t>(round(total_number_of_modules_arm * modulation_signal_upper));
-            next_command.n_insert_lower = static_cast<uint8_t>(round(total_number_of_modules_arm * modulation_signal_lower));
+            next_command.sine_reference_raw = mmc_encode_sine_reference(ot_sin(angle));
             next_command.status = POWER;
         }
         else angle = 0.0F;
@@ -841,8 +888,7 @@ void loop_critical_task()
         if (communication_fault)
         {
             next_command.status = IDLE;
-            next_command.n_insert_upper = 0;
-            next_command.n_insert_lower = 0;
+            next_command.sine_reference_raw = 0;
         }
         if (begin_cycle(next_command)) send_own_measurements();
     }

@@ -1,0 +1,269 @@
+// Source de référence : ../src/main.cpp. Documentation uniquement.
+// Rendu depuis la racine : dot -Tsvg docs/main_control.dot -o docs/main_control.svg
+// Les appels aux helpers RS485 sont condensés ; leurs règles sont dans main_control.md.
+digraph main_control {
+    graph [
+        label="main.cpp — contrôle distribué du MMC\n10 modules · 2 bras de 5 · période de contrôle : 200 µs",
+        labelloc=t, labeljust=l, fontname="Arial", fontsize=22,
+        rankdir=TB, compound=true, newrank=true,
+        nodesep=0.35, ranksep=0.55, pad=0.3, bgcolor="white"
+    ];
+    node [shape=box, style="rounded,filled", fillcolor="#F1F5F9",
+          color="#64748B", fontname="Arial", fontsize=11, margin="0.14,0.10"];
+    edge [color="#475569", fontname="Arial", fontsize=10, arrowsize=0.7];
+
+    legend [shape=note, fillcolor="#FFFFFF", label="LECTURE\lRectangle : action ou appel de fonction\lLosange : décision (branches étiquetées)\lTrait plein : exécution, appel ou retour\lPointillés : activation, événement ou données partagées\lOrange + SM1 : action réservée au maître\lRouge : signalement de défaut / arrêt\lLes tâches et la réception sont des chemins distincts.\l"];
+
+    subgraph cluster_startup {
+        label="1 · Démarrage";
+        color="#94A3B8"; style=rounded; fontname="Arial"; fontsize=16;
+
+        s_uid [label="Initialisation globale\nmodule_ID = detect_module_id()\nread_board_uid() → SM1…SM10, sinon 0"];
+        s_main [label="main() → setup_routine()\nAfficher UID et module_ID"];
+        s_known [shape=diamond, style=filled, fillcolor="#FFFFFF", label="1 ≤ module_ID ≤ 10 ?"];
+        s_unknown [fillcolor="#FEE2E2", label="Carte inconnue\nRetour sans initialiser contrôle ni RS485"];
+        s_hw [label="config_led_LL(); shield.power.initBuck(ALL)\nCréer tâches de fond et critique (200 µs)\nActiver capteurs ; calibrations SM1 / SM6\nDéconnecter condensateurs LEG1 / LEG2\nBornes de rapport cyclique : 0 et 1"];
+        s_background [label="Démarrer loop_background_task\nCréer et démarrer loop_communication_task"];
+        s_rs485 [label="communication.rs485.configure(...)\nbuffer_tx / buffer_rx, reception_function, SPEED_20M"];
+        s_role [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        s_master [fillcolor="#FFEDD5", label="SM1 : communication.sync.initMaster()\nScope : 14 canaux, a_trigger(), délai 0\nscope.start()"];
+        s_slave [label="SM2…SM10\ncommunication.sync.initSlave()"];
+        s_start [label="task.startCritical()"];
+        s_return [label="Retour de setup_routine(), puis main() retourne 0\nSi carte reconnue : les tâches poursuivent l'exécution"];
+
+        s_uid -> s_main -> s_known;
+        s_known -> s_hw [label="oui"];
+        s_known -> s_unknown [label="non"];
+        s_unknown -> s_return;
+        s_hw -> s_background -> s_rs485 -> s_role;
+        s_role -> s_master [label="oui"];
+        s_role -> s_slave [label="non"];
+        s_master -> s_start;
+        s_slave -> s_start;
+        s_start -> s_return;
+    }
+
+    subgraph cluster_control {
+        label="2 · loop_critical_task() — un appel toutes les 200 µs";
+        color="#60A5FA"; style=rounded; fontname="Arial"; fontsize=16;
+
+        c_tick [fillcolor="#DBEAFE", label="Tick de contrôle\nConsommer le tour k ; préparer le tour k+1"];
+        c_measure [label="update_measurements()\nCap_voltage ← V_HIGH ; Arm_current ← -I1_LOW\nNO_VALUE : conserver la dernière valeur"];
+        c_round [label="round_complete = (received_module_count == 10)"];
+        c_missing [shape=diamond, style=filled, fillcolor="#FFFFFF", label="cycle_started\n&& !round_complete ?"];
+        c_round_fault [fillcolor="#FEE2E2", label="communication_fault = COMMUNICATION_ERROR"];
+        c_read [label="request = requested_command\nrequested_command = 0"];
+        c_request_i [shape=diamond, style=filled, fillcolor="#FFFFFF", label="request == 'i' ?"];
+        c_i [label="power_requested = false\nSi esclave : communication_fault = COMMUNICATION_ERROR"];
+        c_has_fault [shape=diamond, style=filled, fillcolor="#FFFFFF", label="communication_fault != 0 ?"];
+        c_cancel [fillcolor="#FEE2E2", label="power_requested = false\nUne demande 'p' simultanée n'est pas retenue"];
+        c_request_p [shape=diamond, style=filled, fillcolor="#FFFFFF", label="SM1 && request == 'p' ?"];
+        c_p [fillcolor="#FFEDD5", label="SM1 : power_requested = true"];
+        c_mode [shape=diamond, style=filled, fillcolor="#FFFFFF", label="round_complete\n&& cycle_command.status == POWER\n&& !communication_fault\n&& (module_ID != MMC_SM1\n    || power_requested) ?"];
+        c_power_mode [label="mode = POWERMODE\nInitialiser les nombres d'insertion locaux à zéro"];
+        c_nlm_local [label="Toutes les cartes, SM1 compris : NLM locale du tour k\nmmc_compute_insertion_counts(cycle_command.sine_reference_raw, Nu, Nl)\nRefuser raw = -32768 ; sinon s = raw / 32767.0\nNu = roundf(5 * (a + m * s) / 2)\nNl = roundf(5 * (a - m * s) / 2)\nValider résultats finis dans [0, 5] avant conversion en uint8_t\na = m = 1 ; mêmes paramètres sur toutes les cartes"];
+        c_nlm_ok [shape=diamond, style=filled, fillcolor="#FFFFFF", label="mmc_compute_insertion_counts()\na retourné true ?"];
+        c_nlm_fault [fillcolor="#FEE2E2", label="communication_fault = COMMUNICATION_ERROR\npower_requested = false ; mode = IDLEMODE\nNe pas exécuter le consensus ni l'acquisition"];
+        c_power [label="POWER conservé : poursuivre le contrôle\ni_upper_arm = MMC_arm_current[0] - 0.8\ni_lower_arm = MMC_arm_current[5] + 0.19\nVariables du scope N_u / N_l ← Nu / Nl validés"];
+        c_idle [label="mode = IDLEMODE"];
+        c_scope_role [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        c_scope [fillcolor="#FFEDD5", label="SM1 : si ++scope_timer ≥ scope_period\nscope.acquire(); scope_timer = 0\n(scope_period = 1)"];
+        c_power_count [label="critical_task_timer++"];
+        c_prepare_role [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        c_prepare [fillcolor="#FFEDD5", label="SM1 : next_command = {}\nsm_id = MMC_SM1\ncycle_id = uint16_t(cycle_command.cycle_id + 1)"];
+        c_wanted [shape=diamond, style=filled, fillcolor="#FFEDD5", label="SM1 : power_requested ?"];
+        c_sine [fillcolor="#FFEDD5", label="SM1 : référence sin(angle) pour le tour k+1\nangle = ot_modulo_2pi(angle + w0 * Ts)\nnext_command.sine_reference_raw = mmc_encode_sine_reference(ot_sin(angle))\nEntrée non finie : -32768 ; sinon saturer à ±1 et roundf(sinus * 32767)\nint16_t : [-32767, 32767] ; -32768 invalide\nnext_command.status = POWER\nf0 = 50 Hz ; Ts = 200 µs ; m non appliqué ici"];
+        c_zero [fillcolor="#FFEDD5", label="SM1 : angle = 0\nnext_command reste IDLE\nnext_command.sine_reference_raw = 0\nL'arrêt dépend du statut, pas de la valeur du sinus"];
+        c_reset [label="Préparer la collecte suivante\nreceived_module_count = 0\nmeasurement_received[0…9] = false"];
+        c_fault_final [shape=diamond, style=filled, fillcolor="#FFFFFF", label="communication_fault != 0 ?"];
+        c_force_idle [fillcolor="#FEE2E2", label="power_requested = false\nmode = IDLEMODE"];
+        c_apply [shape=diamond, style=filled, fillcolor="#FFFFFF", label="mode == POWERMODE ?"];
+        c_pwm [label="shield.power.setDutyCycle(LEG1, module_command ? 1 : 0)\nSi !pwm_enable : shield.power.start(LEG1)\npwm_enable = true"];
+        c_stop [fillcolor="#FEE2E2", label="Si pwm_enable : shield.power.stop(ALL)\npwm_enable = false ; module_command = 0"];
+        c_count [label="counter_timer++"];
+        c_open_role [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        c_open [fillcolor="#FFEDD5", label="SM1 : si défaut, forcer next_command à IDLE\net sine_reference_raw = 0\nbegin_cycle(next_command)\nUn nouveau tour IDLE valide efface le défaut"];
+        c_open_ok [shape=diamond, style=filled, fillcolor="#FFEDD5", label="SM1 : begin_cycle a retourné true ?"];
+        c_send [fillcolor="#FFEDD5", label="SM1 : send_own_measurements()\nCopier cycle_command ; coder Vc et I locaux sur 12 bits\nSi défaut : frame.status = communication_fault\nstore_module_measurements(frame), puis émettre RS485"];
+        c_end [fillcolor="#DBEAFE", label="Fin du tick\nÉchanges du tour k+1 avant le prochain tick\nIDLE continue aussi les échanges"];
+
+        c_tick -> c_measure -> c_round -> c_missing;
+        c_missing -> c_round_fault [label="oui"];
+        c_missing -> c_read [label="non"];
+        c_round_fault -> c_read;
+        c_read -> c_request_i;
+        c_request_i -> c_i [label="oui"];
+        c_request_i -> c_has_fault [label="non"];
+        c_i -> c_has_fault;
+        c_has_fault -> c_cancel [label="oui"];
+        c_has_fault -> c_request_p [label="non"];
+        c_cancel -> c_mode;
+        c_request_p -> c_p [label="oui"];
+        c_request_p -> c_mode [label="non"];
+        c_p -> c_mode;
+        c_mode -> c_power_mode [label="oui"];
+        c_power_mode -> c_nlm_local -> c_nlm_ok;
+        c_nlm_ok -> c_power [label="oui"];
+        c_nlm_ok -> c_nlm_fault [label="non"];
+        c_nlm_fault -> c_prepare_role;
+        c_mode -> c_idle [label="non"];
+        // Le chemin POWER passe par le cluster consensus, puis revient au scope.
+        c_scope_role -> c_scope [label="oui"];
+        c_scope_role -> c_power_count [label="non"];
+        c_scope -> c_power_count;
+        c_power_count -> c_prepare_role;
+        c_idle -> c_prepare_role;
+        c_prepare_role -> c_prepare [label="oui"];
+        c_prepare_role -> c_reset [label="non"];
+        c_prepare -> c_wanted;
+        c_wanted -> c_sine [label="oui"];
+        c_wanted -> c_zero [label="non"];
+        c_sine -> c_reset;
+        c_zero -> c_reset;
+        c_reset -> c_fault_final;
+        c_fault_final -> c_force_idle [label="oui"];
+        c_fault_final -> c_apply [label="non"];
+        c_force_idle -> c_apply;
+        c_apply -> c_pwm [label="oui"];
+        c_apply -> c_stop [label="non"];
+        c_pwm -> c_count;
+        c_stop -> c_count;
+        c_count -> c_open_role;
+        c_open_role -> c_open [label="oui"];
+        c_open_role -> c_end [label="non"];
+        c_open -> c_open_ok;
+        c_open_ok -> c_send [label="oui"];
+        c_open_ok -> c_end [label="non"];
+        c_send -> c_end;
+    }
+
+    subgraph cluster_rs485 {
+        label="3 · Réception RS485 — callback asynchrone sur chaque carte";
+        color="#A78BFA"; style=rounded; fontname="Arial"; fontsize=16;
+
+        r_rx [fillcolor="#EDE9FE", label="reception_function()\nCopier buffer_rx dans MMC_frame_t frame"];
+        r_is_sm1 [shape=diamond, style=filled, fillcolor="#FFFFFF", label="frame.sm_id == MMC_SM1 ?"];
+        r_self [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        r_begin [label="begin_cycle(frame) sur l'esclave\nRefuser fenêtre déjà occupée / cycle ancien ou identique\nSaut de cycle en POWER : signaler un défaut\nIDLE : effacer défaut, puis valider statut et sinus codé\nsine_reference_raw == -32768 : défaut de communication\nSi ouvert : cycle_command = frame ; cycle_started = true"];
+        r_opened [shape=diamond, style=filled, fillcolor="#FFFFFF", label="begin_cycle a retourné true ?"];
+        r_store [label="accepted = store_module_measurements(frame)\nVérifier tour, ID, numéro de cycle, doublon et présence SM1\nStatut > POWER ou incohérent : signaler un défaut\nSi acceptée : décoder Vc / I, marquer l'ID reçu, compteur++\nUne trame acceptée peut porter un défaut"];
+        r_reply [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID != MMC_SM1\n&& accepted\n&& frame.sm_id == module_ID - 1 ?"];
+        r_send [label="send_own_measurements()\nCopier cycle_command ; ajouter ID, Vc et I locaux codés\nSi défaut : frame.status = communication_fault\nStocker sa propre mesure, puis émettre RS485\nAucun besoin de recevoir son propre écho"];
+        r_count [label="counter_receive++"];
+        r_end [label="Retour du callback"];
+        r_note [shape=note, fillcolor="#FFFFFF", label="Tour nominal : SM1 → SM2 → … → SM10\lChaque émission est diffusée aux cartes du bus.\lUn esclave répond après la trame acceptée de son prédécesseur.\lLes 10 mesures et le sinus de SM1 servent au prochain tick.\lNu / Nl et les portes g_u / g_l sont calculés localement.\lSinus signé : 2 octets, taille totale de trame inchangée.\lProtocole incompatible : mettre à jour les 10 cartes ensemble.\lVoir main_control.md pour les rejets et défauts des helpers.\l"];
+
+        r_rx -> r_is_sm1;
+        r_is_sm1 -> r_self [label="oui"];
+        r_is_sm1 -> r_store [label="non"];
+        r_self -> r_end [label="oui : ignorer son écho"];
+        r_self -> r_begin [label="non"];
+        r_begin -> r_opened;
+        r_opened -> r_store [label="oui (défaut possible)"];
+        r_opened -> r_end [label="non"];
+        r_store -> r_reply;
+        r_reply -> r_send [label="oui"];
+        r_reply -> r_count [label="non"];
+        r_send -> r_count -> r_end;
+    }
+
+    subgraph cluster_consensus {
+        label="4 · Consensus — calcul synchrone dans le chemin POWER";
+        color="#34D399"; style=rounded; fontname="Arial"; fontsize=16;
+
+        g_arm [shape=diamond, style=filled, fillcolor="#FFFFFF", label="mmc_is_upper_arm_module(module_ID) ?\nSM1…SM5"];
+        g_upper [label="Bras supérieur\nvoltages = MMC_capacitor_voltage[0…4]\narm_current = i_upper_arm ; N = Nu (NLM locale)\ngates = g_u"];
+        g_lower [label="Bras inférieur : SM6…SM10\nvoltages = MMC_capacitor_voltage[5…9]\narm_current = i_lower_arm ; N = Nl (NLM locale)\ngates = g_l"];
+        g_priority [fillcolor="#D1FAE5", label="assign_arm_gates_local_consensus(...)\nPour chacun des 5 indices : mmc_local_consensus_priority(...)\nVoisins en anneau : prev = (i+4)%5 ; next = (i+1)%5\nerr = (Vc_prev + Vc_next)/2 - Vc_i ; si |err| < 0.1 V : err = 0\nordre = (Vc_i > Vc_prev) + (Vc_i > Vc_next) - 1\ndir = mmc_smooth_current_direction(arm_current)\npriority[i] = 0.2 * err * dir - 0.02 * ordre * dir"];
+        g_clear [label="mmc_select_top_consensus_priorities(...)\nmmc_clear_gates(gates, 5)\nN = min(N, 5) ; selected = 0"];
+        g_more [shape=diamond, style=filled, fillcolor="#FFFFFF", label="selected < N ?"];
+        g_best [label="Parcourir les indices 0…4 non encore sélectionnés\nRetenir la plus grande priorité (comparaison stricte >)\nÀ égalité : le plus petit indice gagne"];
+        g_set [label="gates[best_index] = 1\nselected++"];
+        g_local [fillcolor="#D1FAE5", label="Extraire sa propre porte\nSupérieur : module_command = g_u[module_ID - MMC_SM1]\nInférieur : module_command = g_l[module_ID - MMC_SM6]"];
+
+        g_arm -> g_upper [label="oui"];
+        g_arm -> g_lower [label="non"];
+        g_upper -> g_priority;
+        g_lower -> g_priority;
+        g_priority -> g_clear -> g_more;
+        g_more -> g_best [label="oui"];
+        g_best -> g_set -> g_more;
+        g_more -> g_local [label="non"];
+    }
+
+    subgraph cluster_auxiliary {
+        label="5 · Console et arrière-plan — tâches indépendantes";
+        color="#94A3B8"; style=rounded; fontname="Arial"; fontsize=16;
+
+        u_console [label="loop_communication_task()\nreceived_serial_char = console_getchar()"];
+        u_key [shape=diamond, style=filled, fillcolor="#FFFFFF", label="Caractère reçu ?"];
+        u_help [label="'h' : afficher le menu"];
+        u_idle [label="'i' : requested_command = 'i'"];
+        u_p_role [shape=diamond, style=filled, fillcolor="#FFFFFF", label="'p' : module_ID == MMC_SM1 ?"];
+        u_power [fillcolor="#FFEDD5", label="SM1 : requested_command = 'p'"];
+        u_acq [label="'a' : enable_acq = !enable_acq"];
+        u_download [label="'r' : is_downloading = true"];
+        u_return [label="Fin de cette invocation console"];
+
+        b_entry [label="loop_background_task()"];
+        b_master [shape=diamond, style=filled, fillcolor="#FFFFFF", label="module_ID == MMC_SM1 ?"];
+        b_idle [shape=diamond, style=filled, fillcolor="#FFEDD5", label="SM1 : mode == IDLEMODE ?"];
+        b_led_off [fillcolor="#FFEDD5", label="SM1 : spin.led.turnOff()"];
+        b_download [shape=diamond, style=filled, fillcolor="#FFEDD5", label="SM1 : is_downloading ?"];
+        b_dump [fillcolor="#FFEDD5", label="SM1 : dump_scope_datas(scope)\nExporter les données par printk\nis_downloading = false"];
+        b_power [shape=diamond, style=filled, fillcolor="#FFEDD5", label="SM1 : mode == POWERMODE ?\nDeuxième test indépendant du test IDLE"];
+        b_toggle [fillcolor="#FFEDD5", label="SM1 : spin.led.toggle()"];
+        b_sleep [label="task.suspendBackgroundMs(2000)\nFin de cette invocation"];
+
+        u_console -> u_key;
+        u_key -> u_help [label="h"];
+        u_key -> u_idle [label="i"];
+        u_key -> u_p_role [label="p"];
+        u_key -> u_acq [label="a"];
+        u_key -> u_download [label="r"];
+        u_key -> u_return [label="autre"];
+        u_help -> u_return;
+        u_idle -> u_return;
+        u_p_role -> u_power [label="oui"];
+        u_p_role -> u_return [label="non : ignoré"];
+        u_power -> u_return;
+        u_acq -> u_return;
+        u_download -> u_return;
+
+        b_entry -> b_master;
+        b_master -> b_idle [label="oui"];
+        b_master -> b_sleep [label="non"];
+        b_idle -> b_led_off [label="oui"];
+        b_idle -> b_power [label="non"];
+        b_led_off -> b_download;
+        b_download -> b_dump [label="oui"];
+        b_download -> b_power [label="non"];
+        b_dump -> b_power;
+        b_power -> b_toggle [label="oui"];
+        b_power -> b_sleep [label="non"];
+        b_toggle -> b_sleep;
+    }
+
+    // Appel et retour synchrones : même invocation de loop_critical_task().
+    c_power -> g_arm [label="Choisir le bras et calculer les portes"];
+    g_local -> c_scope_role [label="Suite du chemin POWER"];
+
+    // Ces liens décrivent des activations ou des données, pas un ordre séquentiel.
+    edge [style=dotted, color="#7C3AED", fontcolor="#6D28D9", constraint=false];
+    s_background -> u_console [label="Tâche console activée"];
+    s_background -> b_entry [label="Tâche de fond activée"];
+    s_start -> c_tick [label="Activation périodique"];
+    c_end -> c_tick [label="Tick suivant : +200 µs entre débuts de ticks"];
+    u_return -> u_console [label="Invocation suivante par l'ordonnanceur"];
+    b_sleep -> b_entry [label="Invocation suivante après suspension"];
+    u_idle -> c_read [label="requested_command"];
+    u_power -> c_read [label="requested_command"];
+    u_acq -> c_scope [label="a_trigger() lit enable_acq sur SM1"];
+    u_download -> b_download [label="is_downloading sur SM1"];
+    c_send -> r_rx [label="Diffusion de la trame SM1 : ouvre k+1 sur les esclaves"];
+    r_send -> r_rx [label="Diffusion des mesures du module suivant"];
+    r_store -> c_round [label="Collecte du tour : compteur + défauts"];
+    r_begin -> c_mode [label="cycle_command reçu de SM1 sur les esclaves"];
+    r_store -> c_power [label="Tableaux Vc / I au tick suivant"];
+    c_mode -> b_idle [label="mode observé en arrière-plan"];
+}

@@ -48,6 +48,8 @@ ota_slot_owner owner = OTA_SLOT_NONE;
 bool initialized, recovery, maintenance, writer_open, flushed, staged, reboot_queued;
 uint32_t accepted, reboot_commit;
 uint8_t expected_lead_eui[8];
+uint32_t event_mask, event_ms[12];
+uint8_t event_order[12];
 int terminal_error;
 
 uint16_t read16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
@@ -66,13 +68,13 @@ template<typename T> int store(uint16_t key, T &record)
     if (rc < 0) return OTA_ERR_JOURNAL;
     T check = {};
     rc = nvs_storage_read(key, &check, sizeof(check));
-    return rc == sizeof(check) && !memcmp(&check, &record, sizeof(check)) ? OTA_OK : OTA_ERR_JOURNAL;
+    return rc == static_cast<int>(sizeof(check)) && !memcmp(&check, &record, sizeof(check)) ? OTA_OK : OTA_ERR_JOURNAL;
 }
 template<typename T> int load(uint16_t key, T &record)
 {
     int rc = nvs_storage_read(key, &record, sizeof(record));
     if (rc == -ENOENT) return rc;
-    if (rc != sizeof(record) || record.magic != JOURNAL_MAGIC || record.crc !=
+    if (rc != static_cast<int>(sizeof(record)) || record.magic != JOURNAL_MAGIC || record.crc !=
         ota_crc32(reinterpret_cast<const uint8_t *>(&record), offsetof(T, crc))) return OTA_ERR_JOURNAL;
     return OTA_OK;
 }
@@ -83,9 +85,15 @@ int save_journal(const ota_manifest *m, ota_state state, uint32_t commit)
     local_record record = {};
     record.magic = JOURNAL_MAGIC; record.journal.campaign_id = m->campaign_id;
     record.journal.commit_id = commit; record.journal.state = state;
+    record.journal.image_size = m->image_size;
     memcpy(record.journal.lead_eui, expected_lead_eui, 8);
     memcpy(record.journal.artifact_sha256, m->artifact_sha256, 32);
     memcpy(record.journal.mcuboot_image_hash, m->mcuboot_image_hash, 32);
+    memcpy(record.journal.version, m->version, OTA_IDENTITY_TEXT_SIZE);
+    memcpy(record.journal.build_id, m->build_id, OTA_IDENTITY_TEXT_SIZE);
+    record.journal.event_mask = event_mask;
+    memcpy(record.journal.event_ms, event_ms, sizeof(event_ms));
+    memcpy(record.journal.event_order, event_order, sizeof(event_order));
     int rc = store(JOURNAL_KEY, record);
     if (!rc) current_journal = record.journal;
     return rc;
@@ -283,7 +291,9 @@ int hook_reboot(void *, uint32_t commit, uint32_t delay)
     if (!commit || !delay || delay > 120000 || current_journal.commit_id != commit ||
         current_journal.state != OTA_REBOOTING) return OTA_ERR_STATE;
     reboot_commit = commit; reboot_queued = true;
-    k_work_schedule(&reboot_timer, K_MSEC(delay)); return OTA_OK;
+    int rc = k_work_schedule(&reboot_timer, K_MSEC(delay));
+    if (rc < 0) { reboot_queued = false; return OTA_ERR_STATE; }
+    return OTA_OK;
 }
 void hook_close(void *) { lock guard; close_writer(); recovery = maintenance; }
 } // namespace
@@ -301,7 +311,11 @@ int ota_storage_init(void)
     if (maintenance) ota_safety_restore(true);
     local_record record = {};
     int jr = load(JOURNAL_KEY, record);
-    if (!jr) { current_journal = record.journal; memcpy(expected_lead_eui, record.journal.lead_eui, 8); }
+    if (!jr) {
+        current_journal = record.journal; memcpy(expected_lead_eui, record.journal.lead_eui, 8);
+        event_mask = record.journal.event_mask; memcpy(event_ms, record.journal.event_ms, sizeof(event_ms));
+        memcpy(event_order, record.journal.event_order, sizeof(event_order));
+    }
     if ((rc && rc != -ENOENT) || (jr && jr != -ENOENT)) {
         maintenance = recovery = true; ota_safety_restore(true); return OTA_ERR_JOURNAL;
     }
@@ -332,6 +346,15 @@ int ota_storage_expect_lead(const uint8_t eui[8])
     lock guard;
     if ((owner != OTA_SLOT_NONE || recovery) && memcmp(eui, expected_lead_eui, 8)) return OTA_ERR_CONFLICT;
     memcpy(expected_lead_eui, eui, 8); return OTA_OK;
+}
+void ota_storage_set_events(uint32_t mask, const uint32_t timestamps[12], const uint8_t order[12])
+{
+    lock guard;
+    event_mask = mask;
+    if (timestamps) memcpy(event_ms, timestamps, sizeof(event_ms));
+    else memset(event_ms, 0, sizeof(event_ms));
+    if (order) memcpy(event_order, order, sizeof(event_order));
+    else memset(event_order, 0, sizeof(event_order));
 }
 void ota_storage_hooks(ota_participant_hooks *hooks)
 {
@@ -415,9 +438,15 @@ int ota_storage_release_maintenance(const uint8_t expected_hash[32])
     uint8_t active[32];
     if (!expected_hash || writer_open || reboot_queued || !boot_available() ||
         ota_storage_active_hash(active) || memcmp(active, expected_hash, 32)) return OTA_ERR_STATE;
-    /* Keep journal as evidence of the last campaign; only the independent
-     * inhibition marker is cleared after fleet-level success is established. */
+    /* Retain complete campaign provenance and result across a subsequent boot.
+     * The independent inhibition marker is cleared only after this succeeds. */
+    local_record record = {}; record.magic = JOURNAL_MAGIC; record.journal = current_journal;
+    record.journal.state = OTA_SUCCEEDED; record.journal.event_mask = event_mask;
+    memcpy(record.journal.event_ms, event_ms, sizeof(event_ms));
+    memcpy(record.journal.event_order, event_order, sizeof(event_order));
+    if (store(JOURNAL_KEY, record)) return OTA_ERR_JOURNAL;
     if (save_marker(MAINTENANCE_KEY, false)) return OTA_ERR_JOURNAL;
+    current_journal = record.journal;
     maintenance = recovery = false; owner = OTA_SLOT_NONE; ota_safety_restore(false);
     return OTA_OK;
 }

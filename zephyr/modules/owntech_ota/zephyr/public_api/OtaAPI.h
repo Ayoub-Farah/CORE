@@ -160,6 +160,18 @@ struct ota_command {
 
 int ota_participant_command(struct ota_participant *, const struct ota_command *);
 
+/* Bounded first-occurrence evidence, retained across a campaign reboot.
+ * event_ms is device uptime at the event; order is authoritative across resets
+ * and same-millisecond events. A missing mask bit never implies completion. */
+enum ota_event {
+    OTA_EVENT_ERASE_BEGIN, OTA_EVENT_ERASE_END,
+    OTA_EVENT_USB_STAGE_BEGIN, OTA_EVENT_USB_STAGE_END,
+    OTA_EVENT_CAN_TRANSFER_BEGIN, OTA_EVENT_CAN_TRANSFER_END,
+    OTA_EVENT_FLASH_COMPLETE, OTA_EVENT_VERIFY_BEGIN, OTA_EVENT_VERIFY_END,
+    OTA_EVENT_ALL_VALIDATED, OTA_EVENT_REBOOTING, OTA_EVENT_POSTBOOT_CHECK,
+    OTA_EVENT_COUNT
+};
+
 struct ota_observation {
     struct ota_identity identity;
     struct ota_status status;
@@ -169,6 +181,9 @@ struct ota_observation {
     bool healthy;
     bool confirmed;
     bool rolled_back;
+    uint32_t event_mask;
+    uint32_t event_ms[OTA_EVENT_COUNT];
+    uint8_t event_order[OTA_EVENT_COUNT];
 };
 
 struct ota_target {
@@ -244,6 +259,7 @@ struct ota_coordinator {
     uint64_t last_command_ms;
     uint64_t next_block_ms;
     bool command_sent;
+    bool status_polled;
     bool tx_pending;
     bool commit_may_have_executed;
     uint8_t tx_buffer[OTA_HEADER_SIZE + OTA_MAX_PAYLOAD];

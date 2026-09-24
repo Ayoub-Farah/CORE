@@ -65,7 +65,9 @@ int nvs_storage_write(uint16_t key, const void *data, size_t n)
 int nvs_storage_read(uint16_t key, void *data, size_t n)
 {
     for (unsigned i = 0; i < 16; ++i) if (records[i].key == key) {
-        if (n > records[i].len) n = records[i].len; memcpy(data, records[i].data, n); return (int)records[i].len;
+        if (n > records[i].len) n = records[i].len;
+        memcpy(data, records[i].data, n);
+        return (int)records[i].len;
     }
     return -ENOENT;
 }
@@ -81,6 +83,7 @@ static void reset_ram()
     initialized = recovery = maintenance = writer_open = flushed = staged = reboot_queued = false;
     accepted = reboot_commit = 0; terminal_error = 0; inhibited = true;
     memset(expected_lead_eui,0,8);
+    event_mask=0;memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
 }
 static int init_service()
 {
@@ -92,6 +95,7 @@ static ota_manifest artifact()
 {
     ota_manifest m = {}; m.campaign_id = 42; m.image_size = 1024; m.image_content_size = 200;
     m.hardware_id = 1; m.layout_id = 2; m.bootloader_id = 3; m.protocol_version = 1;
+    memcpy(m.version,"1.2.3",6);memcpy(m.build_id,"test-build",11);
     memset(m.mcuboot_image_hash, 0xbb, 32);
     memset(expected_artifact, 0xff, sizeof(expected_artifact));
     memset(expected_artifact, 0, 32); uint8_t *b = expected_artifact;
@@ -139,6 +143,8 @@ extern "C" int ota_storage_test_run()
     CHECK(!hooks.prepare(nullptr,&m,true) && ota_storage_owner()==OTA_SLOT_LEAD && erased==1);
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE);
     CHECK(!hooks.validate(nullptr,&m));
+    uint32_t timestamps[12]={100,200};uint8_t order[12]={1,2};
+    ota_storage_set_events(3,timestamps,order);
     CHECK(!hooks.journal(nullptr,&m,OTA_REBOOTING,77));
     CHECK(!hooks.schedule_reboot(nullptr,77,1000));CHECK(!hooks.schedule_reboot(nullptr,77,2000)&&scheduled==1);
     CHECK(hooks.schedule_reboot(nullptr,78,1000)==OTA_ERR_CONFLICT);
@@ -148,10 +154,15 @@ extern "C" int ota_storage_test_run()
     CHECK(!ota_storage_load_campaign(&loaded,targets,&count,&commit)&&count==OTA_MAX_TARGETS&&commit==77);
     uint8_t existing[4];CHECK(nvs_storage_read(0x0201,existing,4)==4&&!memcmp(existing,calibration,4));
     reset_ram();CHECK(!init_service()&&ota_storage_recovery_required()&&inhibited);
+    ota_storage_journal restored;CHECK(!ota_storage_get_journal(&restored));
+    CHECK(restored.campaign_id==m.campaign_id&&restored.image_size==m.image_size&&restored.event_mask==3);
+    CHECK(restored.event_ms[1]==200&&restored.event_order[1]==2&&!memcmp(restored.version,m.version,32));
+    CHECK(!memcmp(restored.build_id,m.build_id,32));
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE);
     CHECK(ota_storage_release_maintenance(m.mcuboot_image_hash)==OTA_ERR_STATE);swap=BOOT_SWAP_TYPE_NONE;
     uint8_t hash[32];CHECK(!ota_storage_active_hash(hash)&&!memcmp(hash,m.mcuboot_image_hash,32));
     CHECK(!ota_storage_release_maintenance(hash)&&!ota_storage_maintenance()&&!inhibited);
+    CHECK(!ota_storage_get_journal(&restored)&&restored.state==OTA_SUCCEEDED&&restored.campaign_id==m.campaign_id);
     CHECK(!ota_storage_load_role(&lead)&&lead);
     ++m.campaign_id;CHECK(!upload(m)&&erased==2);ota_storage_abort();CHECK(ota_storage_recovery_required());
 
@@ -174,5 +185,6 @@ extern "C" int ota_storage_test_run()
     return 0;
 }
 #ifndef OWNTECH_FREESTANDING_TEST
-int main(){return ota_storage_test_run();}
+#include <stdio.h>
+int main(){int rc=ota_storage_test_run();if(rc) fprintf(stderr,"storage_test.cpp:%d\n",rc);return rc?1:0;}
 #endif

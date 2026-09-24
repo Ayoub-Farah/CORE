@@ -165,7 +165,10 @@ static int start(fleet *f)
 }
 static int coordinator_test()
 {
-    fleet f = {}; CHECK(!start(&f)); f.lose_once = true;
+    fleet f = {}; CHECK(!start(&f));
+    CHECK(ota_coordinator_step(&f.c, 1) == OTA_AGAIN);
+    CHECK(ota_coordinator_step(&f.c, 30) == OTA_AGAIN && f.c.current_target == 1);
+    memset(&f, 0, sizeof(f)); CHECK(!start(&f)); f.lose_once = true;
     uint64_t now;
     for (now = 1; now < 9000 && f.c.phase != OTA_COORD_VALIDATE_BARRIER; ++now)
         CHECK(ota_coordinator_step(&f.c, now) == OTA_AGAIN);
@@ -203,5 +206,6 @@ extern "C" int ota_test_run()
     return coordinator_test();
 }
 #ifndef OWNTECH_FREESTANDING_TEST
-int main() { return ota_test_run(); }
+#include <stdio.h>
+int main() { int rc = ota_test_run(); if (rc) fprintf(stderr, "core_test.cpp:%d\n", rc); return rc ? 1 : 0; }
 #endif

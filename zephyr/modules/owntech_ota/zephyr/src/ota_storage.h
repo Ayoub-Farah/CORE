@@ -11,10 +11,16 @@ enum ota_slot_owner { OTA_SLOT_NONE, OTA_SLOT_USB, OTA_SLOT_PARTICIPANT, OTA_SLO
 struct ota_storage_journal {
     uint64_t campaign_id;
     uint32_t commit_id;
+    uint32_t image_size;
     enum ota_state state;
     uint8_t lead_eui[8];
     uint8_t artifact_sha256[32];
     uint8_t mcuboot_image_hash[32];
+    char version[OTA_IDENTITY_TEXT_SIZE];
+    char build_id[OTA_IDENTITY_TEXT_SIZE];
+    uint32_t event_mask;
+    uint32_t event_ms[12];
+    uint8_t event_order[12];
 };
 int ota_storage_init(void);
 bool ota_storage_recovery_required(void);
@@ -25,6 +31,8 @@ int ota_storage_persist_role(bool lead);
 /* Bind the prepared campaign to its stable Lead identity before the first
  * stage/prepare. The next journal persists it before any erase. */
 int ota_storage_expect_lead(const uint8_t eui[8]);
+/* Copy worker-owned event history into the next durable state transition. */
+void ota_storage_set_events(uint32_t mask, const uint32_t event_ms[12], const uint8_t order[12]);
 void ota_storage_hooks(struct ota_participant_hooks *hooks);
 void ota_storage_boot_identity(struct ota_identity *identity);
 int ota_storage_active_hash(uint8_t hash[32]);

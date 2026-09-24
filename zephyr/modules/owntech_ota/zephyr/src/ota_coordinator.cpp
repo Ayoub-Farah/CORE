@@ -14,10 +14,10 @@ static int fail(ota_coordinator *c, int error)
 static void phase(ota_coordinator *c, ota_coordinator_phase p, uint64_t now)
 {
     c->phase = p; c->phase_started_ms = now; c->current_target = 0;
-    c->target_started_ms = now; c->command_sent = false;
+    c->target_started_ms = now; c->command_sent = false; c->status_polled = false;
 }
 static void next(ota_coordinator *c, uint64_t now)
-{ ++c->current_target; c->target_started_ms = now; c->command_sent = false; }
+{ ++c->current_target; c->target_started_ms = now; c->command_sent = false; c->status_polled = false; }
 void ota_coordinator_default_options(ota_coordinator_options *o)
 {
     o->total_timeout_ms = 600000; o->command_timeout_ms = 20000; o->retry_interval_ms = 250;
@@ -83,7 +83,9 @@ int ota_coordinator_commit(ota_coordinator *c, uint64_t campaign, uint32_t commi
 static int control(ota_coordinator *c, ota_command_type command, uint64_t now)
 {
     ota_target *target = &c->targets[c->current_target];
-    if (!c->command_sent || now - c->last_command_ms >= c->options.retry_interval_ms) {
+    /* Always collect a status after an accepted command, even if the command
+     * round trip itself exceeded the retry interval. */
+    if (!c->command_sent || (c->status_polled && now - c->last_command_ms >= c->options.retry_interval_ms)) {
         ota_command cmd = {};
         cmd.type = command; cmd.manifest = c->manifest; cmd.pass_id = c->pass_id;
         cmd.start_offset = c->pass_start; cmd.commit_id = c->commit_id; cmd.adopt = target->is_lead;
@@ -92,11 +94,12 @@ static int control(ota_coordinator *c, ota_command_type command, uint64_t now)
         int rc = c->hooks.send_command(c->hooks.context, target, &cmd);
         if (rc < 0) return fail(c, rc);
         if (rc == OTA_AGAIN) return OTA_AGAIN;
-        c->command_sent = true; c->last_command_ms = now;
+        c->command_sent = true; c->status_polled = false; c->last_command_ms = now;
         if (command == OTA_CMD_COMMIT) c->commit_may_have_executed = true;
         return OTA_AGAIN;
     }
     ota_observation observation = {};
+    c->status_polled = true;
     int rc = c->hooks.read_status(c->hooks.context, target, &observation);
     if (rc < 0) return fail(c, rc);
     if (rc == OTA_AGAIN) return rc;

@@ -491,7 +491,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--bootstrap-image", type=Path,
-                        help="optional initial receiver image (e.g. blink A), distinct from campaign target B")
+                        help="optional initial receiver image, distinct from the campaign target")
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--serial")

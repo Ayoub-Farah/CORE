@@ -56,18 +56,9 @@ config OWNTECH_OTA_HEALTH_TIMEOUT_MS
 	range 1000 120000
 	default 15000
 
-config OWNTECH_OTA_BLINK_HALF_PERIOD_MS
-	int "Application LED half period (ms)"
-	range 100 5000
-	default 500
-
 config OWNTECH_OTA_BLOCK_INTERVAL_MS
 	int "Minimum delay between OTA blocks (prototype, measure on hardware)"
 	range 1 1000
 	default 20
-
-config OWNTECH_OTA_BLINK_DEMO
-	bool "Build the power-off blink qualification application"
-	default n
 
 endif

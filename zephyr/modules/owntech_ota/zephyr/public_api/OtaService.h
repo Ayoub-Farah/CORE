@@ -5,8 +5,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Weak application hooks. Default maintenance/health fail closed except for the
- * power-off blink profile. Applications must override these for their plant. */
+/* Weak defaults fail closed. The application supplies maintenance and health
+ * checks appropriate to its behavior; see the example hooks in src/main.cpp. */
 int owntech_ota_enter_maintenance(void);
 int owntech_ota_check_health(void);
 bool ota_safety_inhibited(void);

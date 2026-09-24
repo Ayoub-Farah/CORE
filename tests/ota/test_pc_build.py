@@ -15,6 +15,7 @@ from test_pc_artifact import artifact
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
+sys.path.insert(0, str(ROOT / "owntech/scripts"))
 from lead_update import CampaignError, prepare_manifest, main
 
 
@@ -28,7 +29,10 @@ class Environment:
         return value.replace("$PROJECT_DIR", str(self.project)).replace("$BUILD_DIR", str(self.build)).replace("${PROGNAME}", "firmware").replace("$PIOENV", "USB_LEAD")
 
     def GetProjectOption(self, key, default=None):
-        return {"custom_ota_build_id": "build-test"}.get(key, default)
+        return {}.get(key, default)
+
+    def get(self, key, default=None):
+        return {"OWNTECH_OTA_VERSION": "1.2.3+4", "OWNTECH_OTA_BUILD_ID": "build-test"}.get(key, default)
 
     def BoardConfig(self):
         return {"build.zephyr.bootloader.app_version": "1.2.3+4"}
@@ -44,6 +48,9 @@ class Environment:
 
     def VerboseAction(self, action, message):
         return action
+
+    def Replace(self, **values):
+        self.replacements = values
 
 
 class BuildTests(unittest.TestCase):
@@ -129,6 +136,56 @@ class BuildTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(post([], [image], env), 1)
             self.assertEqual(snapshot.read_bytes(), artifact())
+
+    def test_provision_hook_uses_generated_identity_and_only_custom_application_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / "build"
+            env = Environment(build)
+            env.GetProjectOption = lambda key, default=None: {
+                "board_id": "selected-serial", "upload_port": "COM17", "custom_ota_timeout": "42",
+                "custom_ota_build_id": "stale-manual-id", "custom_ota_mcumgr": "existing-mcumgr",
+            }.get(key, default)
+            script = ModuleType("SCons.Script")
+            script.COMMAND_LINE_TARGETS = ["upload"]
+            with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
+                runpy.run_path(str(ROOT / "owntech/scripts/pre_target_ota.py"),
+                               init_globals={"env": env, "Import": lambda name: None})
+            self.assertEqual(script.COMMAND_LINE_TARGETS, ["mcuboot-image", "upload"])
+            self.assertEqual(len(env.post), 1)
+            self.assertEqual(set(env.replacements), {"UPLOADCMD"})
+            with patch("provision_ota.main", return_value=0) as provision:
+                self.assertEqual(env.replacements["UPLOADCMD"]([], [], env), 0)
+            args = provision.call_args.args[0]
+            self.assertEqual(args[args.index("--build-id") + 1], "build-test")
+            self.assertEqual(args[args.index("--version") + 1], "1.2.3+4")
+            self.assertEqual(args[args.index("--serial") + 1], "selected-serial")
+            self.assertEqual(args[args.index("--port") + 1], "COM17")
+            self.assertEqual(args[args.index("--mcumgr") + 1], "existing-mcumgr")
+            self.assertEqual(args[args.index("--timeout") + 1], "42")
+            self.assertNotIn("--receiver-absent", args)
+            self.assertFalse(hasattr(env, "task"))
+
+    def test_ota_identity_hook_is_required_instead_of_silent_manual_fallback(self):
+        from ota_pio import artifact_options
+        with tempfile.TemporaryDirectory() as directory:
+            env = Environment(Path(directory))
+            env.get = lambda key, default=None: default
+            with self.assertRaisesRegex(ValueError, "pre_ota_identity"):
+                artifact_options(env)
+
+    def test_scons_hooks_execute_without_dunder_file(self):
+        # Real SConscript deliberately removes __file__ before exec(), unlike
+        # runpy. Both hooks must resolve imports through the project env.
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in ("pre_target_ota.py", "pre_target_usb_lead.py"):
+                env = Environment(Path(directory))
+                script = ModuleType("SCons.Script")
+                script.COMMAND_LINE_TARGETS = []
+                namespace = {"env": env, "Import": lambda name: None}
+                with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
+                    exec(compile((ROOT / "owntech/scripts" / filename).read_text(), filename, "exec"), namespace)
+                self.assertNotIn("__file__", namespace)
+                self.assertEqual(len(env.post), 1)
 
 
 if __name__ == "__main__":

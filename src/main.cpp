@@ -25,14 +25,26 @@
  * @author Ayoub Farah Hassan <ayoub.farah-hassan@laas.fr>
  */
 
-#if defined(CONFIG_OWNTECH_OTA_BLINK_DEMO)
-/* PlatformIO builds PROJECT_SRC_DIR independently of CMake's app source list. */
-#include "../examples/ota_blink/main.cpp"
-#else
-
 /* --------------OWNTECH APIs---------------------------------- */
 #include "SpinAPI.h"
 #include "TaskAPI.h"
+
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+
+/* This application only drives the LED. The OTA service inhibits and verifies
+ * power outputs itself. Adapt these application checks if you add a power
+ * control algorithm; keep required protection/supervision running. */
+extern "C" int owntech_ota_enter_maintenance(void)
+{
+    return 0;
+}
+
+extern "C" int owntech_ota_check_health(void)
+{
+    return 0;
+}
+#endif
 
 /* --------------SETUP FUNCTIONS DECLARATION------------------- */
 
@@ -119,5 +131,3 @@ int main(void)
 
     return 0;
 }
-
-#endif /* CONFIG_OWNTECH_OTA_BLINK_DEMO */

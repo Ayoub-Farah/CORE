@@ -22,7 +22,7 @@ from lead_update import Campaign, Journal
 
 IDS = ["0102030405060708", "1112131415161718", "2122232425262728"]
 MANIFEST = {"artifact_size": 512, "useful_size": 300, "artifact_sha256": "aa" * 32,
-            "mcuboot_image_hash": "bb" * 32, "version": "1.0.1+0", "build_id": "ota-blink-B",
+            "mcuboot_image_hash": "bb" * 32, "version": "1.0.1+0", "build_id": "test-app-next",
             "protocol": 1, "hardware_id": 0x01020142, "layout_id": 0x00010001,
             "bootloader_id": 0x00010100, "profile": {"slot_size": 227328}}
 

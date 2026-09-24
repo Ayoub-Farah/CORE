@@ -54,7 +54,7 @@ static void observation(ota_observation *o,size_t index)
         if(active_target)o->event_ms[OTA_EVENT_POSTBOOT_CHECK]=5;
     }
     const char *version=active_target?stored.version:"1.0.0+0";
-    const char *build=active_target?stored.build_id:"ota-blink-A";
+    const char *build=active_target?stored.build_id:"test-app-initial";
     memcpy(o->active_version,version,strlen(version)+1);memcpy(o->active_build_id,build,strlen(build)+1);
     if(active_target)memcpy(o->active_mcuboot_image_hash,stored.mcuboot_image_hash,32);
 }

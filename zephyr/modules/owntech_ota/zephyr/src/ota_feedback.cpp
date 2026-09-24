@@ -29,8 +29,7 @@ static void feedback(void *, void *, void *)
         case OTA_FAILED: case OTA_ABORTED: case OTA_RECOVERY_REQUIRED:
             on = t % 2000 < 900; break;
         default:
-            on = IS_ENABLED(CONFIG_OWNTECH_OTA_BLINK_DEMO)
-                ? (t / CONFIG_OWNTECH_OTA_BLINK_HALF_PERIOD_MS) % 2 : atomic_get(&app_led);
+            on = atomic_get(&app_led);
         }
         gpio_pin_set_dt(&led, on);
         k_sleep(K_MSEC(25));

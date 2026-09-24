@@ -13,11 +13,11 @@ extern "C" void ota_safety_restore(bool value) { atomic_set(&inhibited, value); 
 
 extern "C" __weak int owntech_ota_enter_maintenance(void)
 {
-    return IS_ENABLED(CONFIG_OWNTECH_OTA_BLINK_DEMO) ? 0 : OTA_ERR_SAFETY;
+    return OTA_ERR_SAFETY;
 }
 extern "C" __weak int owntech_ota_check_health(void)
 {
-    return IS_ENABLED(CONFIG_OWNTECH_OTA_BLINK_DEMO) ? 0 : OTA_ERR_HEALTH;
+    return OTA_ERR_HEALTH;
 }
 
 extern "C" int ota_safety_enter(void)

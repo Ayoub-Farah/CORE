@@ -182,6 +182,11 @@ image, build identity and health. The next update uses the same command after
 editing the application again. A compatible receiver is reused; it is not
 reinstalled on each campaign.
 
+Each new campaign refreshes the CAN inventory, including each board's current
+image and availability. Repeated status reads during that discovery share the
+same scan, so retrying after a board has been initialized does not reuse an old
+inventory or require a Lead reset.
+
 Build identity is derived automatically from the application sources and build
 configuration. Editing `src/main.cpp` changes the identity without requiring a
 manual build-ID increment. Equivalent `OTA` and `USB_LEAD` source/configuration

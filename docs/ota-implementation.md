@@ -44,8 +44,8 @@ records the resolved signing key path and the image's public key digest, without
 copying private key material. The currently resolved fallback is MCUboot's
 published example RSA key, as in the original chain. Both diagnosed boards'
 installed bootloaders were subsequently matched byte for byte to OwnTech v1.1.0
-using SWD backups. This does not qualify every board's bootloader or the complete fleet
-signature/swap workflow.
+using SWD backups. The complete update workflow subsequently passed on this
+two-board bench; other boards still require their own qualification.
 
 The full padded file must fit `0x37800` bytes. Useful content (header, program,
 protected/unprotected TLVs) is checked separately against `0x36000`. This is the
@@ -210,6 +210,59 @@ prototype. USB/CAN are trusted bench interfaces, not authenticated authorities.
 
 ## Validation
 
+### Complete two-board CAN update
+
+Campaign `1cc90b2bd2929c1b` completed successfully on 2026-09-24 through the
+PlatformIO `USB_LEAD` / `lead_update` target, with one Lead
+(`1ccd6d8ab16b213e`) and one follower (`1ccd6d8a80f3af97`). The 250 ms application
+image had 219444 useful bytes and 227328 transmitted bytes, build
+`ota-cfa4068bc1039caefdfd16fc`, MCUboot hash
+`c1c3f9690de7dce4a83fb4616c2ad5edbb8af7335a13bd40c1b6a5e9e8fa9aac`.
+PlatformIO returned success in 122.097 seconds; the campaign journal spans
+117.608 seconds. CAN required one pass, with no reported RX drops.
+
+The journal records both complete `VALID` targets at `ALL_VALIDATED` before
+its single `COMMIT_REQUEST`, then reboot, postboot reconciliation and `SUCCESS`.
+There are no `FAILED`, `PARTIAL` or `STATUS_REJECTED` records. A fresh read-only
+status afterward reports both exact identities in `SUCCESS`, on the expected
+hash/build, healthy, confirmed, validated and available, with error zero. The
+Lead also reports `slot_available: true`. This exercises the normal maintenance
+release path; no new full flash/NVS comparison was performed.
+
+Evidence: `ota-journals/campaign-1cc90b2bd2929c1b.jsonl` and, under
+`.pio/swd-recovery-20260924/`, `complete-cycle-250ms.log`,
+`complete-cycle-250ms-status.json`, and frozen `complete-cycle-250ms.bin` / `.json`.
+
+The consecutive 1000 ms cycle, `0d8573b7b00837aa`, also returned `SUCCESS` through
+the normal command `pio run -e USB_LEAD -t lead_update -j 8`. Its 234.268-second
+PlatformIO duration includes a full rebuild of roughly 117 seconds. The image
+has 219452 useful / 227328 transmitted bytes, build
+`ota-cb61d951ce57143aa874b049`, MCUboot hash
+`6af4fc8cfdc63279e641e99f337b94acf53357fd63255e3264558392c7b0fa48`.
+A fresh status confirms the same two EUIs in `SUCCESS` on that exact image,
+healthy, confirmed, validated and available, error zero; the Lead slot is
+available. Evidence: `ota-journals/campaign-0d8573b7b00837aa.jsonl` and
+`complete-cycle-1000ms.log`, `complete-cycle-1000ms-status.json`,
+`complete-cycle-1000ms.bin` / `.json` in the same evidence directory.
+The journal spans 117.490 seconds and records `ALL_VALIDATED` at line 262 before
+`COMMIT_REQUEST` at line 263. Device event timestamps measure CAN transfer at
+73.709 seconds on the Lead and 73.729 seconds on the follower.
+
+The final `OTA` build also passed in 121.255 seconds and produces the same
+`ota-cb61d951ce57143aa874b049` build identity, MCUboot hash and 219452 useful bytes
+as `USB_LEAD`, verified by comparing their manifests. Its log is
+`.pio/swd-recovery-20260924/final-ota-1000ms-build.log`.
+
+Between these campaigns, no manual reset, BOOT entry, recovery utility or
+ST-Link was used. The application delay was restored to 1000 ms in `src/main.cpp`
+and the ignored local `src/app.ini` supplied the Lead serial, two frozen EUIs
+and timeout. The second success establishes reuse of the deployed receiver,
+image slots and campaign storage through the normal USB/CAN workflow, including
+its automatic reboots and maintenance release. The source application is back
+to its committed 1000 ms delay.
+
+### Software checks and earlier hardware findings
+
 Run the host suites with:
 
 ```sh
@@ -256,7 +309,7 @@ The new builds share `ota-e3c380391b56790f0217bde8` and MCUboot image hash
 The full signed file hashes differ because signing can produce different
 signature bytes; each build's adjacent manifest remains authoritative.
 Logs: `.pio/ota-standalone-tests.log`, `.pio/ota-standalone-build.log` and
-`.pio/usb-lead-standalone-build.log`. Current linker/artifact measurements:
+`.pio/usb-lead-standalone-build.log`.
 
 The first hardware attempt to install this standalone build was rejected before
 accepting data: the bootloader's standard image service returned `rc=6`
@@ -291,8 +344,10 @@ space for a replacement before image erase. Host tests reproduce the original
 failure and exercise repeated replacements with garbage collection and existing
 calibration. A later full flash dump proved the original replacement was short
 by 192 bytes: 640 free versus 832 required for data and its NVS allocation entry.
-See [the recovery evidence and procedures](ota-recovery.md). A complete
-hardware update through postboot reconciliation has not yet passed.
+See [the recovery evidence and procedures](ota-recovery.md). This earlier failed
+campaign is distinct from the complete successful cycle above.
+
+Historical linker/artifact measurements before the later runtime fixes:
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
@@ -307,9 +362,8 @@ environments compile to `ota-0dcaaff159634ec78f2ca713`, MCUboot hash
 Logs: `.pio/ota-nvs-recovery-tests.log`, `.pio/ota-nvs-fixed-build.log`,
 `.pio/usb-lead-nvs-fixed-build.log`. The separate recovery build also passes;
 its final ELF contains the recovery entry point and excludes automatic image
-confirmation and the ordinary user main. These build checks preceded the first
-board's successful hardware recovery described below; they do not establish a
-successful campaign using the corrected normal images.
+confirmation and the ordinary user main. These build checks preceded the
+hardware recovery and complete campaign validation described here.
 
 The subsequent read-only recovery inspection of the first board's bootloader
 returned `{"images": [], "splitStatus": 0}` twice. No image identity could be
@@ -401,15 +455,129 @@ signed image name before validation and USB access. The host regression uses
 real SCons with parallel jobs and a changed final `PROGNAME`: valid artifacts
 must be signed and validated before the USB action, and corrupt artifacts must
 stop that action. The successful hardware `ota_init` invocation above also
-exercises the real PlatformIO task graph. A complete corrected CAN update
-through postboot reconciliation is not yet established by these checks.
+exercises the real PlatformIO task graph independently of the later CAN cycle.
+
+The next two-board campaign, `071755d86a3704ed`, attempted a 250 ms application
+image. USB staging on Lead `1ccd6d8ab16b213e` completed and validated all 227328
+bytes, but about 35 ms after `START_REQUEST` the client rejected an `invalid
+device event history`. No `COMMIT_REQUEST` was sent. The runtime had cleared
+`staged` before the Lead participant adopted the campaign, publishing its old
+campaign ID zero together with the new USB-stage event mask 463. Commit
+`07b9a69` keeps the staged observation until adoption and reports coherent
+campaign, size, validation and abort fields. Commit `fc688a5` records future
+invalid responses as `STATUS_REJECTED` before abort, preserving the diagnostic
+evidence. Logs: `ota-journals/campaign-071755d86a3704ed.jsonl` and
+`.pio/swd-recovery-20260924/fleet-250ms-failure-status.json`.
+
+The failed campaign's follower row was a cached observation. It showed the old
+image and `IDLE`, but does not prove the follower's current flash or readiness;
+a fresh inventory remains necessary. The Lead subsequently required another
+guarded repair because abort retained maintenance and the padded secondary.
+Physical bootloader entry initially listed only that secondary. One separately
+requested USB reset let the 250 ms trial boot with hash `5d65217a...`,
+unconfirmed and error `-18`. Physical RESET without BOOT then restored the old
+500 ms image, hash `25336f5e...`, confirmed. Another physical bootloader entry
+listed both slots. No ST-Link/SWD access occurred during these new attempts;
+the exact interrupted-move progress was not measured by a flash dump.
+
+The dedicated `--staged-lead-only` recovery mode now covers this pre-COMMIT
+case. Its host configuration requires a complete Lead `STAGED` observation,
+exactly one START, terminal failure, and no COMMIT or CAN-transfer evidence.
+Only the frozen Lead can run the helper. Firmware checks the matching local
+OTA1 journal with `VALID`/`ABORTED`, commit zero and USB-only event mask, plus
+the mandatory 304-byte OTA2 fleet CRC, roster, Lead index, campaign token and
+`PREPARING`/`FAILED` state. Its version-2 recovery marker keeps resumptions
+separate from the original recovery policy; role and calibration keys remain
+outside the cleanup. See [the mode safeguards and exact USB repair evidence](ota-recovery.md#failed-staging-handoff-and-lead-only-usb-repair).
+
+The generated header SHA-256 was
+`a1e4942d9c2dd7d77af7a03523307c301b235139ca6f2b0c3e3720f83663ff7d`.
+The helper built in 80.372 seconds with 106300 useful bytes and MCUboot hash
+`b549250871598b9c92577e4c13a17b524912d8f7d6d305f8969e8f3e9e9ec311`.
+Using `--staged-lead-only --after-revert --apply`, the client transferred it
+over USB in 12 seconds and requested reset only after verifying the pending
+helper hash. The console reported `RECOVERED rc=0 EUI=1ccd6d8ab16b213e
+confirmed=1`, with outputs inhibited. Evidence is in
+`.pio/swd-board2-20260924/staged-lead-recovery-build.log`,
+`staged-lead-recovery-apply.log` and `staged-lead-recovery-console.log`.
+This proves the guarded helper completed; no new full flash/NVS comparison was
+performed. The corrected normal Lead was subsequently installed over USB:
+`.pio/swd-board2-20260924/corrected-lead-provision.log` returned `PROVISIONED`,
+CAN `READY`, local/network health, active confirmation, slot availability and
+error zero. Its 218916-byte useful image is build
+`ota-014e997f0c2c99f4dd7fe714`, MCUboot hash
+`51317c5351dcd8b3252979b68fac97008575e22b46199a48a46b2209ca603cd2`.
+
+A fresh CAN discovery then showed follower `1ccd6d8a80f3af97` still `READY`
+for campaign `071755d86a3704ed`, with offset zero, pass zero, 227328-byte image
+size, erase-event mask 3, original `ef76db03...` hash, health and confirmation.
+It was unavailable because PREPARE had reached it before the earlier abort.
+This newer observation supersedes the cached follower IDLE row at failure.
+Physical bootloader entry listed its original confirmed primary alone.
+Evidence: `.pio/swd-recovery-20260924/corrected-can-preflight.json` and
+`prepared-follower-bootloader.json`.
+
+The separate `--prepared-follower-only` helper policy accepts only frozen
+non-Lead EUIs, a matching local journal in `PREPARING`/`READY`, commit zero,
+erase-only mask 1/3 and no fleet record, including during recovery resumption.
+Its version-3 marker separates it from the other modes. The USB client requires
+the original confirmed primary and no listed secondary, uploads the helper
+without a separate erase request, then verifies the primary and exact pending
+helper before reset. Neither an omitted secondary nor the durable READY journal
+alone proves no CAN data: BEGIN_PASS does not rewrite the journal. The fresh
+CAN observation and host history are part of the diagnosis. See
+[the prepared-follower procedure](ota-recovery.md#explicit-recovery-of-a-prepared-follower).
+The generated header hash is
+`ee6317a8c0c97809d76b889a1e9147171e6f383a0dba60df8111860498247ebf`.
+The version-3 helper built in 110.924 seconds with 106404 useful bytes and hash
+`dd49e0921c0f5f31fb4e4377af9782a53a45b41bb14f8a8dd95ea2f645fc340e`.
+Its USB transfer completed in 12 seconds, with no separate erase request;
+`prepared-follower-recovery-console.log` reported
+`RECOVERED rc=0 EUI=1ccd6d8a80f3af97 confirmed=1`, outputs inhibited.
+The build, inspection and upload logs share the `prepared-follower-recovery-`
+prefix under `.pio/swd-recovery-20260924/`. No SWD access was used.
+
+The follower then received the same normal 500 ms build `ota-014e997f0c2c99f4dd7fe714`
+and hash `51317c53...` as the corrected Lead. Its
+`.pio/swd-recovery-20260924/corrected-follower-provision.log` reports
+`PROVISIONED`, CAN `READY`, `IDLE`, local/network health, active confirmation,
+slot availability and error zero. The next 250 ms `lead_update` attempt stopped
+at preflight on a stale CAN discovery result, before any firmware staging or
+flash write; see `corrected-fleet-cycle-250ms.log` and
+`corrected-fleet-preflight-refusal.json` in the same evidence directory.
+Commit `11241e1` fixes that stale preflight by binding discovery to a campaign
+token. The PC sends the same token while polling and paging one inventory;
+a different campaign token requests a fresh CAN scan. The runtime reserves
+discovery while it is queued or active and publishes no target pages until
+the new table is complete. Thus subsequent campaigns cannot silently reuse an
+earlier campaign's inventory. The complete 250 ms cycle above passed after this
+correction.
+
+The second cycle also exposed a host-journal issue: discovery retained the
+previous campaign's successful device trace, which the client re-emitted as
+foreign top-level events. The client now validates those traces but keeps them
+only inside observations. Recovery accepts a historical SUCCESS snapshot only
+when its campaign, identity, image, state and complete trace exactly match the
+frozen discovery; current activation or divergent evidence still forbids repair.
+The original hardware journals are unchanged, and mixed top-level campaign IDs
+remain rejected. These host-only changes do not alter the validated firmware.
+
+After the discovery, handoff, recovery and journal changes, all 172 host/native
+tests passed in 49.444 seconds:
+`.pio/swd-recovery-20260924/all-tests-final-usb-can.log`.
+They include coherent runtime observations during Lead adoption, preservation
+of rejected host status, all three recovery policies, refusal of committed or
+wrong-role repairs, compact ARM fleet fixtures, recovery across interrupted
+mutations, fresh discovery across consecutive campaign tokens and strict
+separation of previous successful traces from current activation evidence.
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
 CMake configuration. The edit changed both the embedded build ID and MCUboot
 image hash; restoration reproduced their original values. The final `OTA` and
 `USB_LEAD` artifacts have the same build ID and MCUboot image hash. The delay
-change was only a build check; the committed application retains 1000 ms.
+change was only a build check; later hardware attempts used the separately
+identified 500 ms and 250 ms artifacts above.
 
 Both generated configurations were checked for disabled live metrics, CAN/SDK
 thread priority 10 and FDCAN2 interrupt priority 2. Host regressions exercise the
@@ -419,15 +587,14 @@ configuration-cache invalidation and identity restoration with real CMake after
 build-directory removal.
 
 The useful image must remain below the provisional 221184-byte capacity. The
-current OTA application has 2364 bytes left within that bound; application code
-and enabled libraries share that budget with the service.
+final 219452-byte 1000 ms image leaves 1732 bytes within that bound;
+application code and enabled libraries share that budget with the service.
 Linker RAM allocations are not measured stack high-water marks. Generated
 binaries and build/test logs are local artifacts, not committed source.
 
-Still to qualify on a physical Lead plus two followers: wiring/termination,
-installed bootloader/signature/swap behavior, a visible application change on
-every identity, real packet loss and bus load, power inhibition during flash,
-stack high-water marks, measured throughput/duration, rollback and partial
-recovery. Repeat the campaign after another application edit to establish that
-the deployed image retains its receiver. CAN FD/BRS is disabled in prototype
+The consecutive bench cycles cover one Lead and one follower. Broader qualification
+still includes multiple followers, electrical behavior under load, injected
+packet loss, measured power inhibition and stack high-water marks, and systematic
+power-cut/partial-fleet recovery. The observed rollback and scoped repairs above
+do not replace those fault campaigns. CAN FD/BRS is disabled in prototype
 profiles; its codec tests are not bus qualification.

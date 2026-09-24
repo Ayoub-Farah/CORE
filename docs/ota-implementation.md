@@ -260,7 +260,7 @@ The first hardware attempt to install this standalone build was rejected before
 accepting data: the bootloader's standard image service returned `rc=6`
 (`EBADSTATE`) at offset zero. A diagnostic retry with one outstanding chunk
 returned the same rejection. The old `ota-b24bcb19601a8ab5256acf65` application
-remains unconfirmed and in `FAILED`; the new standalone build has not yet been
+was then unconfirmed and in `FAILED`; the new standalone build had not yet been
 validated on that physical board. No forced image confirmation was sent.
 Logs: `.pio/ota-standalone-upload.log` and `.pio/ota-standalone-window1.log`.
 
@@ -270,9 +270,25 @@ client verified the exact build/hash, `local_healthy: true`,
 `active_confirmed: true`, `slot_available: true`, `error: 0` and `WAITING_CAN`
 while that board was alone on CAN. A second invocation returned
 `ALREADY_INITIALIZED` without upload or reset. This validates standalone USB
-initialization on hardware; CAN joining and recovery of the first board remain
-separate checks. Logs: `.pio/ota-second-board-boot-upload.log` and
+initialization on hardware. Logs: `.pio/ota-second-board-boot-upload.log` and
 `.pio/ota-second-board-recheck.log`.
+
+With both boards powered and connected by CAN, resetting the first board let
+its original application pass health checks and confirm itself normally. USB
+status reported `IDLE`, confirmed and available. The second board joined CAN
+from its standalone waiting state. An explicit two-EUI preflight verified both
+healthy, confirmed and available (`.pio/ota-two-board-preflight.log`).
+
+Campaign `61c6c4384740260e` then transferred and validated 227328 bytes on both
+boards in one pass, with no RX drops. It failed during the Lead's collective
+journal replacement, before any participant COMMIT or REBOOT (`-9`, journal
+error). Both running images remained confirmed; the staged images still had
+activation trailers. This exposed a missing NVS replacement-space reservation.
+The corrected fleet record is 304 bytes instead of 824, and admission reserves
+space for a replacement before image erase. Host tests reproduce the original
+failure and exercise repeated replacements with garbage collection and existing
+calibration. See [the scoped USB recovery procedure](ota-recovery.md). A complete
+hardware update through postboot reconciliation has not yet passed.
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|

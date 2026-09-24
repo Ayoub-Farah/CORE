@@ -103,7 +103,7 @@ static int _console_init()
 	return 0;
 }
 
-#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA)
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA) && !defined(CONFIG_OWNTECH_OTA_RECOVERY)
 #include <zephyr/kernel.h>
 #include <zephyr/dfu/mcuboot.h>
 
@@ -147,6 +147,10 @@ static int _img_validation()
  */
 void reboot_bootloader_task(struct k_work* work)
 {
+#ifdef CONFIG_OWNTECH_OTA_RECOVERY
+    /* Only physical BOOT + RESET may interrupt the scoped repair utility. */
+    return;
+#endif
 #ifdef CONFIG_OWNTECH_OTA
     unsigned int ota_key = irq_lock();
     if (ota_service_busy() || ota_safety_inhibited()) { irq_unlock(ota_key); return; }
@@ -240,7 +244,7 @@ SYS_INIT(_console_init,
          89
         );
 
-#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA)
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA) && !defined(CONFIG_OWNTECH_OTA_RECOVERY)
 SYS_INIT(_img_validation,
          APPLICATION,
          CONFIG_APPLICATION_INIT_PRIORITY

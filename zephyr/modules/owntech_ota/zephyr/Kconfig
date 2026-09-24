@@ -62,3 +62,11 @@ config OWNTECH_OTA_BLOCK_INTERVAL_MS
 	default 20
 
 endif
+
+config OWNTECH_OTA_RECOVERY
+	bool "Dedicated recovery application for an explicitly selected uncommitted campaign"
+	default n
+	depends on !OWNTECH_OTA && OWNTECH_FLASH && OWNTECH_SHIELD_API && BOOTLOADER_MCUBOOT
+	help
+	  Build-only maintenance utility; requires a generated campaign and board
+	  allowlist. This is never enabled in OTA or USB_LEAD application builds.

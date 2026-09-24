@@ -11,6 +11,10 @@ workflows. Use an OTA environment for images that must receive future campaigns.
 Neither OTA workflow installs or replaces the existing bootloader or generates
 a new signing key.
 
+`OTA_RECOVERY` is a separate maintenance utility for a diagnosed, uncommitted
+campaign failure. It is not part of normal testing or deployment; see the
+[guarded USB repair procedure](ota-recovery.md) before using it.
+
 ## Install OTA support on each board
 
 Build and upload the current application individually to every board that does

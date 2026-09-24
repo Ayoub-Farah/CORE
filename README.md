@@ -2,6 +2,10 @@
 
 This is the OwnTech Power API Core repository.
 
+The experimental collective CAN updater is available through the `USB_LEAD`
+environment and the `lead_update` Project Task. See the [operator guide](docs/ota-client.md)
+and [implementation and validation notes](docs/ota-implementation.md).
+
 The Power API is designed to be used with VS Code and PlatformIO.
 [Installing VS Code with PlatformIO](https://platformio.org/install/ide?install=vscode).
 

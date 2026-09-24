@@ -82,7 +82,7 @@ static void k_timer_stop(struct k_timer *t){t->active=false;}
 #define K_TIMER_DEFINE(n,fn,unused) struct k_timer n={.handler=fn}
 struct k_work {int unused;};
 struct k_work_delayable {struct k_work work;};
-static struct k_work_delayable *k_work_delayable_from_work(struct k_work *w){return (void *)w;}
+static struct k_work_delayable *k_work_delayable_from_work(struct k_work *w){return (struct k_work_delayable *)w;}
 static void k_work_init_delayable(struct k_work_delayable *w,void (*fn)(struct k_work *)){}
 static void thingset_sdk_reschedule_work(struct k_work_delayable *w,k_timeout_t t){}
 struct k_event {uint32_t flags;};

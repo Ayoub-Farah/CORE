@@ -80,6 +80,13 @@ custom_ota_expected_ids = 0102030405060708, 1112131415161718, 2122232425262728
 custom_ota_timeout = 180
 ```
 
+Pause power conversion/control on the whole fleet before starting the command;
+real-time operation is not guaranteed during flash writes and reboot. The
+application's maintenance callback must keep it paused, including when RS485
+commands arrive. Outside campaigns, the supplied OTA profile disables periodic
+CAN telemetry and gives CAN interrupts lower priority than HRTIM control; see
+[real-time coexistence](ota-implementation.md#coexistence-with-real-time-control-outside-a-campaign).
+
 Then run the **Update Lead and CAN fleet** Project Task:
 
 ```sh

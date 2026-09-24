@@ -29,6 +29,14 @@ Source or build-configuration changes produce a new identity automatically.
 environments; no manual build-ID change is needed. Identity is recorded in the
 compiled firmware and generated manifest, and verified again after reboot.
 
+A separate configuration fingerprint invalidates the environment's CMake cache
+when profiles, overlays, Kconfig, CMake inputs or build settings change. This is
+needed because the installed PlatformIO Zephyr builder does not watch all those
+inputs itself. Identity is also retained under `.pio/ota-generated/<environment>/`
+so CMake can restore its generated header after the builder cleans its build
+directory. Editing the contents of an existing `main.cpp` still uses the normal
+incremental compilation path.
+
 The existing PlatformIO `mcuboot-image` builder and its existing resolved
 signature key produce `firmware.mcuboot.bin`. No bootloader is built, installed,
 downloaded or modified by `lead_update`; no key is generated. The manifest
@@ -118,6 +126,42 @@ gate. Application-specific electrical safety, interrupt behavior and flash timin
 need bench tests. Public LED calls use the service's LED owner so OTA state
 indications can temporarily take priority over the application's normal pattern.
 
+### Coexistence with real-time control outside a campaign
+
+The supplied OTA profile keeps CAN available for requests, but does not enable
+periodic ThingSet live-metric publication. FDCAN2's normal interrupts have logical
+priority 2, below the HRTIM control interrupt at logical priority 0. The RS485 RX
+DMA interrupt retains its separate zero-latency configuration. ThingSet CAN and
+SDK work run in preemptible threads at priority 10; the kernel's shared workqueue
+priority is unchanged.
+
+The OTA worker blocks on its queue when no discovery, reconciliation or
+coordinator deadline needs servicing. It publishes on handled events instead of
+waking every 5 ms while idle. The 5 ms service cadence is retained during timed
+campaign operations. CAN report reassembly expiry is armed only while incomplete
+reports need a deadline; it has no permanent idle timer. Address claims and
+responses to received requests remain part of the protocol, including at startup.
+
+This reduces background work; it is not a measured bound on interrupt latency.
+Short kernel critical sections, incoming CAN traffic and shared memory accesses
+still exist. The LED owner keeps its existing 25 ms cadence, preserving the
+atomic-only application LED API used from interrupt contexts. Measure control
+latency and RS485 loss under the intended load before qualifying an application.
+Use GPIO timing or a cycle counter to record maximum control entry delay and
+execution time, plus the RS485 receive-to-transmit delay and missed-frame count.
+Compare CAN disabled, enabled and quiet, then handling discovery/status traffic;
+flash tests belong to the paused maintenance phase.
+
+For the supplied TWIST 1.4.2 wiring, synchronization uses PB2/AF13 for HRTIM SCIN
+and PB1/AF13 for SCOUT. The driver now selects PB2 for both TWIST 1.4.1 and 1.4.2,
+leaving CAN TX on PB6. Other shield revisions retain their existing mapping.
+
+Firmware updates assume the application has paused power conversion on the whole
+fleet before the PC starts the campaign. Erase, programming, persistent role
+changes and reboot are maintenance operations; this implementation does not
+promise real-time control throughout them. Application maintenance callbacks must
+prevent RS485 commands or another task from restarting conversion while inhibited.
+
 NVS keys are reserved in category `0x0500`: role, maintenance, local campaign
 journal and frozen fleet journal. They share the existing NVS mount and mutex.
 A preflight budgets live-record space before image erase; calibration, thresholds
@@ -164,15 +208,15 @@ maintenance release and a subsequent campaign. They verify that a persisted
 Lead preference does not prevent a board from participating in another Lead's
 campaign.
 
-The generic application workflow passed all 56 host tests and the three firmware
+The generic application workflow passed all 60 host tests and the three firmware
 builds on 2026-09-24 (PlatformIO 6.2.0, Zephyr 4.0.0, GNU Arm 12.3.1). Measurements
 below come from the linker reports and inspected signed artifacts:
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
 | USB | 96872 | 31616 | 97208 | 227328 |
-| OTA | 216432 | 97572 | 216768 | 227328 |
-| USB_LEAD | 216432 | 97572 | 216768 | 227328 |
+| OTA | 216112 | 97572 | 216448 | 227328 |
+| USB_LEAD | 216112 | 97572 | 216448 | 227328 |
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
@@ -181,8 +225,15 @@ image hash; restoration reproduced their original values. The final `OTA` and
 `USB_LEAD` artifacts have the same build ID and MCUboot image hash. The delay
 change was only a build check; the committed application retains 1000 ms.
 
+Both generated configurations were checked for disabled live metrics, CAN/SDK
+thread priority 10 and FDCAN2 interrupt priority 2. Host regressions exercise the
+real runtime returning to indefinite queue waits and waking for requests, plus
+CAN reassembly deadlines that stop when the pool becomes idle. They also verify
+configuration-cache invalidation and identity restoration with real CMake after
+build-directory removal.
+
 The useful image must remain below the provisional 221184-byte capacity. The
-current OTA application has 4416 bytes left within that bound; application code
+current OTA application has 4736 bytes left within that bound; application code
 and enabled libraries share that budget with the service.
 Linker RAM allocations are not measured stack high-water marks. Generated
 binaries and build/test logs are local artifacts, not committed source.

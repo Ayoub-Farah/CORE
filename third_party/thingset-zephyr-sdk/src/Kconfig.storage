@@ -1,0 +1,99 @@
+# Copyright (c) The ThingSet Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig THINGSET_STORAGE
+	bool "Storage backend"
+	depends on EEPROM || NVS
+	help
+	  Enables long-term storage of data in non-volatile memory (EEPROM or Flash).
+
+if THINGSET_STORAGE
+
+choice THINGSET_STORAGE_TYPE
+	prompt "Storage type"
+	help
+	   Select whether the data should be stored in EEPROM or Flash.
+
+config THINGSET_STORAGE_EEPROM
+	bool "EEPROM"
+	depends on EEPROM
+	select CRC
+
+config THINGSET_STORAGE_FLASH
+	bool "Flash/NVS"
+	depends on NVS
+
+endchoice
+
+config THINGSET_STORAGE_LOAD_ATTEMPTS
+	int "Maximum number of attempts to load data from storage at boot"
+	range 1 100
+	default 3
+	help
+	  Depending on the environment, loading data from e.g. an I2C EEPROM may fail occasionally
+	  with bad CRCs due to noise in the communication. This Kconfig defines how often reading
+	  from the storage should be retried.
+
+config THINGSET_STORAGE_SAVE_UPDATES
+	bool "Store data upon updates to ThingSet stored items"
+	default y
+	help
+	  If enabled, data objects which are part of the TS_SUBSET_NVM subset are immediately stored
+	  in NVM after an update of one of these data objects via ThingSet.
+
+config THINGSET_STORAGE_AUTOSAVE
+	bool "Store data in regular intervals"
+	default y
+	help
+	  Store all data objects which are part of the TS_SUBSET_NVM subset in regular intervals to
+	  EEPROM or flash.
+
+config THINGSET_STORAGE_AUTOSAVE_INTERVAL
+	int "Regular storage interval (in hours)"
+	depends on THINGSET_STORAGE_AUTOSAVE
+	range 1 8760
+	default 6
+
+config THINGSET_STORAGE_INHIBIT_OVERWRITE
+	bool "Inhibit overwrite of data if reading failed"
+	depends on THINGSET_STORAGE_AUTOSAVE
+	help
+	  Disable regular storage in the background if previous loading of data failed because of
+	  bad CRC or wrong data version. Only empty EEPROM data will be overwritten.
+
+config THINGSET_STORAGE_DATA_VERSION
+	int "Data objects version"
+	range 1 65536
+	default 1
+	help
+	  This version number has to be increased each time IDs previously used for data objects
+	  stored in non-volatile memory are re-used for different data objects (different data type
+	  or different semantics).
+
+	  Warning: This will discard previously stored data in order to prevent data corruption. Try
+	  to avoid changing data object IDs used previously.
+
+config THINGSET_STORAGE_EEPROM_PROGRESSIVE_IMPORT_EXPORT
+	bool "Enable progressive import/export for EEPROM storage."
+	select THINGSET_PROGRESSIVE_IMPORT_EXPORT
+	help
+	  When enabled, allows the loading and saving of data larger than the shared buffer
+	  in EEPROM.
+
+config THINGSET_STORAGE_EEPROM_DUPLICATE
+	bool "Write EEPROM data twice to recover from power failures"
+	depends on THINGSET_STORAGE_EEPROM
+	help
+	  Divides the available EEPROM memory into two equal sections and writes the data into both
+	  sections each time. This allows to recover from power failures because at least one
+	  section will always have valid data.
+
+config THINGSET_STORAGE_EEPROM_CHUNK_SIZE
+	int "Size of chunk when reading from/writing to EEPROM"
+	default 128
+	depends on THINGSET_STORAGE_EEPROM
+	help
+	  When reading from or writing to EEPROM, transfer the data in chunks of this size.
+	  This may resolve issues related to limitations with the I2C bus.
+
+endif # THINGSET_STORAGE

@@ -1,0 +1,227 @@
+# Copyright (c) The ThingSet Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig THINGSET_CAN
+	bool "CAN interface"
+	depends on CAN
+	depends on ISOTP_FAST
+	depends on !ISOTP_FAST_PER_FRAME_DISPATCH
+	depends on ENTROPY_GENERATOR
+	select EVENTS
+	select ISOTP_FAST_CUSTOM_ADDRESSING
+
+if THINGSET_CAN
+
+config THINGSET_CAN_ALLOW_ADDRESS_WRITE
+	bool "Allow remote writes of the local CAN address"
+	default y
+	help
+	  Disable when identities and addresses must remain stable during an OTA
+	  campaign. Address claiming still selects an address during initialization.
+	  Direct writes cannot update the ISO-TP filters and should be avoided.
+
+config THINGSET_CAN_RX_BUF_SIZE
+	int "ThingSet CAN RX buffer size"
+	range 64 2048
+	default 600
+	help
+	  Default value large enough to receive a 512 byte flash page for DFU.
+
+config THINGSET_CAN_TX_BUF_SIZE
+	int "Owned request/response TX buffer size (two per instance)"
+	range 64 4095
+	default THINGSET_CAN_RX_BUF_SIZE
+	help
+	  Separate client and server buffers retain ISO-TP bytes until TX finishes.
+
+config THINGSET_CAN_REPORT_MAX_SIZE
+	int "Maximum transmitted multi-frame report size"
+	range 32 4095
+	default 1024
+
+config THINGSET_CAN_REPORT_TIMEOUT
+	int "Complete multi-frame report TX deadline (ms)"
+	range 1 60000
+	default 2000
+
+config THINGSET_CAN_REPORT_RX_TIMEOUT
+	int "Incomplete multi-frame report expiry (ms)"
+	depends on THINGSET_CAN_REPORT_RX
+	range 1 60000
+	default 1000
+
+config THINGSET_CAN_FD_BRS
+	bool "Enable bit-rate switching for multi-frame reports"
+	depends on CAN_FD_MODE
+	help
+	  Enable only after qualifying every controller, transceiver and bus cable.
+
+config THINGSET_CAN_ITEM_RX
+	bool "Support for reception of single-frame data items"
+	help
+	  Single-frame reports containing one data item (type 0x2) are usually used
+	  for control purposes. Enable this option to allow configuring a receive
+	  callback once single-frame reports from other nodes were received.
+
+	  For normal reports, the multi-frame reports of type 0x1 are more
+	  efficient (especially in case of CAN FD).
+
+config THINGSET_CAN_REPORT_RX
+	bool "Support for reception of multi-frame reports"
+	help
+	  Multi-frame reports (type 0x1) are used to publish data items of one
+	  group, subset or record over CAN. The size of one frame is 8 bytes
+	  for classical CAN or up to 64 for CAN FD.
+
+config THINGSET_CAN_REPORT_RX_BUFFER_SIZE
+	int "ThingSet CAN RX buffer size for reassembly of packetized reports"
+	depends on THINGSET_CAN_REPORT_RX
+	range 32 1024
+	default 64
+	help
+	  Default value enough to receive at least a 10-element array via broadcast.
+
+config THINGSET_CAN_REPORT_RX_NUM_BUFFERS
+	int "ThingSet CAN number of RX buffers for reassembly of packetized reports"
+	depends on THINGSET_CAN_REPORT_RX
+	range 1 64
+	default 8
+	help
+	  Maximum number of unique senders anticipated on the CAN bus.
+
+config THINGSET_CAN_REPORT_RX_BUCKETS
+	int "Legacy RX buckets setting (unused, retained for configuration compatibility)"
+	depends on THINGSET_CAN_REPORT_RX
+	range 1 16
+	default 8
+	help
+	  Bounded static slots are now indexed by instance, source and route.
+
+config THINGSET_CAN_REPORT_SEND_TIMEOUT
+	int "ThingSet CAN report send timeout"
+	range 0 100
+	default 30
+	help
+	  Timeout in milliseconds to wait for a report frame to be successfully
+	  submitted to the CAN TX FIFO.
+
+config THINGSET_CAN_FRAME_SEPARATION_TIME
+	int "ThingSet CAN minimum frame separation time"
+	range 0 127
+	default 1
+	help
+	  Minimum time in milliseconds between the end of one frame and the
+	  beginning of the next consecutive frame in multi-frame messages.
+
+	  This parameter is used for the STmin value in the underlying ISO-TP
+	  protocol of request/response messages and as a delay between individual
+	  frames of multi-frame reports.
+
+config THINGSET_CAN_CONTROL_REPORTING
+	bool "Publish data of control subset"
+	help
+	  Enable automatic publication of control data. The subset is application-
+	  specific and has to be specified.
+
+config THINGSET_CAN_CONTROL_SUBSET
+	hex "Subset containing control data to be published"
+	depends on THINGSET_CAN_CONTROL_REPORTING
+
+config THINGSET_CAN_CONTROL_REPORTING_ENABLE_PRESET
+	bool "Control reporting broadcast will be enabled at boot time if set"
+	depends on THINGSET_CAN_CONTROL_REPORTING
+	default y
+
+config THINGSET_CAN_CONTROL_REPORTING_PERIOD
+	int "Control data reporting interval in milliseconds"
+	depends on THINGSET_CAN_CONTROL_REPORTING
+	default 100
+
+choice THINGSET_CAN_ROUTING
+	prompt "Message routing scheme"
+	default THINGSET_CAN_ROUTING_BUSES
+	help
+	  Select how frames should be routed between different buses.
+
+config THINGSET_CAN_ROUTING_BUSES
+	bool "Bus numbers"
+	depends on ISOTP_FAST
+	select ISOTP_FAST_CUSTOM_ADDRESSING
+	help
+	  Bits 16-23 of the CAN ID are used for a target bus (higher nibble) and a
+	  source bus (lower nibble).
+
+	  Buses should be used to allow message routing from one bus to any other bus.
+	  There is no hierarchy between the buses.
+
+config THINGSET_CAN_ROUTING_BRIDGES
+	bool "Bridge numbers"
+	select ISOTP_FAST_FIXED_ADDRESSING
+	help
+	  Bits 16-23 of the CAN ID are used to define a bridge number between 1 and
+	  255. Each bridge defines the connection between two fixed buses. Bridge
+	  number 0 is reserved local communication on the same bus (i.e. no routing).
+
+	  Bridges should be used if the maximum amount of 16 buses is not
+	  sufficient. Otherwise, routing using bus numbers are more simple and generic.
+
+endchoice
+
+config THINGSET_CAN_MULTIPLE_INSTANCES
+	bool "Support for multiple ThingSet CAN instances"
+	depends on ISOTP_FAST
+	help
+	  If enabled, the CAN message processing does not happen in the
+	  background anymore. Instead, each instance has to be initialized
+	  for a dedicated CAN device and and messages have to be processed
+	  manually in application threads.
+
+	  The bus numbering scheme in the CAN ID is not compatible with
+	  the current Zephyr upstream ISO-TP implementation, so it depends
+	  on ISOTP_FAST.
+
+config THINGSET_CAN_DEFAULT_ROUTE
+	int "ThingSet CAN default route"
+	depends on !THINGSET_CAN_MULTIPLE_INSTANCES
+	range 0 15 if THINGSET_CAN_ROUTING_BUSES
+	range 0 255 if THINGSET_CAN_ROUTING_BRIDGES
+	default 0
+	help
+	  The bus or bridge number (depending on THINGSET_CAN_ROUTING choice) is
+	  used to route messages between different buses.
+
+	  For a single bus system, the default 0 should be used.
+
+config THINGSET_CAN_RESPONSE_DELAY
+	int "ThingSet CAN response delay"
+	range 0 100
+	default 10
+	help
+	  Wait for the specified delay in milliseconds before sending out a
+	  response after a request was received.
+
+	  This delay gives the requesting side some more time to switch between
+	  sending and receiving mode, as the Zephyr ISO-TP implementation does
+	  not allow to use the same ID for listening and sending simultaneously.
+
+config THINGSET_CAN_THREAD_STACK_SIZE
+	int "ThingSet CAN thread stack size"
+	depends on !THINGSET_CAN_MULTIPLE_INSTANCES
+	default 2048
+	help
+	  Stack size of thread for processing ThingSet messages transmitted
+	  via CAN ISO-TP.
+
+	  Only available for single-instance implementation.
+
+config THINGSET_CAN_THREAD_PRIORITY
+	int "ThingSet CAN thread priority"
+	depends on !THINGSET_CAN_MULTIPLE_INSTANCES
+	default 2
+	help
+	  Priority of thread for processing ThingSet messages transmitted
+	  via CAN ISO-TP.
+
+	  Only available for single-instance implementation.
+
+endif # THINGSET_CAN

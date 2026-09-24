@@ -1,11 +1,9 @@
-# This west manifest replace default west manifest located in
-# .platformio/packages/framework-zephyr/west.yml. Genuine
-# default version is backup as west.yml.bak in the same folder
-#
-# This file defines the module dependencies of Zephyr RTOS.
-# A script located in owntech/scripts/pre_west.py makes sure
-# the local (project based) west.yml file supplant the default
-# one.
+# PlatformIO's framework-zephyr/scripts/platformio/platformio-build.py reads
+# this project manifest directly (load_west_manifest / install_bundled_projects).
+# It does not require pre_west.py or replacement of the framework manifest.
+# The ThingSet SDK base revision below is retained for dependency resolution;
+# zephyr/CMakeLists.txt overrides the module with the reviewed, vendored fork
+# in third_party/thingset-zephyr-sdk. See its OWNTECH_FORK.md for provenance.
 #
 # A power user can change dependencies version or add new ones
 # at his will using the manifest below.
@@ -53,6 +51,11 @@ manifest:
       groups:
         - fs
       revision: 009bcff0ed4853a53df8256039fa815bda6854dd
+    - name: mbedtls
+      revision: a78176c6ff0733ba08018cba4447bd3f20de7978
+      path: modules/crypto/mbedtls
+      groups:
+        - crypto
     - name: mcuboot
       revision: f74b77cf7808919837c0ed14c2ead3918c546349
       path: bootloader/mcuboot

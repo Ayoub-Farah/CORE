@@ -1,0 +1,74 @@
+name: Zephyr unit testing and docs build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: zephyrprojectrtos/ci:v0.26.5
+    env:
+      CMAKE_PREFIX_PATH: /opt/toolchains
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          path: thingset-zephyr-sdk
+          fetch-depth: 0 # necessary to get tags
+
+      - name: Coding style check
+        working-directory: thingset-zephyr-sdk
+        run: |
+          apt-get update
+          apt-get install -y clang-format-15 colordiff
+          git status
+          bash scripts/check-style.sh
+
+      - name: Initialize west workspace
+        working-directory: thingset-zephyr-sdk
+        run: |
+          west init -l .
+          west update
+          west blobs fetch hal_espressif
+
+      - name: Install docs dependencies
+        working-directory: thingset-zephyr-sdk
+        run: |
+          sudo apt install -y git make python3 python3-pip doxygen
+          pip3 install -r docs/requirements.txt
+
+      - name: Run sample build tests
+        working-directory: thingset-zephyr-sdk
+        run: |
+          west build -p -b olimex_lora_stm32wl_devkit samples/counter -- -DEXTRA_CONF_FILE=lorawan.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b esp32c3_devkitm samples/counter -- -DEXTRA_CONF_FILE=ble.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b native_sim samples/counter -- -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b nrf52840dk_nrf52840 samples/counter -- -DEXTRA_CONF_FILE=dfu.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b nucleo_l073rz samples/counter -- -DEXTRA_CONF_FILE=serial.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b nucleo_l073rz samples/counter -- -DEXTRA_CONF_FILE=storage_eeprom.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b native_sim samples/counter -- -DEXTRA_CONF_FILE=auth.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b native_sim samples/counter -- -DEXTRA_CONF_FILE=can.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b native_sim samples/counter -- -DEXTRA_CONF_FILE=log_backend.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b native_sim samples/counter -- -DEXTRA_CONF_FILE=native_websocket.conf -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+          west build -p -b xiao_esp32c3 samples/serial_ble_gateway -- -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+
+      - name: Run unit tests
+        working-directory: thingset-zephyr-sdk
+        run: |
+          ../zephyr/scripts/twister -T ./tests --integration --inline-logs
+
+      - name: Build documentation
+        working-directory: thingset-zephyr-sdk
+        run: |
+          cd docs
+          make html
+
+      - name: Deploy docs to gh-pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./thingset-zephyr-sdk/docs/build/html/
+          enable_jekyll: false
+          allow_empty_commit: false
+          force_orphan: true
+          publish_branch: gh-pages

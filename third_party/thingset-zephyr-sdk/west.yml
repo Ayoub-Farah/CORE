@@ -1,0 +1,35 @@
+# Copyright (c) The ThingSet Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+manifest:
+  remotes:
+    - name: zephyrproject
+      url-base: https://github.com/zephyrproject-rtos
+    - name: thingset
+      url-base: https://github.com/ThingSet
+    - name: libresolar
+      url-base: https://github.com/LibreSolar
+  projects:
+    - name: zephyr
+      remote: zephyrproject
+      revision: v4.0-branch
+      import:
+        name-allowlist:
+          - cmsis
+          - edtt
+          - hal_espressif
+          - hal_nordic
+          - hal_stm32
+          - hal_st
+          - loramac-node
+          - mbedtls
+          - mcuboot
+          - picolibc
+          - segger
+          - tinycrypt
+          - zcbor
+    - name: thingset-node-c
+      remote: thingset
+      revision: 68c7544830df2ba23f67e31bad91e124377827a3
+      path: modules/thingset-node-c
+      import: true

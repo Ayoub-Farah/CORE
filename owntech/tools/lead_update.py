@@ -19,6 +19,11 @@ class CampaignError(RuntimeError):
     pass
 
 
+DEVICE_EVENTS = ("ERASE_BEGIN", "ERASE_END", "USB_STAGE_BEGIN", "USB_STAGE_END",
+                 "CAN_TRANSFER_BEGIN", "CAN_TRANSFER_END", "FLASH_COMPLETE", "VERIFY_BEGIN",
+                 "VERIFY_END", "ALL_VALIDATED", "REBOOTING", "POSTBOOT_CHECK")
+
+
 def identity(value):
     if isinstance(value, bytes):
         value = value.hex()
@@ -141,6 +146,12 @@ class Journal:
     def __init__(self, path, campaign):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.device_events_seen = set()
+        if self.path.is_file():
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                record = json.loads(line)
+                if "device_event" in record:
+                    self.device_events_seen.add((record["campaign"], record["identity"], record["device_event"]))
         self.stream = self.path.open("a", encoding="utf-8")
         self.campaign = campaign
 
@@ -201,18 +212,35 @@ class Campaign:
                 raise CampaignError("duplicate identity in target status")
             found.add(target)
             old = self.rows.get(target, {})
-            for flag, event in (("flash_complete", "FLASH_COMPLETE"), ("validated", "VERIFY_END")):
-                if row.get(flag) is True and old.get(flag) is not True:
-                    self.journal.emit(event, target, status=row)
+            self._device_events(target, row)
             if old.get("state") != row.get("state"):
                 self.journal.emit("STATE", target, status=row)
-                event = {"ERASING": "ERASE_BEGIN", "RECEIVING": "ERASE_END",
-                         "VERIFYING": "VERIFY_BEGIN"}.get(row.get("state"))
-                if event:
-                    self.journal.emit(event, target)
             self.rows[target] = row
         result["targets"] = rows
         return result
+
+    def _device_events(self, target, row):
+        """Preserve device-recorded transitions missed between PC polls/reboots."""
+        mask = row.get("event_mask", 0)
+        if not mask:
+            return
+        times, order, campaign = row.get("event_ms"), row.get("event_order"), row.get("campaign")
+        count = len(DEVICE_EVENTS)
+        if (type(mask) is not int or not 0 <= mask < 1 << count or type(campaign) is not int
+                or not 0 < campaign < 1 << 64 or not isinstance(times, list) or len(times) != count
+                or not isinstance(order, list) or len(order) != count):
+            raise CampaignError("invalid device event history")
+        present = [index for index in range(count) if mask & (1 << index)]
+        if (any(type(times[index]) is not int or not 0 <= times[index] <= 0xFFFFFFFF
+                or type(order[index]) is not int or not 1 <= order[index] <= count for index in present)
+                or len({order[index] for index in present}) != len(present)):
+            raise CampaignError("invalid device event order/timestamps")
+        for index in sorted(present, key=lambda index: order[index]):
+            key = campaign, target, index
+            if key not in self.journal.device_events_seen:
+                self.journal.emit(DEVICE_EVENTS[index], target, campaign=campaign,
+                                  device_event=index, device_order=order[index], device_uptime_ms=times[index])
+                self.journal.device_events_seen.add(key)
 
     def _table(self, result):
         self.output("Campaign %s | %s | pass %s" % (self.journal.campaign, result.get("phase", result.get("state", "?")), result.get("pass", 0)))
@@ -267,7 +295,7 @@ class Campaign:
         if not rows or any(row.get("available") is not True or row.get("compatible") is not True for row in rows):
             raise CampaignError("all expected boards must expose a compatible, available OTA receiver")
         self.targets = sorted(discovered)
-        self.journal.emit("DISCOVER", targets=self.targets, inventory=rows, manifest=self.manifest)
+        self.journal.emit("DISCOVER", lead_identity=self.lead, targets=self.targets, inventory=rows, manifest=self.manifest)
         return rows
 
     def stage(self):
@@ -277,12 +305,10 @@ class Campaign:
         begin.update(campaign=self.journal.campaign,
                      artifact_sha256=bytes.fromhex(manifest["artifact_sha256"]),
                      mcuboot_image_hash=bytes.fromhex(manifest["mcuboot_image_hash"]))
-        self.journal.emit("USB_STAGE_BEGIN", self.lead, manifest=manifest)
-        self.journal.emit("ERASE_BEGIN", self.lead)
+        self.journal.emit("USB_STAGE_REQUEST", self.lead, manifest=manifest)
         result = self.request("stage_begin", begin)
         if result.get("state", "").upper() not in ("STAGING", "READY"):
             self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() in ("STAGING", "READY"), "Lead erase")
-        self.journal.emit("ERASE_END", self.lead)
         offset = 0
         deadline = self.clock() + self.timeout
         last_display = self.clock() - self.poll_interval
@@ -304,10 +330,6 @@ class Campaign:
         result = self.request("stage_end")
         if result.get("state", "").upper() != "STAGED":
             result = self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() == "STAGED", "Lead reread validation")
-        self.journal.emit("FLASH_COMPLETE", self.lead)
-        self.journal.emit("VERIFY_BEGIN", self.lead)
-        self.journal.emit("VERIFY_END", self.lead)
-        self.journal.emit("USB_STAGE_END", self.lead, offset=offset)
 
     def _all_valid(self, result):
         current = {identity(row["identity"]): row for row in result["targets"]}
@@ -318,7 +340,7 @@ class Campaign:
     def reconcile(self):
         deadline = self.clock() + self.timeout
         expected_hash = self.manifest["mcuboot_image_hash"]
-        self.journal.emit("POSTBOOT_CHECK", targets=self.targets)
+        self.journal.emit("RECONCILE_BEGIN", targets=self.targets)
         good = set()
         while self.clock() < deadline:
             try:
@@ -370,18 +392,16 @@ class Campaign:
         self.discover()
         try:
             self.stage()
-            self.journal.emit("CAN_TRANSFER_BEGIN", targets=self.targets)
+            self.journal.emit("START_REQUEST", targets=self.targets)
             self.request("start", {"campaign": self.journal.campaign, "targets": self.targets})
             self._poll(self._all_valid, "CAN transfer and validation")
-            self.journal.emit("CAN_TRANSFER_END", targets=self.targets)
-            self.journal.emit("ALL_VALIDATED", targets=self.targets)
+            self.journal.emit("COMMIT_REQUEST", targets=self.targets)
             # Mark before transmission: an ACK can be lost after acceptance.
             self.committed = True
             try:
                 self.request("commit", {"campaign": self.journal.campaign})
             except TransportError:
                 pass
-            self.journal.emit("REBOOTING", targets=self.targets)
             if self.reconnect:
                 self.sleep(2)
                 try:
@@ -405,6 +425,8 @@ def journal_campaign(path):
     inventory = None
     lead = None
     usb_serial = None
+    frozen_lead = None
+    frozen_serial = None
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         event = json.loads(line)
         if event.get("event") == "PROBE_LEAD":
@@ -413,9 +435,56 @@ def journal_campaign(path):
             usb_serial = event.get("usb_serial")
         if event.get("event") == "DISCOVER":
             inventory = event
-    if not inventory or not lead:
+            frozen_lead = event.get("lead_identity") or lead
+            frozen_serial = usb_serial
+    if not inventory or not frozen_lead:
         raise CampaignError("journal has no complete frozen campaign inventory")
-    return inventory, identity(lead), usb_serial
+    return inventory, identity(frozen_lead), frozen_serial
+
+
+def prepare_manifest(image_path, output_path=None, profile=None, version=None, build_id=None):
+    """Reuse verified build metadata; never overwrite contradictory provenance."""
+    image_path = Path(image_path)
+    output_path = Path(output_path) if output_path else image_path.with_suffix(".json")
+    existing = None
+    if output_path.is_file():
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            raise CampaignError("existing manifest must be an object")
+    artifact = image_path.read_bytes()
+    effective_profile = profile if profile is not None else (existing.get("profile") if existing else None)
+    effective_build = build_id or (existing.get("build_id") if existing else None)
+    manifest = inspect_image(artifact, effective_profile, version, effective_build)
+    manifest["filename"] = image_path.name
+    if existing is not None:
+        for field in ("artifact_size", "useful_size", "artifact_sha256", "mcuboot_image_hash",
+                      "version", "build_id", "hardware_id", "layout_id", "bootloader_id"):
+            if existing.get(field) != manifest[field]:
+                raise CampaignError("existing manifest contradicts %s; rebuild/regenerate it explicitly before a campaign" % field)
+    else:
+        output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return artifact, manifest
+
+
+def read_only_status(transport):
+    """Take one complete snapshot without discovering, adopting a role or writing."""
+    info = transport.request("info", {})
+    if info.get("service") != "owntech-ota" or info.get("protocol") != 1:
+        raise CampaignError("incompatible application service")
+    result = transport.request("status", {})
+    rows = list(result.get("targets", []))
+    count = result.get("target_count", len(rows))
+    if type(count) is not int or not 0 <= count <= 16:
+        raise CampaignError("invalid bounded target count")
+    if len(rows) < count:
+        rows = []
+        for index in range(count):
+            rows.extend(transport.request("status", {"index": index}).get("targets", []))
+    identities = [identity(row.get("identity")) for row in rows]
+    if len(identities) != count or len(set(identities)) != count:
+        raise CampaignError("incomplete or duplicate status snapshot; retry read-only status")
+    result["targets"] = rows
+    return {"info": info, "status": result}
 
 
 def main(argv=None):
@@ -437,12 +506,18 @@ def main(argv=None):
                         help="operator evidence permits initial application provisioning if no service replies")
     parser.add_argument("--mcumgr", type=Path)
     recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument("--status", action="store_true", help="read info/status only; no discovery, upload, role change or reset")
     recovery.add_argument("--reconcile-journal", type=Path, help="verify an existing frozen campaign without upload/reset")
     recovery.add_argument("--abort-journal", type=Path, help="stop automatic transfer/reset; padded trailer may remain")
     args = parser.parse_args(argv)
     journal = None
     connection = None
     try:
+        if args.status:
+            connection = USBConnection(args.serial, args.port)
+            transport = connection.connect()
+            print(json.dumps(read_only_status(transport), default=json_value, indent=2, sort_keys=True))
+            return 0
         recovery_path = args.reconcile_journal or args.abort_journal
         if not recovery_path and not args.expected_id and not args.expected_count:
             raise CampaignError("supply --expected-id for each card or --expected-count including Lead")
@@ -470,11 +545,9 @@ def main(argv=None):
             return 0
         if not args.image:
             raise CampaignError("--image is required for a new campaign")
-        artifact = args.image.read_bytes()
-        manifest = inspect_image(artifact, load_profile(args.profile) if args.profile else None,
-                                 args.version, args.build_id)
-        manifest_path = args.manifest or args.image.with_suffix(".json")
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        artifact, manifest = prepare_manifest(args.image, args.manifest,
+                                             load_profile(args.profile) if args.profile else None,
+                                             args.version, args.build_id)
         campaign_id = secrets.randbits(63) or 1
         journal = Journal(args.journal or args.image.parent / ("campaign-%016x.jsonl" % campaign_id), campaign_id)
         connection = USBConnection(args.serial, args.port)

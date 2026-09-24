@@ -1,13 +1,16 @@
 from pathlib import Path
 import sys
 import tempfile
+import io
+import json
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "owntech" / "tools"))
 from lead_update import (Campaign, CampaignError, Journal, USBConnection, journal_campaign,
-                         select_port, ReceiverProbeTimeout, TransportError)
+                         select_port, ReceiverProbeTimeout, TransportError, read_only_status, main)
 
 IDS = ["0102030405060708", "1112131415161718", "2122232425262728"]
 MANIFEST = {"artifact_size": 512, "useful_size": 256, "artifact_sha256": "aa" * 32,
@@ -134,6 +137,17 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(inventory["manifest"], MANIFEST)
         self.assertEqual(lead, IDS[0])
 
+    def test_wrong_lead_recovery_probe_cannot_rebind_frozen_journal(self):
+        self.journal.emit("USB_SELECTED", usb_serial="original-usb")
+        self.client().run()
+        # A mistaken recovery attempt is logged before its identity check fails.
+        self.journal.emit("USB_SELECTED", usb_serial="wrong-usb")
+        self.journal.emit("PROBE_LEAD", IDS[1], info={"identity": IDS[1]})
+        inventory, lead, serial = journal_campaign(self.journal.path)
+        self.assertEqual(lead, IDS[0])
+        self.assertEqual(serial, "original-usb")
+        self.assertEqual(inventory["targets"], IDS)
+
     def test_missing_and_wrong_active_image_are_partial(self):
         for missing in (True, False):
             self.transport.postboot = IDS[:2] if missing else IDS
@@ -149,6 +163,34 @@ class CampaignTests(unittest.TestCase):
         for serial in (None, "absent"):
             with self.subTest(serial=serial), self.assertRaises(CampaignError):
                 select_port(ports, serial)
+
+    def test_read_only_status_cli_needs_no_inventory_or_artifact(self):
+        self.transport.paged = True
+        connection = SimpleNamespace(connect=lambda: self.transport, transport=None)
+        with patch("lead_update.USBConnection", return_value=connection), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(["--status", "--serial", "selected"]), 0)
+        self.assertIn(IDS[2], output.getvalue())
+        self.assertEqual({command for command, _ in self.transport.calls}, {"info", "status"})
+
+    def test_device_events_survive_missed_polls_reset_timestamps_and_journal_reopen(self):
+        client = self.client()
+        row = {"campaign": 42, "event_mask": (1 << 0) | (1 << 1) | (1 << 6) | (1 << 11),
+               "event_ms": [1000, 1000, 0, 0, 0, 0, 1001, 0, 0, 0, 0, 5],
+               "event_order": [1, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4]}
+        client._device_events(IDS[0], row)
+        client._device_events(IDS[0], row)
+        events = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual([event["event"] for event in events],
+                         ["ERASE_BEGIN", "ERASE_END", "FLASH_COMPLETE", "POSTBOOT_CHECK"])
+        self.assertEqual([event["device_uptime_ms"] for event in events], [1000, 1000, 1001, 5])
+        self.journal.close()
+        self.journal = Journal(self.journal.path, 42)
+        client = self.client()
+        client._device_events(IDS[0], row)
+        self.assertEqual(len(self.journal.path.read_text().splitlines()), 4)
+        row["campaign"] = 43
+        client._device_events(IDS[0], row)
+        self.assertEqual(len(self.journal.path.read_text().splitlines()), 8)
 
     def test_multiple_cdc_selects_unique_receiver_and_never_bootstraps_busy_port(self):
         connection = USBConnection.__new__(USBConnection)

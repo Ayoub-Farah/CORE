@@ -34,65 +34,38 @@ LOG_MODULE_REGISTER(ts_can, CONFIG_THINGSET_SDK_LOG_LEVEL);
 
 extern struct thingset_context ts;
 
-/* Structure to hold the data to be processed by the workqueue */
-struct can_control_work_data {
-    struct k_work work;
-    /* ThingSet bin headers + CAN frame payload */
-    uint8_t buf[4 + CAN_MAX_DLEN];
-    size_t buf_len;
-};
-
-static struct can_control_work_data can_work_data;
-
-/* Work handler function to be executed in workqueue context */
-static void can_control_work_handler(struct k_work *item)
+/* Commands own their bytes until workqueue processing. Never import arbitrary
+ * high application IDs (including DFUCampaign) through the Control channel. */
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
+struct control_item { uint8_t buf[4 + CAN_MAX_DLEN]; size_t len; };
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_item), 8, 4);
+static void can_control_work_handler(struct k_work *work)
 {
-    struct can_control_work_data *data =
-            CONTAINER_OF(item, struct can_control_work_data, work);
-
-    LOG_HEXDUMP_DBG(data->buf, data->buf_len, "Thingset frame:");
-
-    thingset_import_data(&ts,
-                         data->buf,
-                         data->buf_len,
-                         THINGSET_WRITE_MASK,
-                         THINGSET_BIN_IDS_VALUES);
-}
-
-void can_control_rx_handler(uint16_t data_id,
-                            const uint8_t *value,
-                            size_t value_len,
-                            uint8_t source_addr)
-{
-    /* Control data items use IDs >= 0x8000 */
-    if (data_id >= 0x8000) {
-        /* CBOR: map with 1 element */
-        can_work_data.buf[0] = 0xA1;
-        /* CBOR: uint16 follows (object ID is 2 bytes) */
-        can_work_data.buf[1] = 0x19;
-        /* High byte of data ID */
-        can_work_data.buf[2] = data_id >> 8;
-        /* Low byte of data ID */
-        can_work_data.buf[3] = data_id;
-
-        memcpy(&can_work_data.buf[4], value, value_len);
-
-        can_work_data.buf_len = 4 + value_len;
-
-        LOG_DBG("received control msg with id 0x%X from addr 0x%X",
-                data_id,
-                source_addr);
-
-        /* Submit the work item to the system workqueue */
-        k_work_submit(&can_work_data.work);
+    struct control_item item;
+    while (!k_msgq_get(&control_queue, &item, K_NO_WAIT)) {
+#ifdef CONFIG_OWNTECH_OTA
+        if (ota_safety_inhibited()) continue;
+#endif
+        thingset_import_data(&ts, item.buf, item.len, THINGSET_WRITE_MASK,
+                             THINGSET_BIN_IDS_VALUES);
     }
 }
-
-static int can_control_init()
+K_WORK_DEFINE(control_work, can_control_work_handler);
+void can_control_rx_handler(uint16_t id, const uint8_t *value, size_t len, uint8_t source)
 {
-    k_work_init(&can_work_data.work, can_control_work_handler);
-    thingset_can_set_item_rx_callback(can_control_rx_handler);
-    return 0;
+    ARG_UNUSED(source);
+    if ((id != 0x8001 && id != 0x8002) || len > CAN_MAX_DLEN || !len) return;
+#ifdef CONFIG_OWNTECH_OTA
+    if (ota_safety_inhibited()) return;
+#endif
+    struct control_item item = {.buf = {0xA1, 0x19, id >> 8, id & 255}, .len = 4 + len};
+    memcpy(item.buf + 4, value, len);
+    if (!k_msgq_put(&control_queue, &item, K_NO_WAIT)) k_work_submit(&control_work);
 }
-
+static int can_control_init(void)
+{
+    return thingset_can_set_item_rx_callback(can_control_rx_handler);
+}
 SYS_INIT(can_control_init, APPLICATION, THINGSET_INIT_PRIORITY_DEFAULT);

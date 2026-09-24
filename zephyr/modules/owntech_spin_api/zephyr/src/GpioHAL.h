@@ -226,6 +226,9 @@ public:
 	uint8_t readPin(uint8_t pin);
 
 private:
+#ifdef CONFIG_OWNTECH_OTA
+    bool maintenanceAllows(uint8_t pin, int value);
+#endif
 	/**
 	 * @brief Get the GPIO pin number associated with a logical shield pin.
 	 *

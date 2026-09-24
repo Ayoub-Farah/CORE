@@ -1,3 +1,6 @@
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
 /*
  * Copyright (c) 2023-present LAAS-CNRS
  *
@@ -295,6 +298,9 @@ void PowerAPI::setDutyCycleRaw(leg_t leg, uint16_t duty_value)
 
 void PowerAPI::start(leg_t leg)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    if (ota_safety_inhibited()) return;
+#endif
     int8_t startIndex = 0;
     int8_t endIndex = 0;
 

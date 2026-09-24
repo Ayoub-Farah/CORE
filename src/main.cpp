@@ -25,6 +25,11 @@
  * @author Ayoub Farah Hassan <ayoub.farah-hassan@laas.fr>
  */
 
+#if defined(CONFIG_OWNTECH_OTA_BLINK_DEMO)
+/* PlatformIO builds PROJECT_SRC_DIR independently of CMake's app source list. */
+#include "../examples/ota_blink/main.cpp"
+#else
+
 /* --------------OWNTECH APIs---------------------------------- */
 #include "SpinAPI.h"
 #include "TaskAPI.h"
@@ -114,3 +119,5 @@ int main(void)
 
     return 0;
 }
+
+#endif /* CONFIG_OWNTECH_OTA_BLINK_DEMO */

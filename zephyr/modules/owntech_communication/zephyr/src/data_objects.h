@@ -23,6 +23,7 @@
 
 #include <arm_math.h>
 #include "thingset.h"
+#include "owntech_build_info.h"
 
 /*
  * Groups / first layer data object IDs
@@ -48,7 +49,8 @@
 char manufacturer[] = CONFIG_USB_DEVICE_MANUFACTURER;
 char device_type[] = HW_NAME;
 char hardware_version[] = HW_VER;
-char firmware_version[] = "1.0.0";
+char firmware_version[] = OWNTECH_FIRMWARE_VERSION;
+char firmware_build_id[] = OWNTECH_FIRMWARE_BUILD_ID;
 
 /* Store value of reference (master-slave mode) */
 float32_t reference_value = 0;
@@ -82,6 +84,9 @@ THINGSET_ADD_ITEM_STRING(ID_DEVICE, 0x42, "cHardwareVersion",
 
 THINGSET_ADD_ITEM_STRING(ID_DEVICE, 0x43, "cFirmwareVersion",
                          firmware_version, 0, THINGSET_ANY_R, 0);
+
+THINGSET_ADD_ITEM_STRING(ID_DEVICE, 0x44, "cFirmwareBuildId",
+                         firmware_build_id, 0, THINGSET_ANY_R, 0);
 
 THINGSET_ADD_SUBSET(ID_ROOT, 0x38, "mCAN", SUBSET_CAN,
                     THINGSET_ANY_RW);

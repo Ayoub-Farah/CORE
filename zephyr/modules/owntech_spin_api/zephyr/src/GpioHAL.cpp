@@ -1,3 +1,7 @@
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#include <zephyr/kernel.h>
+#endif
 /*
  * Copyright (c) 2023-present LAAS-CNRS
  *
@@ -39,52 +43,87 @@ const gpio_flags_t OUTPUT       = GPIO_OUTPUT;
 
 void GpioHAL::configurePin(uint8_t pin, gpio_flags_t flags)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (!maintenanceAllows(pin, (flags & GPIO_OUTPUT_INIT_HIGH) ? 1 : (flags & GPIO_OUTPUT_INIT_LOW) ? 0 : 2)) { irq_unlock(ota_key); return; }
+#endif
 	gpio_pin_t pin_number = this->getPinNumber(pin);
 	const struct device* port = this->getGpioDevice(pin);
 	if (port != nullptr)
 	{
 		gpio_pin_configure(port, pin_number, flags);
 	}
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void GpioHAL::setPin(uint8_t pin)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (!maintenanceAllows(pin, 1)) { irq_unlock(ota_key); return; }
+#endif
 	gpio_pin_t pin_number = this->getPinNumber(pin);
 	const struct device* port = this->getGpioDevice(pin);
 	if (port != nullptr)
 	{
 		gpio_pin_set(port, pin_number, 1);
 	}
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void GpioHAL::resetPin(uint8_t pin)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (!maintenanceAllows(pin, 0)) { irq_unlock(ota_key); return; }
+#endif
 	gpio_pin_t pin_number = this->getPinNumber(pin);
 	const struct device* port = this->getGpioDevice(pin);
 	if (port != nullptr)
 	{
 		gpio_pin_set(port, pin_number, 0);
 	}
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void GpioHAL::togglePin(uint8_t pin)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (!maintenanceAllows(pin, 2)) { irq_unlock(ota_key); return; }
+#endif
 	gpio_pin_t pin_number = this->getPinNumber(pin);
 	const struct device* port = this->getGpioDevice(pin);
 	if (port != nullptr)
 	{
 		gpio_pin_toggle(port, pin_number);
 	}
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void GpioHAL::writePin(uint8_t pin, uint8_t value)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (!maintenanceAllows(pin, value != 0)) { irq_unlock(ota_key); return; }
+#endif
 	gpio_pin_t pin_number = this->getPinNumber(pin);
 	const struct device* port = this->getGpioDevice(pin);
 	if (port != nullptr)
 	{
 		gpio_pin_set(port, pin_number, value);
 	}
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 uint8_t GpioHAL::readPin(uint8_t pin)
@@ -243,3 +282,21 @@ const struct device* GpioHAL::getGpioDevice(uint8_t pin)
 
 	return nullptr;
 }
+
+#ifdef CONFIG_OWNTECH_OTA
+bool GpioHAL::maintenanceAllows(uint8_t pin, int value)
+{
+    if (!ota_safety_inhibited()) return true;
+    extern uint8_t dt_leg_count;
+    extern uint16_t dt_pin_driver[], dt_pin_capacitor[];
+    const struct device *port = getGpioDevice(pin);
+    gpio_pin_t number = getPinNumber(pin);
+    for (unsigned i = 0; i < dt_leg_count; ++i) {
+        if (dt_pin_driver[i] && port == getGpioDevice(dt_pin_driver[i]) &&
+            number == getPinNumber(dt_pin_driver[i]) && value != 0) return false;
+        if (dt_pin_capacitor[i] && port == getGpioDevice(dt_pin_capacitor[i]) &&
+            number == getPinNumber(dt_pin_capacitor[i]) && value != 1) return false;
+    }
+    return true;
+}
+#endif

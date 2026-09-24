@@ -65,6 +65,10 @@ list(APPEND ZEPHYR_EXTRA_MODULES ${SUBDIRS})
 # Add extra config and overlay files
 get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
 
+# An extra module with the same module.yml name overrides the downloaded base.
+# Keep the fork in the project, never patch PlatformIO's shared package cache.
+list(APPEND ZEPHYR_EXTRA_MODULES ${PARENT_DIR}/third_party/thingset-zephyr-sdk)
+
 # Looking for app.conf file
 FILELIST(EXTRA_APP_CONF_FILE ${PARENT_DIR}/src conf)
 # Add app.conf path to zephyr variables
@@ -75,11 +79,23 @@ set(EXTRA_CONF_FILE ${EXTRA_APP_CONF_FILE})
 CONFLIB(EXTRA_LIB_CONF_FILE ${PARENT_DIR}/owntech/lib/${BUILD_ENV_NAME} conf)
 # Add app.conf path to zephyr variables
 list(APPEND EXTRA_CONF_FILE ${EXTRA_LIB_CONF_FILE})
+if(DEFINED OWNTECH_BUILD_PROFILE)
+  if(NOT OWNTECH_BUILD_PROFILE MATCHES "^(can|ota_lead)$")
+    message(FATAL_ERROR "Unknown OwnTech build profile")
+  endif()
+  list(APPEND EXTRA_CONF_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/${OWNTECH_BUILD_PROFILE}.conf)
+  if(OWNTECH_FIRMWARE_BUILD_ID STREQUAL "ota-blink-B")
+    list(APPEND EXTRA_CONF_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/blink_b.conf)
+  endif()
+endif()
 
 # Looking for app.overlay file
 FILELIST(EXTRA_OVERLAY_APP_FILE ${PARENT_DIR}/src overlay)
 # Add app.overlay path to zephyr variables
 set(EXTRA_DTC_OVERLAY_FILE ${EXTRA_OVERLAY_APP_FILE})
+if(OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+  list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_usb.overlay)
+endif()
 
 # Check for third party modules
 if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party_modules)
@@ -102,7 +118,7 @@ list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 # board_shield_version is concatenated to board_shield. 
 
 set(BOARD spin@1_2_0)
-set(SHIELD twist_v1_4_1)
+set(SHIELD twist_v1_4_2)
 
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "")
 # Configure Zephyr
@@ -110,5 +126,22 @@ cmake_minimum_required(VERSION 3.13.1)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(owntech_power_api)
+
+# This identity is also used by ThingSet. A signing profile supplies an explicit
+# MCUboot version/build ID; ordinary development builds expose their Git identity.
+if(NOT DEFINED OWNTECH_FIRMWARE_VERSION)
+  set(OWNTECH_FIRMWARE_VERSION "0.0.0-dev")
+endif()
+if(NOT DEFINED OWNTECH_FIRMWARE_BUILD_ID)
+  execute_process(COMMAND git describe --always --dirty --abbrev=12
+    WORKING_DIRECTORY ${PARENT_DIR}
+    OUTPUT_VARIABLE OWNTECH_FIRMWARE_BUILD_ID OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT OWNTECH_FIRMWARE_BUILD_ID)
+    set(OWNTECH_FIRMWARE_BUILD_ID "unversioned")
+  endif()
+endif()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/owntech_build_info.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/generated/owntech_build_info.h @ONLY)
+zephyr_include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/generated)
 target_sources(app PRIVATE ../src/main.cpp)
 zephyr_include_directories(../src)

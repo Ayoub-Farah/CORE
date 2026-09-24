@@ -1,3 +1,6 @@
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
 /*
  * Copyright (c) 2022-present LAAS-CNRS
  *
@@ -46,6 +49,10 @@ void LedHAL::initialize()
 
 void LedHAL::turnOn()
 {
+#ifdef CONFIG_OWNTECH_OTA
+    ota_feedback_application_led(1);
+    return;
+#endif
 	if (ledInitialized == false)
 	{
 		initialize();
@@ -56,6 +63,10 @@ void LedHAL::turnOn()
 
 void LedHAL::turnOff()
 {
+#ifdef CONFIG_OWNTECH_OTA
+    ota_feedback_application_led(0);
+    return;
+#endif
 	if (ledInitialized == false)
 	{
 		initialize();
@@ -66,6 +77,10 @@ void LedHAL::turnOff()
 
 void LedHAL::toggle()
 {
+#ifdef CONFIG_OWNTECH_OTA
+    ota_feedback_application_led(2);
+    return;
+#endif
 	if (ledInitialized == false)
 	{
 		initialize();

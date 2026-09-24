@@ -1,3 +1,6 @@
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
 /*
  * Copyright (c) 2020-present LAAS-CNRS
  *
@@ -817,8 +820,15 @@ void hrtim_out_dis(hrtim_tu_number_t tu_number)
 
 void hrtim_out_en(hrtim_tu_number_t tu_number)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (ota_safety_inhibited()) { irq_unlock(ota_key); return; }
+#endif
     LL_HRTIM_EnableOutput(HRTIM1, tu_channel[tu_number]->gpio_conf.OUT_H);
     LL_HRTIM_EnableOutput(HRTIM1, tu_channel[tu_number]->gpio_conf.OUT_L);
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void hrtim_out_dis_single(hrtim_output_units_t PWM_OUT)
@@ -828,7 +838,14 @@ void hrtim_out_dis_single(hrtim_output_units_t PWM_OUT)
 
 void hrtim_out_en_single(hrtim_output_units_t PWM_OUT)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (ota_safety_inhibited()) { irq_unlock(ota_key); return; }
+#endif
     LL_HRTIM_EnableOutput(HRTIM1, PWM_OUT);
+#ifdef CONFIG_OWNTECH_OTA
+    irq_unlock(ota_key);
+#endif
 }
 
 void hrtim_set_modulation(hrtim_tu_number_t tu_number, hrtim_cnt_t modulation)

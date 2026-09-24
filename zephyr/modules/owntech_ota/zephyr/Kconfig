@@ -1,0 +1,73 @@
+menuconfig OWNTECH_OTA
+	bool "OwnTech collective CAN OTA (experimental)"
+	default n
+	depends on OWNTECH_COMMUNICATION_ENABLE_CAN
+	depends on OWNTECH_FLASH && OWNTECH_SHIELD_API
+	depends on BOOTLOADER_MCUBOOT
+	depends on IMG_MANAGER
+	select THINGSET_CAN_REPORT_RX
+	select IMG_ENABLE_IMAGE_CHECK
+	select CRC
+	select ZCBOR
+	select NET_BUF
+	select BASE64
+	help
+	  One bus, one campaign, sequential storage. Legacy ThingSet DFU must be
+	  disabled so it cannot bypass the shared slot owner. A provisioned boot
+	  profile and application maintenance/health hooks are required to write.
+
+if OWNTECH_OTA
+
+config OWNTECH_OTA_LEAD
+	bool "Compile coordinator and application USB staging"
+	default n
+	help
+	  Capability only. Lead/participant role is persisted separately.
+
+config OWNTECH_OTA_QUEUE_DEPTH
+	int "Ordered command/data queue depth"
+	range 2 32
+	default 8
+
+config OWNTECH_OTA_STACK_SIZE
+	int "OTA worker stack size"
+	range 2048 16384
+	default 4096
+
+config OWNTECH_OTA_USABLE_SLOT_SIZE
+	int "Useful image capacity, excluding padding (zero disables staging)"
+	range 0 227328
+	default 0
+
+config OWNTECH_OTA_HARDWARE_ID
+	hex "Provisioned hardware compatibility ID"
+	default 0
+
+config OWNTECH_OTA_LAYOUT_ID
+	hex "Provisioned flash layout ID"
+	default 0
+
+config OWNTECH_OTA_BOOTLOADER_ID
+	hex "Provisioned bootloader compatibility ID"
+	default 0
+
+config OWNTECH_OTA_HEALTH_TIMEOUT_MS
+	int "Trial boot health deadline (ms)"
+	range 1000 120000
+	default 15000
+
+config OWNTECH_OTA_BLINK_HALF_PERIOD_MS
+	int "Application LED half period (ms)"
+	range 100 5000
+	default 500
+
+config OWNTECH_OTA_BLOCK_INTERVAL_MS
+	int "Minimum delay between OTA blocks (prototype, measure on hardware)"
+	range 1 1000
+	default 20
+
+config OWNTECH_OTA_BLINK_DEMO
+	bool "Build the power-off blink qualification application"
+	default n
+
+endif

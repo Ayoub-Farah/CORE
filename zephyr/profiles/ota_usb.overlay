@@ -1,0 +1,11 @@
+/ {
+	chosen {
+		zephyr,uart-mcumgr = &cdc_acm_ota;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_ota: cdc_acm_ota {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

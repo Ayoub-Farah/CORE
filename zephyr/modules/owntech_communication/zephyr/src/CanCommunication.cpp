@@ -1,3 +1,6 @@
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
 /*
  * Copyright (c) 2024-present LAAS-CNRS
  *
@@ -65,7 +68,11 @@ float32_t CanCommunication::getCtrlReference()
 
 float32_t CanCommunication::getStartStopState()
 {
-    return start_stop;
+    return start_stop
+#ifdef CONFIG_OWNTECH_OTA
+        && !ota_safety_inhibited()
+#endif
+    ;
 }
 
 uint16_t CanCommunication::getControlPeriod()
@@ -90,6 +97,9 @@ void CanCommunication::stopSlaveDevice()
 
 void CanCommunication::startSlaveDevice()
 {
+#ifdef CONFIG_OWNTECH_OTA
+    if (ota_safety_inhibited()) return;
+#endif
     start_stop = 1;
 }
 
@@ -107,6 +117,10 @@ uint16_t CanCommunication::getCanNodeAddr()
 
 void CanCommunication::setCanNodeAddr(uint16_t addr)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    /* Runtime address changes bypass claim/filter consistency. */
+    return;
+#endif
     ts_can_inst->node_addr = addr;
 }
 

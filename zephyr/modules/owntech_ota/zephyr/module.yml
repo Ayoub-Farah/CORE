@@ -1,0 +1,4 @@
+name: owntech_ota
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig

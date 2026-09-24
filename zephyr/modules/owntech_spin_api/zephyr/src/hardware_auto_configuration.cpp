@@ -45,6 +45,10 @@
 
 static const struct device* dac2 = DEVICE_DT_GET(DAC2_DEVICE);
 
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
+
 /* Functions to be run */
 
 /**
@@ -99,7 +103,7 @@ static int _console_init()
 	return 0;
 }
 
-#ifdef CONFIG_BOOTLOADER_MCUBOOT
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA)
 #include <zephyr/kernel.h>
 #include <zephyr/dfu/mcuboot.h>
 
@@ -143,6 +147,10 @@ static int _img_validation()
  */
 void reboot_bootloader_task(struct k_work* work)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    unsigned int ota_key = irq_lock();
+    if (ota_service_busy() || ota_safety_inhibited()) { irq_unlock(ota_key); return; }
+#endif
 	bootmode_set(BOOT_MODE_TYPE_BOOTLOADER);
 	sys_reboot(SYS_REBOOT_WARM);
 }
@@ -158,7 +166,11 @@ K_WORK_DEFINE(reboot_bootloader_work, reboot_bootloader_task);
  */
 void _cdc_rate_callback(const struct device* dev, uint32_t rate)
 {
-	if (rate == 1200)
+	if (rate == 1200
+#ifdef CONFIG_OWNTECH_OTA
+        && !ota_service_busy() && !ota_safety_inhibited()
+#endif
+    )
 	{
 		k_work_submit(&reboot_bootloader_work);
 	}
@@ -228,7 +240,7 @@ SYS_INIT(_console_init,
          89
         );
 
-#ifdef CONFIG_BOOTLOADER_MCUBOOT
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !defined(CONFIG_OWNTECH_OTA)
 SYS_INIT(_img_validation,
          APPLICATION,
          CONFIG_APPLICATION_INIT_PRIORITY

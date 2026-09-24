@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from test_pc_artifact import artifact
+from test_pc_smp import Serial, response
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
@@ -54,6 +55,33 @@ class ProvisionTests(unittest.TestCase):
         return provision(self.connection, Path("exact.mcuboot.bin"), self.manifest, Path("mcumgr"),
                          output=lambda _: None, **kwargs)
 
+    def use_wire_connection(self, lines_by_port):
+        """Exercise the real probe stack with deterministic serial reads/time."""
+        now = [0.0]
+
+        class WireSerial(Serial):
+            def readline(self, size):
+                now[0] += 0.2
+                return super().readline(size)
+
+        streams = {}
+        for device, lines in lines_by_port.items():
+            streams[device] = WireSerial()
+            streams[device].lines = list(lines)
+            streams[device].close = Mock()
+        ports = [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device=device)
+                 for device in streams]
+        with patch.dict(sys.modules, {"serial.tools.list_ports": SimpleNamespace(comports=lambda: ports)}):
+            self.connection = USBConnection()
+        self.connection.bootstrap = Mock(return_value=self.receiver)
+        factory = Mock(side_effect=lambda port, **kwargs: streams[port])
+        patches = [patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=factory)}),
+                   patch("smp_transport.time.monotonic", side_effect=lambda: now[0])]
+        for replacement in patches:
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        return streams, factory
+
     def test_same_live_follower_is_read_only_and_reports_verified_identity(self):
         self.info["mcuboot_image_hash"] = bytes.fromhex(self.manifest["mcuboot_image_hash"])
         result = self.run_provision()
@@ -85,6 +113,44 @@ class ProvisionTests(unittest.TestCase):
         self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
         self.assertEqual(result["result"], "PROVISIONED")
         self.assertEqual(self.receiver.calls, [("info", {})])
+
+    def test_real_silent_probe_bootstraps_once_and_verifies_follower(self):
+        self.info["role"] = "lead"
+        streams, factory = self.use_wire_connection({"COM1": []})
+        result = self.run_provision()
+        self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
+        self.assertEqual(result["result"], "PROVISIONED")
+        self.assertEqual(result["info"]["role"], "follower")
+        self.assertEqual(self.receiver.calls, [("info", {}), ("set_role", {"role": "follower"}), ("info", {})])
+        streams["COM1"].close.assert_called_once()
+        self.assertTrue(streams["COM1"].written)
+        self.assertEqual(factory.call_args.kwargs["baudrate"], 115200)
+
+    def test_real_console_probe_reaches_second_cdc_without_bootstrap(self):
+        streams, factory = self.use_wire_connection({
+            "COM1": [b"application console\n"],
+            "COM2": response(self.info) + response(self.info, sequence=1),
+        })
+        result = self.run_provision()
+        self.assertEqual(result["result"], "ALREADY_INITIALIZED")
+        self.assertEqual(self.connection.device, "COM2")
+        self.connection.bootstrap.assert_not_called()
+        streams["COM1"].close.assert_called_once()
+        streams["COM2"].close.assert_not_called()
+        self.assertEqual([call.args[0] for call in factory.call_args_list], ["COM1", "COM2"])
+        self.assertEqual(len(streams["COM2"].written), 2)
+        self.assertEqual(self.receiver.calls, [])
+
+    def test_real_partial_smp_response_never_bootstraps(self):
+        frames = response(self.info)
+        self.assertGreater(len(frames), 1)
+        streams, _ = self.use_wire_connection({"COM1": frames[:1]})
+        with self.assertRaises((TransportError, CampaignError)) as failure:
+            self.run_provision()
+        self.assertNotIsInstance(failure.exception, ReceiverProbeTimeout)
+        self.connection.bootstrap.assert_not_called()
+        streams["COM1"].close.assert_called_once()
+        self.assertEqual(self.receiver.calls, [])
 
     def test_occupied_malformed_incompatible_and_bootloader_responses_never_bootstrap(self):
         for error in (TransportError("busy"), ProtocolError("bad CRC"), CommandError("unsupported group"),

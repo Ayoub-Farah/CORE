@@ -142,6 +142,7 @@ class SerialSMP:
     def _receive(self, deadline):
         payload = bytearray()
         expected = None
+        saw_frame = False
         while time.monotonic() < deadline:
             line = self.serial.readline(MAX_PACKET * 2)
             if not line:
@@ -153,6 +154,7 @@ class SerialSMP:
                 # Zephyr UART MCUmgr reserves its own framed lines; never treat
                 # application console output as a response or bootstrap evidence.
                 continue
+            saw_frame = True
             try:
                 chunk = base64.b64decode(line[2:].strip(), validate=True)
             except binascii.Error as error:
@@ -174,7 +176,9 @@ class SerialSMP:
                 if binascii.crc_hqx(payload, 0) != 0:
                     raise ProtocolError("SMP UART CRC mismatch")
                 return bytes(payload[:-2])
-        raise ReceiverProbeTimeout("SMP response timeout; receiver absence has not been proven")
+        if saw_frame:
+            raise TransportError("SMP response incomplete; receiver absence has not been proven")
+        raise ReceiverProbeTimeout("SMP response timeout; no framed response received")
 
     def request(self, command, payload=None):
         command_id = COMMANDS[command]
@@ -184,6 +188,7 @@ class SerialSMP:
         sequence = self.sequence
         self.sequence = (self.sequence + 1) & 0xFF
         packet = struct.pack(">BBHHBB", 2, 0, len(body), GROUP, sequence, command_id) + body
+        received_response = False
         try:
             for frame in uart_frames(packet):
                 self.serial.write(frame)
@@ -191,6 +196,7 @@ class SerialSMP:
             deadline = time.monotonic() + self.timeout
             while True:
                 response = self._receive(deadline)
+                received_response = True
                 if len(response) < 8:
                     raise ProtocolError("truncated SMP header")
                 op, flags, length, group, seq, cmd = struct.unpack_from(">BBHHBB", response)
@@ -204,5 +210,15 @@ class SerialSMP:
                 if result.get("rc", 0) != 0 or result.get("err"):
                     raise CommandError("%s rejected: %s" % (command, result))
                 return result
+        except ReceiverProbeTimeout as error:
+            # A late framed reply still proves that a receiver is present.
+            if received_response:
+                raise TransportError("SMP response timeout after a framed reply; "
+                                     "receiver absence has not been proven") from error
+            # Preserve this subtype: USB probing uses it to try the next CDC
+            # interface and explicit provisioning uses it to enter MCUboot.
+            raise
+        except TransportError:
+            raise
         except OSError as error:
             raise TransportError(str(error)) from error

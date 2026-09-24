@@ -1,10 +1,13 @@
 from pathlib import Path
+from itertools import count
 import struct
 import sys
 import unittest
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "owntech" / "tools"))
-from smp_transport import (SerialSMP, ProtocolError, CommandError, cbor_decode,
+from smp_transport import (SerialSMP, ProtocolError, CommandError, TransportError,
+                           ReceiverProbeTimeout, cbor_decode,
                            cbor_encode, uart_frames)
 
 
@@ -56,6 +59,36 @@ class SMPTests(unittest.TestCase):
             client.serial.lines = lines
             with self.assertRaises(error):
                 client.request("info")
+
+    def test_silent_or_console_only_probe_preserves_timeout_type(self):
+        for lines in ([], [b"application log\n"]):
+            with self.subTest(lines=lines):
+                client = SerialSMP("fake", serial_factory=Serial)
+                client.serial.lines = list(lines)
+                with patch("smp_transport.time.monotonic", side_effect=count()), \
+                     self.assertRaises(ReceiverProbeTimeout):
+                    client.request("info")
+
+    def test_partial_or_stale_framed_reply_is_not_receiver_absence(self):
+        fragmented = response({"large": b"x" * 1024})
+        for lines in (fragmented[:1], fragmented[1:2], response({}, sequence=255),
+                      response({}, sequence=255) + fragmented[:1]):
+            with self.subTest(lines=lines):
+                client = SerialSMP("fake", serial_factory=Serial)
+                client.serial.lines = list(lines)
+                with patch("smp_transport.time.monotonic", side_effect=count()), \
+                     self.assertRaises(TransportError) as raised:
+                    client.request("info")
+                self.assertNotIsInstance(raised.exception, ReceiverProbeTimeout)
+
+    def test_serial_io_errors_remain_distinct_from_receiver_absence(self):
+        for operation in ("write", "flush", "readline"):
+            with self.subTest(operation=operation):
+                client = SerialSMP("fake", serial_factory=Serial)
+                setattr(client.serial, operation, Mock(side_effect=OSError("device disconnected")))
+                with self.assertRaisesRegex(TransportError, "device disconnected") as raised:
+                    client.request("info")
+                self.assertNotIsInstance(raised.exception, ReceiverProbeTimeout)
 
 
 if __name__ == "__main__":

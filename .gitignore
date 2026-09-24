@@ -5,3 +5,8 @@
 .vscode/settings.json
 old
 src/Data_records/*
+
+# Local host-test bytecode and campaign journals/build artifacts.
+__pycache__/
+*.py[cod]
+ota-journals/

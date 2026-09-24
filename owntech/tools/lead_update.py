@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Build-independent USB Lead campaign client. See docs/ota-client.md."""
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from ota_artifact import inspect_image, load_profile
+from smp_transport import SerialSMP, TransportError, ReceiverProbeTimeout, ProtocolError, CommandError
+
+
+class CampaignError(RuntimeError):
+    pass
+
+
+def identity(value):
+    if isinstance(value, bytes):
+        value = value.hex()
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{16}", value) is None:
+        raise CampaignError("invalid EUI-64 identity: %r" % value)
+    return value.lower()
+
+
+def json_value(value):
+    if isinstance(value, bytes):
+        return value.hex()
+    raise TypeError(type(value).__name__)
+
+
+def select_port(ports, serial_number=None, device=None):
+    candidates = [port for port in ports if port.vid == 0x2FE3]
+    if serial_number:
+        candidates = [port for port in candidates if port.serial_number == serial_number]
+    if device:
+        candidates = [port for port in candidates if port.device == device]
+    if len(candidates) != 1 or not candidates[0].serial_number:
+        raise CampaignError("select exactly one OwnTech USB device with a stable serial number; found %d" % len(candidates))
+    return candidates[0]
+
+
+class USBConnection:
+    def __init__(self, serial_number=None, device=None, timeout=30):
+        from serial.tools.list_ports import comports
+        self.enumerate = comports
+        ports = [port for port in self.enumerate() if port.vid == 0x2FE3 and port.serial_number
+                 and (not serial_number or port.serial_number == serial_number)
+                 and (not device or port.device == device)]
+        serials = {port.serial_number for port in ports}
+        if len(serials) != 1:
+            raise CampaignError("select exactly one OwnTech USB board by stable serial number")
+        self.serial_number = serials.pop()
+        self.bootstrap_port = device or (ports[0].device if len(ports) == 1 else None)
+        self.device = self.bootstrap_port
+        self.timeout = timeout
+        self.transport = None
+        self.last_info = None
+
+    def connect(self):
+        candidates = [port for port in self.enumerate()
+                      if port.vid == 0x2FE3 and port.serial_number == self.serial_number]
+        if not 1 <= len(candidates) <= 4:
+            raise TransportError("same USB serial is absent or has too many interfaces")
+        selected = []
+        try:
+            for port in candidates:
+                candidate = SerialSMP(port.device)
+                try:
+                    info = candidate.request("info")
+                    if info.get("service") != "owntech-ota" or info.get("protocol") != 1:
+                        raise CampaignError("USB interface replied with an incompatible OTA service")
+                    selected.append((port.device, candidate, info))
+                except ReceiverProbeTimeout:
+                    candidate.close()
+                except Exception:
+                    candidate.close()
+                    raise
+            if not selected:
+                raise ReceiverProbeTimeout("no application receiver replied on the selected USB board")
+            if len(selected) != 1:
+                raise CampaignError("multiple compatible SMP interfaces on the same USB board")
+            self.device, self.transport, self.last_info = selected[0]
+            return self.transport
+        except Exception:
+            for _, candidate, _ in selected:
+                candidate.close()
+            raise
+
+    def reconnect(self):
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+        deadline = time.monotonic() + self.timeout
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                return self.connect()
+            except (CampaignError, TransportError) as error:
+                last = error
+                time.sleep(0.5)
+        raise TransportError("same USB serial did not return: %s (%s)" % (self.serial_number, last))
+
+    def bootstrap(self, image, mcumgr):
+        """Explicit receiver-absent provisioning only, before any campaign exists."""
+        import serial
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+        if not Path(mcumgr).is_file():
+            raise CampaignError("bootstrap needs the existing OwnTech mcumgr executable")
+        if not self.bootstrap_port:
+            raise CampaignError("multiple USB interfaces without a receiver: select the console with --port/custom_ota_port before bootstrap")
+        with serial.Serial(self.bootstrap_port, baudrate=1200, timeout=0.2):
+            pass
+        time.sleep(2)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.device = select_port(self.enumerate(), self.serial_number).device
+                break
+            except CampaignError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+        connection = "dev=%s,baud=115200,mtu=128" % self.device
+        base = [str(mcumgr), "--conntype", "serial", "--connstring", connection]
+        # Neither command writes/replaces the bootloader. A padded image can be
+        # pending already; only this initial provisioning path sends reset.
+        subprocess.run(base + ["image", "upload", str(image)], check=True, timeout=240)
+        subprocess.run(base + ["reset"], check=True, timeout=15)
+        time.sleep(2)
+        return self.reconnect()
+
+
+class Journal:
+    def __init__(self, path, campaign):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = self.path.open("a", encoding="utf-8")
+        self.campaign = campaign
+
+    def emit(self, event, target=None, **data):
+        row = {"timestamp": datetime.now(timezone.utc).isoformat(), "campaign": self.campaign,
+               "identity": target, "event": event, **data}
+        self.stream.write(json.dumps(row, default=json_value, sort_keys=True) + "\n")
+        self.stream.flush()
+
+    def close(self):
+        self.stream.close()
+
+
+class Campaign:
+    def __init__(self, transport, manifest, artifact, journal, expected_ids=None, expected_count=None,
+                 reconnect=None, timeout=180, poll_interval=0.4, clock=time.monotonic, sleep=time.sleep,
+                 output=print):
+        self.transport, self.manifest, self.artifact, self.journal = transport, manifest, artifact, journal
+        self.expected_ids = [identity(value) for value in expected_ids] if expected_ids else None
+        self.expected_count, self.reconnect = expected_count, reconnect
+        self.timeout, self.poll_interval, self.clock, self.sleep = timeout, poll_interval, clock, sleep
+        self.output = output
+        self.targets = []
+        self.rows = {}
+        self.lead = None
+        self.committed = False
+
+    def request(self, name, payload=None):
+        return self.transport.request(name, payload or {})
+
+    def probe(self):
+        response = self.request("info")
+        if response.get("service") != "owntech-ota" or response.get("protocol") != 1:
+            raise CampaignError("USB board replied with an incompatible service; no automatic bootstrap")
+        self.lead = identity(response.get("identity"))
+        self.journal.emit("PROBE_LEAD", self.lead, info=response)
+        if response.get("slot_size") != self.manifest["profile"]["slot_size"]:
+            raise CampaignError("Lead file capacity differs from the artifact profile")
+        if response.get("useful_capacity", 0) < self.manifest["useful_size"]:
+            raise CampaignError("Lead useful image capacity is insufficient")
+        return response
+
+    def _collect(self, command="status", payload=None):
+        result = self.request(command, payload)
+        rows = list(result.get("targets", []))
+        count = result.get("target_count", len(rows))
+        if type(count) is not int or not 0 <= count <= 16:
+            raise CampaignError("invalid bounded target count")
+        if len(rows) < count:
+            rows = []
+            for index in range(count):
+                page = self.request(command, {**(payload or {}), "index": index})
+                rows.extend(page.get("targets", []))
+        found = set()
+        for row in rows:
+            target = identity(row.get("identity"))
+            if target in found:
+                raise CampaignError("duplicate identity in target status")
+            found.add(target)
+            old = self.rows.get(target, {})
+            for flag, event in (("flash_complete", "FLASH_COMPLETE"), ("validated", "VERIFY_END")):
+                if row.get(flag) is True and old.get(flag) is not True:
+                    self.journal.emit(event, target, status=row)
+            if old.get("state") != row.get("state"):
+                self.journal.emit("STATE", target, status=row)
+                event = {"ERASING": "ERASE_BEGIN", "RECEIVING": "ERASE_END",
+                         "VERIFYING": "VERIFY_BEGIN"}.get(row.get("state"))
+                if event:
+                    self.journal.emit(event, target)
+            self.rows[target] = row
+        result["targets"] = rows
+        return result
+
+    def _table(self, result):
+        self.output("Campaign %s | %s | pass %s" % (self.journal.campaign, result.get("phase", result.get("state", "?")), result.get("pass", 0)))
+        self.output("Identity         Role     Accepted/total   Queue State           Validated Postboot")
+        for target in self.targets:
+            row = self.rows.get(target, {})
+            self.output("%s %-8s %6d/%-6d %5d %-15s %-9s %s" % (
+                target, row.get("role", "?"), row.get("offset", 0), self.manifest["artifact_size"],
+                row.get("queue_depth", 0), row.get("state", "MISSING"),
+                str(row.get("validated", False)), row.get("postboot", "WAITING")))
+        self.journal.emit("STATUS", status=result)
+
+    def _poll(self, predicate, description):
+        deadline = self.clock() + self.timeout
+        while self.clock() < deadline:
+            result = self._collect()
+            self._table(result)
+            if str(result.get("phase", result.get("state", ""))).upper() in ("FAILED", "ABORTED"):
+                raise CampaignError("%s failed: %s" % (description, result))
+            if any(row.get("error") not in (None, 0, "", "NONE") for row in result["targets"]):
+                raise CampaignError("target error during %s" % description)
+            if predicate(result):
+                return result
+            self.sleep(self.poll_interval)
+        raise CampaignError("bounded timeout during " + description)
+
+    def discover(self):
+        if not self.expected_ids and not self.expected_count:
+            raise CampaignError("expected identities or expected total count (including Lead) is required")
+        if self.expected_ids and len(self.expected_ids) != len(set(self.expected_ids)):
+            raise CampaignError("duplicate expected identity")
+        deadline = self.clock() + self.timeout
+        while True:
+            result = self._collect("discover")
+            if str(result.get("phase", result.get("state", ""))).upper() != "DISCOVERING":
+                break
+            if self.clock() >= deadline:
+                raise CampaignError("bounded timeout during discovery")
+            self.sleep(self.poll_interval)
+        rows = result["targets"]
+        discovered = [identity(row["identity"]) for row in rows]
+        if self.lead not in discovered:
+            raise CampaignError("discovery must include the USB Lead")
+        addresses = [row.get("address") for row in rows]
+        if None in addresses or len(addresses) != len(set(addresses)):
+            raise CampaignError("discovery contains absent or duplicate CAN addresses")
+        if self.expected_ids and set(self.expected_ids) != set(discovered):
+            raise CampaignError("inventory differs: missing=%s unexpected=%s" % (
+                sorted(set(self.expected_ids) - set(discovered)), sorted(set(discovered) - set(self.expected_ids))))
+        if self.expected_count is not None and len(discovered) != self.expected_count:
+            raise CampaignError("expected %d cards including Lead, discovered %d" % (self.expected_count, len(discovered)))
+        if not rows or any(row.get("available") is not True or row.get("compatible") is not True for row in rows):
+            raise CampaignError("all expected boards must expose a compatible, available OTA receiver")
+        self.targets = sorted(discovered)
+        self.journal.emit("DISCOVER", targets=self.targets, inventory=rows, manifest=self.manifest)
+        return rows
+
+    def stage(self):
+        manifest = self.manifest
+        begin = {key: manifest[key] for key in ("protocol", "artifact_size", "useful_size", "version",
+                                                 "build_id", "hardware_id", "layout_id", "bootloader_id")}
+        begin.update(campaign=self.journal.campaign,
+                     artifact_sha256=bytes.fromhex(manifest["artifact_sha256"]),
+                     mcuboot_image_hash=bytes.fromhex(manifest["mcuboot_image_hash"]))
+        self.journal.emit("USB_STAGE_BEGIN", self.lead, manifest=manifest)
+        self.journal.emit("ERASE_BEGIN", self.lead)
+        result = self.request("stage_begin", begin)
+        if result.get("state", "").upper() not in ("STAGING", "READY"):
+            self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() in ("STAGING", "READY"), "Lead erase")
+        self.journal.emit("ERASE_END", self.lead)
+        offset = 0
+        deadline = self.clock() + self.timeout
+        last_display = self.clock() - self.poll_interval
+        # Custom stage_data enters the same firmware slot owner/writer as CAN.
+        # It cannot shortcut an image already active on the Lead.
+        while offset < len(self.artifact):
+            if self.clock() >= deadline:
+                raise CampaignError("bounded timeout during USB staging")
+            chunk = self.artifact[offset:offset + 256]
+            result = self.request("stage_data", {"offset": offset, "data": chunk})
+            if result.get("offset") != offset + len(chunk):
+                raise CampaignError("USB writer did not accept the exact sequential offset")
+            offset += len(chunk)
+            self.rows.setdefault(self.lead, {"identity": self.lead, "role": "lead"}).update(
+                offset=offset, state="USB_STAGING", flash_complete=False, validated=False)
+            if self.clock() - last_display >= self.poll_interval or offset == len(self.artifact):
+                self._table({"phase": "USB_STAGE", "targets": [self.rows[self.lead]]})
+                last_display = self.clock()
+        result = self.request("stage_end")
+        if result.get("state", "").upper() != "STAGED":
+            result = self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() == "STAGED", "Lead reread validation")
+        self.journal.emit("FLASH_COMPLETE", self.lead)
+        self.journal.emit("VERIFY_BEGIN", self.lead)
+        self.journal.emit("VERIFY_END", self.lead)
+        self.journal.emit("USB_STAGE_END", self.lead, offset=offset)
+
+    def _all_valid(self, result):
+        current = {identity(row["identity"]): row for row in result["targets"]}
+        return result.get("phase") == "ALL_VALIDATED" and set(current) == set(self.targets) and all(
+            row.get("validated") is True and row.get("flash_complete") is True
+            and row.get("offset") == self.manifest["artifact_size"] for row in current.values())
+
+    def reconcile(self):
+        deadline = self.clock() + self.timeout
+        expected_hash = self.manifest["mcuboot_image_hash"]
+        self.journal.emit("POSTBOOT_CHECK", targets=self.targets)
+        good = set()
+        while self.clock() < deadline:
+            try:
+                result = self._collect("reconcile", {"campaign": self.journal.campaign,
+                    "targets": self.targets, "mcuboot_image_hash": bytes.fromhex(expected_hash)})
+                good = set()
+                for row in result["targets"]:
+                    target = identity(row["identity"])
+                    active_hash = row.get("mcuboot_image_hash")
+                    if isinstance(active_hash, bytes):
+                        active_hash = active_hash.hex()
+                    version = str(row.get("version", ""))
+                    if version and "+" not in version:
+                        version += "+0"
+                    valid = (target in self.targets and active_hash == expected_hash
+                             and version == self.manifest["version"]
+                             and row.get("build_id") == self.manifest["build_id"]
+                             and row.get("healthy") is True and row.get("confirmed") is True)
+                    row["postboot"] = "SUCCESS" if valid else "WRONG_IMAGE_OR_UNHEALTHY"
+                    if valid:
+                        good.add(target)
+                self._table(result)
+                if good == set(self.targets) and result.get("phase") == "SUCCESS":
+                    self.journal.emit("SUCCESS", targets=self.targets)
+                    return "SUCCESS"
+            except TransportError:
+                if not self.reconnect:
+                    break
+                try:
+                    self.transport = self.reconnect()
+                    info = self.request("info")
+                    if identity(info.get("identity")) != self.lead:
+                        raise CampaignError("different Lead after reconnect")
+                except TransportError:
+                    pass
+            self.sleep(self.poll_interval)
+        for target in set(self.targets) - good:
+            self.rows.setdefault(target, {"identity": target})["postboot"] = "PARTIAL/TIMEOUT"
+        self._table({"phase": "PARTIAL", "targets": list(self.rows.values())})
+        self.journal.emit("PARTIAL", missing_or_failed=sorted(set(self.targets) - good))
+        raise CampaignError("PARTIAL: not every frozen identity returned with the expected healthy, confirmed image")
+
+    def run(self):
+        info = self.probe()
+        if info.get("available") is not True or info.get("active_confirmed") is not True or info.get("slot_available") is not True:
+            raise CampaignError("Lead not available/confirmed; preserve its rollback slot and reconcile first")
+        if info.get("role") != "lead":
+            self.request("set_role", {"role": "lead"})
+        self.discover()
+        try:
+            self.stage()
+            self.journal.emit("CAN_TRANSFER_BEGIN", targets=self.targets)
+            self.request("start", {"campaign": self.journal.campaign, "targets": self.targets})
+            self._poll(self._all_valid, "CAN transfer and validation")
+            self.journal.emit("CAN_TRANSFER_END", targets=self.targets)
+            self.journal.emit("ALL_VALIDATED", targets=self.targets)
+            # Mark before transmission: an ACK can be lost after acceptance.
+            self.committed = True
+            try:
+                self.request("commit", {"campaign": self.journal.campaign})
+            except TransportError:
+                pass
+            self.journal.emit("REBOOTING", targets=self.targets)
+            if self.reconnect:
+                self.sleep(2)
+                try:
+                    self.transport = self.reconnect()
+                except TransportError:
+                    pass
+            return self.reconcile()
+        except Exception as error:
+            if not self.committed:
+                try:
+                    self.request("abort", {"campaign": self.journal.campaign})
+                except (TransportError, ProtocolError):
+                    pass
+                self.journal.emit("FAILED", error=str(error), targets=self.targets,
+                                  activation_trailer_may_remain=True)
+            raise
+
+
+def journal_campaign(path):
+    """Recover the frozen set and target digest; never infer it from new peers."""
+    inventory = None
+    lead = None
+    usb_serial = None
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        if event.get("event") == "PROBE_LEAD":
+            lead = event.get("identity")
+        if event.get("event") == "USB_SELECTED":
+            usb_serial = event.get("usb_serial")
+        if event.get("event") == "DISCOVER":
+            inventory = event
+    if not inventory or not lead:
+        raise CampaignError("journal has no complete frozen campaign inventory")
+    return inventory, identity(lead), usb_serial
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image", type=Path)
+    parser.add_argument("--bootstrap-image", type=Path,
+                        help="optional initial receiver image (e.g. blink A), distinct from campaign target B")
+    parser.add_argument("--profile", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--serial")
+    parser.add_argument("--port")
+    parser.add_argument("--expected-id", action="append")
+    parser.add_argument("--expected-count", type=int)
+    parser.add_argument("--journal", type=Path)
+    parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--build-id")
+    parser.add_argument("--version")
+    parser.add_argument("--receiver-absent", action="store_true",
+                        help="operator evidence permits initial application provisioning if no service replies")
+    parser.add_argument("--mcumgr", type=Path)
+    recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument("--reconcile-journal", type=Path, help="verify an existing frozen campaign without upload/reset")
+    recovery.add_argument("--abort-journal", type=Path, help="stop automatic transfer/reset; padded trailer may remain")
+    args = parser.parse_args(argv)
+    journal = None
+    connection = None
+    try:
+        recovery_path = args.reconcile_journal or args.abort_journal
+        if not recovery_path and not args.expected_id and not args.expected_count:
+            raise CampaignError("supply --expected-id for each card or --expected-count including Lead")
+        if args.expected_count is not None and not 1 <= args.expected_count <= 16:
+            raise CampaignError("expected count must be between 1 and 16")
+        if args.timeout <= 0:
+            raise CampaignError("timeout must be positive")
+        if recovery_path:
+            inventory, lead, usb_serial = journal_campaign(recovery_path)
+            journal = Journal(recovery_path, inventory["campaign"])
+            connection = USBConnection(args.serial or usb_serial, args.port)
+            transport = connection.connect()
+            client = Campaign(transport, inventory["manifest"], b"", journal,
+                              inventory["targets"], reconnect=connection.reconnect, timeout=args.timeout)
+            client.probe()
+            if client.lead != lead:
+                raise CampaignError("recovery selected a different Lead identity")
+            client.targets = inventory["targets"]
+            if args.abort_journal:
+                client.request("abort", {"campaign": journal.campaign})
+                journal.emit("ABORTED", activation_trailer_may_remain=True)
+                print("ABORTED; maintenance and padded activation trailer may remain")
+            else:
+                print(client.reconcile())
+            return 0
+        if not args.image:
+            raise CampaignError("--image is required for a new campaign")
+        artifact = args.image.read_bytes()
+        manifest = inspect_image(artifact, load_profile(args.profile) if args.profile else None,
+                                 args.version, args.build_id)
+        manifest_path = args.manifest or args.image.with_suffix(".json")
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        campaign_id = secrets.randbits(63) or 1
+        journal = Journal(args.journal or args.image.parent / ("campaign-%016x.jsonl" % campaign_id), campaign_id)
+        connection = USBConnection(args.serial, args.port)
+        journal.emit("USB_SELECTED", usb_serial=connection.serial_number)
+        journal.emit("PROBE_LEAD", usb_serial=connection.serial_number, state="BEGIN")
+        try:
+            transport = connection.connect()
+            probe = connection.last_info
+        except ReceiverProbeTimeout:
+            if not args.receiver_absent or not args.mcumgr:
+                raise
+            bootstrap_image = args.bootstrap_image or args.image
+            bootstrap_profile = dict(manifest["profile"])
+            bootstrap_profile.pop("version", None)
+            bootstrap_profile.pop("build_id", None)
+            bootstrap_manifest = inspect_image(bootstrap_image.read_bytes(), bootstrap_profile)
+            journal.emit("INIT_LEAD", usb_serial=connection.serial_number,
+                         receiver_absent_evidence="explicit operator assertion",
+                         manifest=bootstrap_manifest)
+            transport = connection.bootstrap(bootstrap_image, args.mcumgr)
+            probe = connection.last_info
+        if probe.get("service") != "owntech-ota" or probe.get("protocol") != 1:
+            raise CampaignError("incompatible response; refusing blind bootstrap")
+        campaign = Campaign(transport, manifest, artifact, journal, args.expected_id, args.expected_count,
+                            reconnect=connection.reconnect, timeout=args.timeout)
+        result = campaign.run()
+        print(result + "; journal: " + str(journal.path))
+        return 0
+    except (OSError, ValueError, CampaignError, subprocess.SubprocessError) as error:
+        if journal:
+            journal.emit("PARTIAL" if str(error).startswith("PARTIAL") else "FAILED", error=str(error))
+        print("Lead update failed: %s" % error, file=sys.stderr)
+        return 1
+    finally:
+        if connection and connection.transport:
+            connection.transport.close()
+        if journal:
+            journal.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -99,6 +99,21 @@ class CampaignTests(unittest.TestCase):
         self.transport.paged = True
         self.assertEqual(self.client().run(), "SUCCESS")
 
+    def test_standalone_initialization_does_not_authorize_fleet_update(self):
+        request = self.transport.request
+
+        def standalone(command, payload):
+            reply = request(command, payload)
+            if command == "info":
+                reply.update(phase="WAITING_CAN", available=False, local_healthy=True,
+                             healthy=False, can_ready=False, error=0)
+            return reply
+
+        self.transport.request = standalone
+        with self.assertRaisesRegex(CampaignError, "Lead waiting for CAN"):
+            self.client().run()
+        self.assertEqual([command for command, _ in self.transport.calls], ["info"])
+
     def test_missing_identity_and_duplicate_address_block_before_erase(self):
         self.transport.discovered.pop()
         with self.assertRaises(CampaignError):

@@ -57,6 +57,10 @@ class ProvisionTests(unittest.TestCase):
         return provision(self.connection, Path("exact.mcuboot.bin"), self.manifest, Path("mcumgr"),
                          output=lambda _: None, **kwargs)
 
+    def waiting_can(self):
+        self.info.update(phase="WAITING_CAN", local_healthy=True, healthy=False,
+                         can_ready=False, available=False, error=0)
+
     def use_wire_connection(self, lines_by_port):
         """Exercise the real probe stack with deterministic serial reads/time."""
         now = [0.0]
@@ -88,9 +92,117 @@ class ProvisionTests(unittest.TestCase):
         self.info["mcuboot_image_hash"] = bytes.fromhex(self.manifest["mcuboot_image_hash"])
         result = self.run_provision()
         self.assertEqual(result["result"], "ALREADY_INITIALIZED")
+        self.assertEqual(result["can_status"], "READY")
         self.assertEqual(result["info"]["identity"], "0000000000000001")
         self.assertEqual(self.receiver.calls, [("info", {})])
         self.connection.bootstrap.assert_not_called()
+
+    def test_waiting_for_can_peer_is_initialized_read_only_without_network_health(self):
+        self.waiting_can()
+        sleep = Mock()
+        result = self.run_provision(sleep=sleep)
+        self.assertEqual(result["result"], "ALREADY_INITIALIZED")
+        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
+        self.assertFalse(result["info"]["available"])
+        self.assertTrue(result["info"]["active_confirmed"])
+        self.assertEqual(self.receiver.calls, [("info", {})])
+        sleep.assert_not_called()
+        self.connection.bootstrap.assert_not_called()
+
+    def test_initial_bootstrap_succeeds_without_can_peer_after_local_confirmation(self):
+        self.waiting_can()
+        self.connection.connect.side_effect = ReceiverProbeTimeout("no receiver")
+        result = self.run_provision()
+        self.assertEqual(result["result"], "PROVISIONED")
+        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
+        self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
+        self.assertEqual(self.receiver.calls, [("info", {})])
+
+    def test_real_waiting_can_receiver_is_accepted_without_reset_or_upload(self):
+        self.waiting_can()
+        streams, _ = self.use_wire_connection({"COM1": response(self.info) + response(self.info, sequence=1)})
+        result = self.run_provision()
+        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
+        self.assertEqual(result["result"], "ALREADY_INITIALIZED")
+        self.assertEqual(len(streams["COM1"].written), 2)
+        self.connection.bootstrap.assert_not_called()
+
+    def test_waiting_can_lead_can_be_changed_to_verified_follower(self):
+        self.waiting_can()
+        self.info["role"] = "lead"
+        result = self.run_provision()
+        self.assertEqual(result["info"]["role"], "follower")
+        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
+        self.assertEqual(self.receiver.calls, [("info", {}), ("set_role", {"role": "follower"}), ("info", {})])
+        self.connection.bootstrap.assert_not_called()
+
+    def test_waiting_can_rejects_missing_or_contradictory_health_before_role_change(self):
+        self.waiting_can()
+        self.info["role"] = "lead"
+        fields = ("local_healthy", "healthy", "can_ready", "available", "active_confirmed", "slot_available", "error")
+        for field in fields:
+            original = self.info[field]
+            for value in (None, -17 if field == "error" else not original, False if field == "error" else int(original)):
+                with self.subTest(field=field, value=value):
+                    self.receiver.calls.clear()
+                    if value is None:
+                        self.info.pop(field)
+                    else:
+                        self.info[field] = value
+                    with self.assertRaisesRegex(CampaignError, "coherent local health"):
+                        self.run_provision()
+                    self.assertEqual(self.receiver.calls, [("info", {})])
+                    self.connection.bootstrap.assert_not_called()
+                    self.info[field] = original
+
+    def test_waiting_can_still_requires_the_exact_expected_application(self):
+        self.waiting_can()
+        self.info["role"] = "lead"
+        for field, value in (("version", "0.9.0+0"), ("build_id", "ota-other"), ("mcuboot_image_hash", "00" * 32)):
+            original = self.info[field]
+            self.info[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(CampaignError, "USB_LEAD lead_update"):
+                self.run_provision()
+            self.info[field] = original
+        self.connection.bootstrap.assert_not_called()
+        self.assertTrue(all(call[0] == "info" for call in self.receiver.calls))
+
+    def test_waiting_can_role_recheck_rejects_health_identity_image_and_state_changes(self):
+        self.waiting_can()
+        self.info["role"] = "lead"
+        invalid = {"local_healthy": False, "healthy": True, "can_ready": True, "error": -17,
+                   "active_confirmed": False, "slot_available": False, "available": True,
+                   "identity": "0000000000000002", "build_id": "ota-other", "role": "lead", "phase": "FAILED"}
+        for field, value in invalid.items():
+            with self.subTest(field=field):
+                after = dict(self.info, role="follower")
+                after[field] = value
+                self.receiver.request = Mock(side_effect=[dict(self.info), {"rc": 0}, after])
+                with self.assertRaises(CampaignError):
+                    self.run_provision()
+                self.assertEqual([call.args[0] for call in self.receiver.request.call_args_list], ["info", "set_role", "info"])
+                self.connection.bootstrap.assert_not_called()
+
+    def test_network_may_become_ready_during_follower_role_verification(self):
+        self.waiting_can()
+        self.info["role"] = "lead"
+        ready = dict(self.info, phase="IDLE", role="follower", healthy=True, can_ready=True, available=True)
+        self.receiver.request = Mock(side_effect=[dict(self.info), {"rc": 0}, ready])
+        result = self.run_provision()
+        self.assertEqual(result["can_status"], "READY")
+        self.connection.bootstrap.assert_not_called()
+
+    def test_idle_new_diagnostics_must_agree_with_ready_state(self):
+        self.info.update(local_healthy=True, healthy=True, can_ready=True, error=0)
+        self.assertEqual(self.run_provision()["can_status"], "READY")
+        for field in ("local_healthy", "healthy", "can_ready", "error"):
+            original = self.info[field]
+            self.info[field] = -17 if field == "error" else False
+            with self.subTest(field=field), self.assertRaisesRegex(CampaignError, "inconsistent local/CAN health"):
+                self.run_provision()
+            self.info[field] = original
+        self.connection.bootstrap.assert_not_called()
+        self.assertTrue(all(call[0] == "info" for call in self.receiver.calls))
 
     def test_same_healthy_idle_lead_can_be_initialized_as_follower_only(self):
         self.info["role"] = "lead"
@@ -397,12 +509,15 @@ class ProvisionTests(unittest.TestCase):
                     factory = Mock(return_value=candidate)
                 else:
                     factory = Mock(side_effect=failure)
-                with patch("lead_update.SerialSMP", factory), patch("lead_update.time.monotonic", side_effect=count(step=0.1)), \
+                serial = Mock()
+                with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
+                     patch("lead_update.SerialSMP", factory), patch("lead_update.time.monotonic", side_effect=count(step=0.1)), \
                      patch("lead_update.time.sleep"), patch("lead_update.upload_image") as upload, \
                      patch("lead_update.subprocess.run") as reset, \
                      self.assertRaisesRegex(CampaignError, "image service did not become ready"):
                     connection.bootstrap(Path("exact.mcuboot.bin"), executable, enter_bootloader=False)
                 self.assertTrue(factory.called)
+                serial.assert_not_called()
                 upload.assert_not_called()
                 reset.assert_not_called()
 

@@ -37,6 +37,29 @@ def _verify_image(info, manifest):
         raise CampaignError("a different OTA application is already running; use USB_LEAD lead_update to update it")
 
 
+def _provision_readiness(info):
+    """Local initialization may finish before a CAN peer joins the bus."""
+    if info.get("phase") == "WAITING_CAN":
+        expected = {"local_healthy": True, "healthy": False, "active_confirmed": True,
+                    "slot_available": True, "available": False, "can_ready": False, "error": 0}
+        if any(type(info.get(field)) is not type(value) or info[field] != value
+               for field, value in expected.items()):
+            raise CampaignError("WAITING_CAN receiver lacks coherent local health, confirmation or free slot; "
+                                "inspect --status before any reset")
+        return "WAITING_FOR_PEER"
+    if info.get("phase") != "IDLE":
+        return None
+    # Older IDLE receivers do not expose these diagnostics. If present, each
+    # must agree with the fully ready state before initialization can succeed.
+    for field, value in (("local_healthy", True), ("healthy", True), ("can_ready", True), ("error", 0)):
+        if field in info and (type(info[field]) is not type(value) or info[field] != value):
+            raise CampaignError("IDLE receiver reports inconsistent local/CAN health (%s=%s); "
+                                "inspect --status before any reset" % (field, info[field]))
+    if all(info.get(field) is True for field in ("available", "active_confirmed", "slot_available")):
+        return "READY"
+    return None
+
+
 def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monotonic,
               sleep=time.sleep, output=print):
     """One explicit initialization; a live service is never reset or uploaded."""
@@ -62,20 +85,20 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
         if info.get("service") != "owntech-ota" or info.get("protocol") != manifest["protocol"]:
             raise CampaignError("incompatible live receiver; no automatic bootloader recovery")
         # The USB service is available before the runtime publishes its first
-        # identity/hash snapshot and completes the bounded CAN health check.
+        # identity/hash snapshot and completes the local startup health check.
         if info.get("phase") == "BOOT":
             if clock() >= deadline:
                 raise CampaignError("receiver initialization did not finish; inspect --status before any reset")
             sleep(0.25)
             continue
-        if info.get("phase") != "IDLE":
+        if info.get("phase") not in ("IDLE", "WAITING_CAN"):
             message = "receiver is not idle (%s)" % info.get("phase")
             if info.get("phase") == "FAILED":
                 # A failed startup can leave the active hash unpublished. Report
                 # the failure before interpreting that hash as another image.
                 message += "; startup health failed"
                 details = ["%s=%s" % (field, info[field]) for field in
-                           ("error", "healthy", "can_ready", "active_confirmed", "slot_available")
+                           ("error", "local_healthy", "healthy", "can_ready", "active_confirmed", "slot_available")
                            if field in info]
                 if details:
                     message += " (" + ", ".join(details) + ")"
@@ -88,7 +111,8 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
         if expected_identity is not None and actual_identity != expected_identity:
             raise CampaignError("board identity changed during initialization")
         expected_identity = actual_identity
-        if info.get("available") and info.get("active_confirmed") and info.get("slot_available"):
+        can_status = _provision_readiness(info)
+        if can_status is not None:
             break
         if clock() >= deadline:
             raise CampaignError("receiver is not healthy, confirmed and available; check the active CAN ACK peer "
@@ -100,12 +124,12 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
         transport.request("set_role", {"role": "follower"})
         info = transport.request("info", {})
         _verify_image(info, manifest)
+        can_status = _provision_readiness(info)
         if (identity(info["identity"]) != expected_identity or info.get("role") != "follower"
-                or info.get("phase") != "IDLE" or not info.get("available")
-                or not info.get("active_confirmed") or not info.get("slot_available")):
+                or can_status is None):
             raise CampaignError("follower role/readiness could not be verified; inspect --status")
     result = {"result": "PROVISIONED" if bootstrapped else "ALREADY_INITIALIZED",
-              "usb_serial": connection.serial_number, "info": info}
+              "usb_serial": connection.serial_number, "can_status": can_status, "info": info}
     output(json.dumps(result, default=json_value, indent=2, sort_keys=True))
     return result
 

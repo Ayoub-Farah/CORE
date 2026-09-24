@@ -448,6 +448,9 @@ class Campaign:
 
     def run(self):
         info = self.probe()
+        if info.get("phase") == "WAITING_CAN":
+            raise CampaignError("Lead waiting for CAN; connect and power the terminated 500 kbit/s bus "
+                                "with another initialized board, then retry; no upload/reset was sent")
         if info.get("available") is not True or info.get("active_confirmed") is not True or info.get("slot_available") is not True:
             raise CampaignError("Lead not available/confirmed; preserve its rollback slot and reconcile first")
         if info.get("role") != "lead":

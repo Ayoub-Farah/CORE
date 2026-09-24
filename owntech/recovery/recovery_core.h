@@ -15,6 +15,8 @@ struct OtaRecoveryConfig {
     OtaRecoveryBoard boards[16];
     /* Explicit host-proven, pre-COMMIT USB staging failure; Lead only. */
     bool staged_lead_only;
+    /* Explicit pre-transfer preparation failure; a frozen follower only. */
+    bool prepared_follower_only;
 };
 struct OtaRecoveryIO {
     void *context;

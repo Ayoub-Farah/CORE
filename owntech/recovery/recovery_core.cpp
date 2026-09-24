@@ -21,6 +21,10 @@ bool journal_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
     if(n!=240 || le32(p)!=OTA1 || !crc(p,232) || le64(p+8)!=c.campaign ||
        le32(p+16)!=0 || le32(p+20)!=c.image_size ||
        memcmp(p+25,c.lead_eui,8) || memcmp(p+65,c.image_hash,32)) return false;
+    if(c.prepared_follower_only) {
+        const uint32_t events=le32(p+164);
+        return (p[24]==1 || p[24]==2) && (events==1 || events==3);
+    }
     if(!c.staged_lead_only) return p[24]==6;
     /* Stage validation is saved before VERIFY_END; ABORT may save it again.
      * Both permitted masks prove USB stage/flush/verify without CAN or reboot. */
@@ -71,7 +75,8 @@ bool fleet_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 }
 void make_marker(uint8_t p[64],const OtaRecoveryConfig &c,const uint8_t eui[8])
 {
-    memset(p,0,64);put32(p,REC1);put32(p+4,c.staged_lead_only?2:1);put64(p+8,c.campaign);
+    memset(p,0,64);put32(p,REC1);
+    put32(p+4,c.prepared_follower_only?3:(c.staged_lead_only?2:1));put64(p+8,c.campaign);
     memcpy(p+16,eui,8);memcpy(p+24,c.image_hash,32);put32(p+56,c.image_size);
     put32(p+60,ota_recovery_crc32(p,60));
 }
@@ -91,7 +96,8 @@ uint32_t ota_recovery_crc32(const uint8_t *p,size_t n)
 }
 int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
 {
-    if(!c.campaign || !c.image_size || !c.board_count || c.board_count>16 ||
+    if((c.staged_lead_only && c.prepared_follower_only) ||
+       !c.campaign || !c.image_size || !c.board_count || c.board_count>16 ||
        !nonzero(c.lead_eui,8) || !nonzero(c.image_hash,32) || !io.read || !io.write ||
        !io.erase || !io.identity || !io.backup_hash || !io.health || !io.confirmed || !io.confirm)
         return OTA_RECOVERY_CONFIG;
@@ -105,6 +111,7 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
     uint8_t eui[8],backup[32];
     if(io.identity(io.context,eui)) return OTA_RECOVERY_IDENTITY;
     if(c.staged_lead_only && memcmp(eui,c.lead_eui,8)) return OTA_RECOVERY_IDENTITY;
+    if(c.prepared_follower_only && !memcmp(eui,c.lead_eui,8)) return OTA_RECOVERY_IDENTITY;
     const OtaRecoveryBoard *board=nullptr;
     for(size_t i=0;i<c.board_count;i++) if(!memcmp(c.boards[i].eui,eui,8)) board=&c.boards[i];
     if(!board) return OTA_RECOVERY_IDENTITY;
@@ -124,7 +131,8 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
      * to be absent. Any remaining record must still pass every original guard. */
     if(!(resume && jr==MISSING) && !journal_ok(journal,jr,c)) return OTA_RECOVERY_JOURNAL;
     if(!(resume && ar==MISSING) && !maintenance_ok(maintenance,ar)) return OTA_RECOVERY_MAINTENANCE;
-    if((c.staged_lead_only && !resume && fr==MISSING) ||
+    if((c.prepared_follower_only && fr!=MISSING) ||
+       (c.staged_lead_only && !resume && fr==MISSING) ||
        (fr!=MISSING && !fleet_ok(fleet,fr,c))) return OTA_RECOVERY_FLEET;
     if(io.health(io.context)) return OTA_RECOVERY_HEALTH;
 

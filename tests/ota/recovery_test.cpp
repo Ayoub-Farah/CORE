@@ -77,6 +77,11 @@ void init_staged(Fixture &f)
     memcpy(fleet.bytes,ARM_COMPACT_FLEET,sizeof(ARM_COMPACT_FLEET));
 #endif
 }
+void init_prepared(Fixture &f)
+{
+    init(f,false);f.config.prepared_follower_only=true;
+    auto journal=find(f,0x502);journal->bytes[24]=2;put32(journal->bytes+164,3);checksum(journal->bytes,232);
+}
 bool clean(Fixture &f)
 {for(uint16_t key=0x501;key<=0x504;key++) {auto r=find(f,key);if(r && r->size!=-1) return false;}return true;}
 bool preserved(Fixture &f,const uint8_t role[12])
@@ -179,6 +184,54 @@ extern "C" int ota_recovery_test_run()
     CHECK(find(f,0x504)->bytes[4]==2);f.config.staged_lead_only=false;mutations=f.mutations;
     CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER);CHECK(f.mutations==mutations);
     f.config.staged_lead_only=true;put32(find(f,0x502)->bytes+16,1);checksum(find(f,0x502)->bytes,232);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(f.mutations==mutations);
+
+    /* An erased/prepared follower is separate from a fully staged Lead. It
+     * never has a fleet record, including after a valid recovery intent. */
+    for(unsigned state=1;state<=2;state++) for(unsigned mask=1;mask<=3;mask+=2) {
+        init_prepared(f);memcpy(original_role,find(f,0x500)->bytes,12);
+        auto journal=find(f,0x502);journal->bytes[24]=uint8_t(state);put32(journal->bytes+164,mask);checksum(journal->bytes,232);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERED);CHECK(f.confirmed && clean(f) && preserved(f,original_role));
+        mutations=f.mutations;CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_ALREADY_DONE);CHECK(f.mutations==mutations);
+    }
+    for(unsigned cut=1;cut<=6;cut++) {
+        init_prepared(f);memcpy(original_role,find(f,0x500)->bytes,12);f.cut=cut;
+        CHECK(ota_recovery_run(f.config,io(f))<0);CHECK(preserved(f,original_role));
+        f.cut=0;int rc=ota_recovery_run(f.config,io(f));CHECK(rc==OTA_RECOVERED || rc==OTA_RECOVERY_ALREADY_DONE);
+        CHECK(f.confirmed && clean(f) && preserved(f,original_role));
+    }
+    init_prepared(f);f.config.staged_lead_only=true;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_CONFIG);CHECK(!f.mutations);
+    init_prepared(f);memcpy(f.eui,f.config.lead_eui,8);memcpy(f.backup,f.config.boards[0].original_hash,32);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_IDENTITY);CHECK(!f.mutations);
+    init_prepared(f);f.eui[0]^=128;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_IDENTITY);CHECK(!f.mutations);
+    init_prepared(f);f.backup[0]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_BACKUP);CHECK(!f.mutations);
+    for(unsigned state=0;state<=12;state++) if(state!=1 && state!=2) {
+        init_prepared(f);find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,232);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(!f.mutations);
+    }
+    const uint32_t prepared_bad_masks[]={0,2,3|4,3|8,3|16,3|32,3|64,3|128,3|256,3|512,3|1024,3|2048};
+    for(uint32_t mask:prepared_bad_masks) {
+        init_prepared(f);put32(find(f,0x502)->bytes+164,mask);checksum(find(f,0x502)->bytes,232);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(!f.mutations);
+    }
+    const unsigned prepared_bad_fields[]={8,16,20,25,65};
+    for(unsigned offset:prepared_bad_fields) {
+        init_prepared(f);find(f,0x502)->bytes[offset]^=1;checksum(find(f,0x502)->bytes,232);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(!f.mutations);
+    }
+    init_prepared(f);find(f,0x502)->bytes[100]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(!f.mutations);
+    init_prepared(f);add(f,0x503,304);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_FLEET);CHECK(!f.mutations);
+    init_prepared(f);f.cut=1;CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_STORAGE);f.cut=0;
+    CHECK(find(f,0x504)->bytes[4]==3);mutations=f.mutations;
+    add(f,0x503,304);CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_FLEET);CHECK(f.mutations==mutations);
+    find(f,0x503)->size=-1;f.config.prepared_follower_only=false;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER);CHECK(f.mutations==mutations);
+    f.config.prepared_follower_only=true;put32(find(f,0x502)->bytes+16,1);checksum(find(f,0x502)->bytes,232);
     CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(f.mutations==mutations);
     return 0;
 }

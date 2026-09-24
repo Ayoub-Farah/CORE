@@ -24,6 +24,7 @@ static_assert(sizeof(LegacyLocal)==240 && offsetof(LegacyLocal,crc)==232, "legac
 static_assert(offsetof(LegacyLocal,journal)+offsetof(ota_storage_journal,state)==24, "state offset");
 static_assert(offsetof(LegacyLocal,journal)+offsetof(ota_storage_journal,lead_eui)==25, "lead offset");
 static_assert(offsetof(LegacyLocal,journal)+offsetof(ota_storage_journal,mcuboot_image_hash)==65, "hash offset");
+static_assert(offsetof(LegacyLocal,journal)+offsetof(ota_storage_journal,event_mask)==164, "event mask offset");
 static_assert(sizeof(LegacyFleet)==824 && offsetof(LegacyFleet,crc)==820, "legacy fleet ABI");
 static_assert(offsetof(LegacyFleet,manifest)+offsetof(ota_manifest,mcuboot_image_hash)==69, "fleet hash offset");
 static_assert(offsetof(LegacyFleet,targets)==168 && sizeof(ota_target)==40, "fleet targets ABI");

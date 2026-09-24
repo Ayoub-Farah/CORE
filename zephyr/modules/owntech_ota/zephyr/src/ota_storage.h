@@ -44,6 +44,8 @@ int ota_storage_read(uint32_t offset, uint8_t *data, size_t length);
 void ota_storage_abort(void);
 int ota_storage_persist_campaign(const struct ota_manifest *, const struct ota_target *,
                                 size_t count, uint32_t commit_id, enum ota_state);
+/* OTA2 restores stable EUIs and is_lead only; refresh all other target identity
+ * fields through discovery. Deployed OTA1 records remain readable for recovery. */
 int ota_storage_load_campaign(struct ota_manifest *, struct ota_target *, size_t *count,
                              uint32_t *commit_id);
 /* Only after every frozen identity passed postboot validation. Never clears a

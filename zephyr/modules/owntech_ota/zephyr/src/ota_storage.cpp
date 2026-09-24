@@ -24,9 +24,12 @@ extern "C" void ota_safety_restore(bool);
 namespace {
 constexpr uint16_t ROLE_KEY = 0x0500, MAINTENANCE_KEY = 0x0501, JOURNAL_KEY = 0x0502, FLEET_KEY = 0x0503;
 constexpr uint32_t JOURNAL_MAGIC = 0x3141544f; /* OTA1 */
+constexpr uint32_t FLEET_MAGIC = 0x3241544f; /* OTA2: fixed-width compact fleet */
 struct marker { uint32_t magic; uint32_t value; uint32_t crc; };
 struct local_record { uint32_t magic; ota_storage_journal journal; uint32_t crc; };
-struct fleet_record {
+/* Preserve the deployed OTA1 layout for recovery. New records only retain
+ * stable EUIs; addresses and availability must be rediscovered after reboot. */
+struct legacy_fleet_record {
     uint32_t magic;
     uint32_t length;
     ota_manifest manifest;
@@ -36,6 +39,21 @@ struct fleet_record {
     enum ota_state state;
     uint32_t crc;
 };
+struct fleet_record {
+    uint32_t magic;
+    uint32_t length;
+    uint8_t manifest[157];
+    uint8_t eui[OTA_MAX_TARGETS][8];
+    uint8_t count;
+    uint8_t lead_index;
+    uint8_t state;
+    uint32_t commit_id;
+    uint32_t crc;
+};
+static_assert(sizeof(legacy_fleet_record) == 824 && offsetof(legacy_fleet_record, crc) == 820,
+              "OTA1 fleet recovery requires its deployed layout");
+static_assert(sizeof(fleet_record) == 304 && offsetof(fleet_record, crc) == 300,
+              "OTA2 fleet is a fixed-width record without padding");
 K_MUTEX_DEFINE(slot_mutex);
 struct lock {
     lock() { k_mutex_lock(&slot_mutex, K_FOREVER); }
@@ -53,6 +71,27 @@ uint8_t event_order[12];
 int terminal_error;
 
 uint16_t read16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
+void write32(uint8_t *p, uint32_t value)
+{ for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(value >> (8 * i)); }
+void encode_manifest(uint8_t out[157], const ota_manifest &m)
+{
+    write32(out, (uint32_t)m.campaign_id); write32(out + 4, (uint32_t)(m.campaign_id >> 32));
+    write32(out + 8, m.image_size); write32(out + 12, m.image_content_size);
+    write32(out + 16, m.hardware_id); write32(out + 20, m.layout_id); write32(out + 24, m.bootloader_id);
+    out[28] = m.protocol_version;
+    memcpy(out + 29, m.artifact_sha256, 32); memcpy(out + 61, m.mcuboot_image_hash, 32);
+    memcpy(out + 93, m.version, 32); memcpy(out + 125, m.build_id, 32);
+}
+void decode_manifest(ota_manifest &m, const uint8_t in[157])
+{
+    m = {};
+    m.campaign_id = (uint64_t)ota_read_le32(in) | ((uint64_t)ota_read_le32(in + 4) << 32);
+    m.image_size = ota_read_le32(in + 8); m.image_content_size = ota_read_le32(in + 12);
+    m.hardware_id = ota_read_le32(in + 16); m.layout_id = ota_read_le32(in + 20);
+    m.bootloader_id = ota_read_le32(in + 24); m.protocol_version = in[28];
+    memcpy(m.artifact_sha256, in + 29, 32); memcpy(m.mcuboot_image_hash, in + 61, 32);
+    memcpy(m.version, in + 93, 32); memcpy(m.build_id, in + 125, 32);
+}
 bool equal_manifest(const ota_manifest &a, const ota_manifest &b)
 {
     return a.campaign_id == b.campaign_id && a.image_size == b.image_size &&
@@ -70,11 +109,11 @@ template<typename T> int store(uint16_t key, T &record)
     rc = nvs_storage_read(key, &check, sizeof(check));
     return rc == static_cast<int>(sizeof(check)) && !memcmp(&check, &record, sizeof(check)) ? OTA_OK : OTA_ERR_JOURNAL;
 }
-template<typename T> int load(uint16_t key, T &record)
+template<typename T> int load(uint16_t key, T &record, uint32_t magic = JOURNAL_MAGIC)
 {
     int rc = nvs_storage_read(key, &record, sizeof(record));
     if (rc == -ENOENT) return rc;
-    if (rc != static_cast<int>(sizeof(record)) || record.magic != JOURNAL_MAGIC || record.crc !=
+    if (rc != static_cast<int>(sizeof(record)) || record.magic != magic || record.crc !=
         ota_crc32(reinterpret_cast<const uint8_t *>(&record), offsetof(T, crc))) return OTA_ERR_JOURNAL;
     return OTA_OK;
 }
@@ -103,9 +142,13 @@ int reserve_journal_space(ota_slot_owner desired)
 {
     /* NVS has one spare erase sector: the advertised 4KiB is not all usable
      * live data. Reserve the worst-case frozen fleet without deleting or
-     * relocating calibration/metadata keys. Existing same-size records count
-     * only once because NVS reclaims their old versions. */
-    size_t needed = 0;
+     * relocating calibration/metadata keys. NVS copies the old live value into
+     * the GC sector before appending its replacement: reserve both, not only
+     * final live-data growth. Do not credit shrinking an OTA1 fleet until its
+     * compact replacement is durable. Reserve 8 B for a future GC marker and
+     * 16 B for the NVS version key that the first write may create implicitly.
+     * Other application NVS writers must remain stopped during maintenance. */
+    size_t needed = 8 + 16, overwrite = 0;
     const uint16_t keys[] = {MAINTENANCE_KEY, JOURNAL_KEY, FLEET_KEY};
     const size_t sizes[] = {sizeof(marker), sizeof(local_record), sizeof(fleet_record)};
     unsigned count = desired == OTA_SLOT_USB ? 3 : 2;
@@ -113,10 +156,12 @@ int reserve_journal_space(ota_slot_owner desired)
         uint8_t first;
         int old_size = nvs_storage_read(keys[i], &first, sizeof(first));
         if (old_size < 0 && old_size != -ENOENT) return OTA_ERR_JOURNAL;
-        size_t old = old_size < 0 ? 0 : (size_t)old_size;
-        if (sizes[i] > old) needed += ((sizes[i] + 7) & ~7U) - ((old + 7) & ~7U);
-        if (!old) needed += 8; /* NVS allocation table entry, flash alignment 8. */
+        size_t old = old_size < 0 ? 0 : (((size_t)old_size + 7) & ~(size_t)7) + 8;
+        size_t next = ((sizes[i] + 7) & ~(size_t)7) + 8;
+        if (next > old) needed += next - old;
+        if (next > overwrite) overwrite = next;
     }
+    needed += overwrite;
     int32_t free = nvs_storage_get_free_space();
     return free < 0 || (size_t)free < needed ? OTA_ERR_JOURNAL : OTA_OK;
 }
@@ -417,20 +462,57 @@ int ota_storage_persist_campaign(const ota_manifest *m, const ota_target *target
 {
     if (!m || !targets || !count || count > OTA_MAX_TARGETS || !commit) return OTA_ERR_ARGUMENT;
     lock guard;
-    fleet_record record = {}; record.magic = JOURNAL_MAGIC; record.length = sizeof(record);
-    record.manifest = *m; memcpy(record.targets, targets, count * sizeof(*targets));
-    record.count = count; record.commit_id = commit; record.state = state;
+    fleet_record record = {}; record.magic = FLEET_MAGIC; record.length = sizeof(record);
+    encode_manifest(record.manifest, *m);
+    unsigned leads = 0;
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t nonzero = 0;
+        for (size_t k = 0; k < 8; ++k) nonzero |= targets[i].identity.eui[k];
+        if (!nonzero) return OTA_ERR_IDENTITY;
+        for (size_t j = 0; j < i; ++j)
+            if (!memcmp(targets[i].identity.eui, record.eui[j], 8)) return OTA_ERR_IDENTITY;
+        memcpy(record.eui[i], targets[i].identity.eui, 8);
+        if (targets[i].is_lead) { ++leads; record.lead_index = (uint8_t)i; }
+    }
+    if (leads != 1) return OTA_ERR_IDENTITY;
+    record.count = (uint8_t)count; record.commit_id = commit; record.state = (uint8_t)state;
     return store(FLEET_KEY, record);
 }
 int ota_storage_load_campaign(ota_manifest *m, ota_target *targets, size_t *count, uint32_t *commit)
 {
     if (!m || !targets || !count || !commit) return OTA_ERR_ARGUMENT;
-    lock guard; fleet_record record = {}; int rc = load(FLEET_KEY, record);
+    lock guard;
+    uint32_t header[2] = {};
+    int rc = nvs_storage_read(FLEET_KEY, header, sizeof(header));
+    if (rc < 0) return rc == -ENOENT ? rc : OTA_ERR_JOURNAL;
+    if (rc == static_cast<int>(sizeof(legacy_fleet_record)) && header[0] == JOURNAL_MAGIC) {
+        legacy_fleet_record record = {}; rc = load(FLEET_KEY, record);
+        if (rc) return rc;
+        if (record.length != sizeof(record) || !record.count || record.count > OTA_MAX_TARGETS ||
+            record.count > *count || !record.commit_id) return OTA_ERR_JOURNAL;
+        *m = record.manifest; *count = record.count; *commit = record.commit_id;
+        memcpy(targets, record.targets, record.count * sizeof(*targets)); return OTA_OK;
+    }
+    if (rc != static_cast<int>(sizeof(fleet_record)) || header[0] != FLEET_MAGIC) return OTA_ERR_JOURNAL;
+    fleet_record record = {}; rc = load(FLEET_KEY, record, FLEET_MAGIC);
     if (rc) return rc;
     if (record.length != sizeof(record) || !record.count || record.count > OTA_MAX_TARGETS ||
-        record.count > *count || !record.commit_id) return OTA_ERR_JOURNAL;
-    *m = record.manifest; *count = record.count; *commit = record.commit_id;
-    memcpy(targets, record.targets, record.count * sizeof(*targets)); return OTA_OK;
+        record.count > *count || !record.commit_id || record.lead_index >= record.count ||
+        record.state > OTA_SUCCEEDED) return OTA_ERR_JOURNAL;
+    for (size_t i = 0; i < record.count; ++i) {
+        uint8_t nonzero = 0;
+        for (size_t k = 0; k < 8; ++k) nonzero |= record.eui[i][k];
+        if (!nonzero) return OTA_ERR_JOURNAL;
+        for (size_t j = 0; j < i; ++j)
+            if (!memcmp(record.eui[i], record.eui[j], 8)) return OTA_ERR_JOURNAL;
+    }
+    decode_manifest(*m, record.manifest); *count = record.count; *commit = record.commit_id;
+    memset(targets, 0, record.count * sizeof(*targets));
+    for (size_t i = 0; i < record.count; ++i) {
+        memcpy(targets[i].identity.eui, record.eui[i], 8);
+        targets[i].is_lead = i == record.lead_index;
+    }
+    return OTA_OK;
 }
 int ota_storage_release_maintenance(const uint8_t expected_hash[32])
 {

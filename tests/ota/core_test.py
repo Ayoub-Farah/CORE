@@ -16,7 +16,7 @@ OTA = ROOT / "zephyr/modules/owntech_ota/zephyr"
 
 
 class CoreTests(unittest.TestCase):
-    def compile_and_run(self, storage=False):
+    def compile_and_run(self, storage=False, short_enums=False):
         compiler = shutil.which("clang++") or shutil.which("g++")
         self.assertIsNotNone(compiler, "C++ compiler required (LLVM clang++ on Windows)")
         name = "storage" if storage else "core"
@@ -24,6 +24,8 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="owntech-ota-") as tmp:
             output = Path(tmp) / (name + (".dll" if os.name == "nt" else ""))
             args = [compiler, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror"]
+            if short_enums:
+                args += ["-fshort-enums"]
             includes = [OTA / "public_api", OTA / "src"]
             sources = [OTA / "src/ota_protocol.c"]
             if storage:
@@ -58,6 +60,9 @@ class CoreTests(unittest.TestCase):
 
     def test_storage_and_journal(self):
         self.compile_and_run(storage=True)
+
+    def test_storage_with_arm_enum_layout(self):
+        self.compile_and_run(storage=True, short_enums=True)
 
 
 if __name__ == "__main__":

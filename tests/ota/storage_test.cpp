@@ -8,8 +8,13 @@
 
 static uint8_t flash[2][1024], expected_artifact[1024];
 static flash_area areas[] = {{0,1024},{1,1024}};
-struct nv { uint16_t key; size_t len; uint8_t data[1536]; };
-static nv records[16];
+/* Two 2048-byte sectors, one reserved for GC. Entries append data+ATE; GC
+ * copies every latest live value BEFORE appending a replacement, exactly the
+ * capacity constraint of Zephyr NVS. The old key remains live on ENOSPC. */
+struct nv { uint16_t key; size_t len; unsigned sequence; uint8_t data[1536]; };
+static nv records[2][64];
+static unsigned nv_sector, nv_sequence, nv_used[2], nv_gc_count;
+static bool nv_gc_marker;
 static unsigned erased, flushed_count, scheduled, checked, nvs_writes;
 static bool confirmed = true, inhibited = true, safety_fail, write_fail, nvs_fail, hash_fail;
 static int swap = BOOT_SWAP_TYPE_NONE;
@@ -56,26 +61,66 @@ extern "C" bool ota_safety_inhibited() { return inhibited; }
 extern "C" void ota_safety_restore(bool v) { inhibited = v; }
 int nvs_storage_write(uint16_t key, const void *data, size_t n)
 {
-    if (nvs_fail || n > sizeof(records[0].data)) return -5;
-    for (unsigned i = 0; i < 16; ++i) if (records[i].key == key || !records[i].key) {
-        records[i].key = key; records[i].len = n; memcpy(records[i].data, data, n); ++nvs_writes; return (int)n;
+    if (nvs_fail || n > sizeof(records[0][0].data)) return -EIO;
+    nv *latest = nullptr;
+    for (unsigned i = 0; i < 64; ++i) if (records[nv_sector][i].key == key &&
+            (!latest || records[nv_sector][i].sequence > latest->sequence)) latest = &records[nv_sector][i];
+    if (latest && latest->len == n && !memcmp(latest->data, data, n)) return 0;
+    unsigned required = ((n + 7) & ~7U) + 8;
+    if (nv_used[nv_sector] + required > 2032) {
+        unsigned next = nv_sector ^ 1, count = 0;
+        memset(records[next], 0, sizeof(records[next])); nv_used[next] = 8; /* GC-done ATE */
+        for (unsigned i = 0; i < 64; ++i) {
+            const nv &candidate = records[nv_sector][i];
+            if (!candidate.key) continue;
+            bool obsolete = false;
+            for (unsigned j = 0; j < 64; ++j)
+                if (records[nv_sector][j].key == candidate.key &&
+                    records[nv_sector][j].sequence > candidate.sequence) obsolete = true;
+            if (obsolete) continue;
+            records[next][count++] = candidate;
+            nv_used[next] += ((candidate.len + 7) & ~7U) + 8;
+        }
+        memset(records[nv_sector], 0, sizeof(records[nv_sector])); nv_used[nv_sector] = 0;
+        nv_sector = next; nv_gc_marker = true; ++nv_gc_count;
     }
-    return -5;
+    if (nv_used[nv_sector] + required > 2032) return -ENOSPC;
+    for (unsigned i = 0; i < 64; ++i) if (!records[nv_sector][i].key) {
+        nv &entry = records[nv_sector][i]; entry.key = key; entry.len = n; entry.sequence = ++nv_sequence;
+        memcpy(entry.data, data, n); nv_used[nv_sector] += required; ++nvs_writes; return (int)n;
+    }
+    return -ENOSPC;
 }
 int nvs_storage_read(uint16_t key, void *data, size_t n)
 {
-    for (unsigned i = 0; i < 16; ++i) if (records[i].key == key) {
-        if (n > records[i].len) n = records[i].len;
-        memcpy(data, records[i].data, n);
-        return (int)records[i].len;
+    const nv *latest = nullptr;
+    for (unsigned i = 0; i < 64; ++i) if (records[nv_sector][i].key == key &&
+            (!latest || records[nv_sector][i].sequence > latest->sequence)) latest = &records[nv_sector][i];
+    if (latest) {
+        if (n > latest->len) n = latest->len;
+        memcpy(data, latest->data, n);
+        return (int)latest->len;
     }
     return -ENOENT;
 }
 int32_t nvs_storage_get_free_space()
 {
-    int32_t free=2032;
-    for(unsigned i=0;i<16;++i) if(records[i].key) free-=((records[i].len+7)&~7U)+8;
+    int32_t free = 2032 - (nv_gc_marker ? 8 : 0);
+    for (unsigned i = 0; i < 64; ++i) {
+        const nv &candidate = records[nv_sector][i];
+        if (!candidate.key) continue;
+        bool obsolete = false;
+        for (unsigned j = 0; j < 64; ++j)
+            if (records[nv_sector][j].key == candidate.key &&
+                records[nv_sector][j].sequence > candidate.sequence) obsolete = true;
+        if (!obsolete) free -= ((candidate.len + 7) & ~7U) + 8;
+    }
     return free;
+}
+static void reset_nv()
+{
+    memset(records, 0, sizeof(records)); nv_sector = nv_sequence = nv_gc_count = 0;
+    nv_used[0] = nv_used[1] = 0; nv_gc_marker = false;
 }
 static void reset_ram()
 {
@@ -112,9 +157,102 @@ static int upload(const ota_manifest &m)
     for (uint32_t pos=0;pos<1024;pos+=256) { rc=ota_storage_stage_append(pos,expected_artifact+pos,256); if(rc) return rc; }
     return ota_storage_stage_end(&m);
 }
+static int journal_gc_regressions()
+{
+    reset_nv(); reset_ram(); ota_manifest m=artifact(); m.campaign_id=0xfedcba9876543210ULL;
+    CHECK(!init_service());
+    uint8_t calibration[1200], readback[1200];
+    for(size_t i=0;i<sizeof(calibration);++i) calibration[i]=(uint8_t)(i*37+9);
+    const uint16_t version=1;
+    CHECK(nvs_storage_write(0x0100,&version,sizeof(version))==sizeof(version));
+    CHECK(nvs_storage_write(0x0201,calibration,512)==512);
+    CHECK(!ota_storage_persist_role(true));
+    CHECK(!upload(m));
+    ota_target targets[OTA_MAX_TARGETS]={}; targets[0].is_lead=true;
+    for(size_t i=0;i<OTA_MAX_TARGETS;++i) {
+        targets[i].identity.eui[0]=0xa5;targets[i].identity.eui[7]=(uint8_t)(i+1);
+        targets[i].identity.address=(uint8_t)(i+5);
+    }
+    /* Reproduce the hardware failure: the original growth-only reservation
+     * admits 824 B, VALID is durable, but COMMITTED needs another 832 B while
+     * GC must preserve that VALID record. The prior value survives ENOSPC. */
+    CHECK(nvs_storage_get_free_space()>=832);
+    legacy_fleet_record legacy={};legacy.magic=JOURNAL_MAGIC;legacy.length=sizeof(legacy);
+    legacy.manifest=m;memcpy(legacy.targets,targets,sizeof(targets));
+    legacy.count=2;legacy.commit_id=77;legacy.state=OTA_VALID;
+    CHECK(!store(FLEET_KEY,legacy));
+    legacy.state=OTA_COMMITTED;
+    legacy.crc=ota_crc32(reinterpret_cast<const uint8_t *>(&legacy),offsetof(legacy_fleet_record,crc));
+    CHECK(nvs_storage_write(FLEET_KEY,&legacy,sizeof(legacy))==-ENOSPC);
+    CHECK(store(FLEET_KEY,legacy)==OTA_ERR_JOURNAL);
+    legacy_fleet_record previous={};CHECK(!load(FLEET_KEY,previous)&&previous.state==OTA_VALID);
+    ota_manifest restored={};ota_target restored_targets[OTA_MAX_TARGETS]={};
+    size_t count=OTA_MAX_TARGETS;uint32_t commit=0;
+    CHECK(!ota_storage_load_campaign(&restored,restored_targets,&count,&commit));
+    CHECK(count==2&&commit==77&&equal_manifest(restored,m));
+    CHECK(restored_targets[0].is_lead&&restored_targets[1].identity.address==6);
+    /* Migration may only use currently free bytes; it never counts the 520 B
+     * shrink before the compact replacement itself has been committed. */
+    CHECK(!reserve_journal_space(OTA_SLOT_USB));
+    CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_COMMITTED));
+    uint8_t first=0;CHECK(nvs_storage_read(FLEET_KEY,&first,1)==304);
+    unsigned gc_before=nv_gc_count;
+    for(unsigned i=0;i<80;++i) {
+        CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,78+i,
+              i%2?OTA_REBOOTING:OTA_COMMITTED));
+        CHECK(!save_journal(&m,i%2?OTA_REBOOTING:OTA_COMMITTED,78+i));
+        count=OTA_MAX_TARGETS;CHECK(!ota_storage_load_campaign(&restored,restored_targets,&count,&commit));
+        CHECK(count==OTA_MAX_TARGETS&&commit==78+i&&equal_manifest(restored,m));
+        CHECK(restored_targets[0].is_lead&&!restored_targets[1].is_lead);
+        for(size_t j=0;j<count;++j)
+            CHECK(!memcmp(restored_targets[j].identity.eui,targets[j].identity.eui,8)&&
+                  !restored_targets[j].identity.address);
+    }
+    CHECK(nv_gc_count>gc_before+10);
+    CHECK(nvs_storage_read(0x0201,readback,512)==512&&!memcmp(readback,calibration,512));
+    CHECK(nvs_storage_read(0x0100,&commit,sizeof(commit))==2&&(commit&0xffff)==version);
+    /* A valid CRC cannot hide a malformed compact roster; damaged bytes also
+     * fail loading. These are read-only failures, without migration writes. */
+    fleet_record compact={};CHECK(!load(FLEET_KEY,compact,FLEET_MAGIC));
+    compact.eui[1][0]^=1;CHECK(nvs_storage_write(FLEET_KEY,&compact,sizeof(compact))==sizeof(compact));
+    count=OTA_MAX_TARGETS;CHECK(ota_storage_load_campaign(&restored,restored_targets,&count,&commit)==OTA_ERR_JOURNAL);
+    memcpy(compact.eui[1],compact.eui[0],8);CHECK(!store(FLEET_KEY,compact));
+    CHECK(ota_storage_load_campaign(&restored,restored_targets,&count,&commit)==OTA_ERR_JOURNAL);
+    /* No version key yet: the 16 B implicit first-write allocation must also
+     * fit. Free space equals growth+overwrite+GC, so omitting VERSION would
+     * admit this campaign incorrectly. Rejection must precede any mutation. */
+    reset_nv();reset_ram();CHECK(!init_service());
+    CHECK(nvs_storage_write(0x0201,calibration,1120)==1120);
+    unsigned erase_before=erased, writes_before=nvs_writes;
+    CHECK(nvs_storage_get_free_space()==24+248+312+312+8);
+    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
+    CHECK(erased==erase_before&&nvs_writes==writes_before);
+    /* Enough final live-data space, but no room to replace the largest
+     * journal. Reject before marker, erase or calibration changes. */
+    reset_nv();reset_ram();CHECK(!init_service());
+    CHECK(nvs_storage_write(0x0201,calibration,1200)==1200);
+    erase_before=erased;writes_before=nvs_writes;
+    CHECK(nvs_storage_get_free_space()>24+248+312);
+    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
+    CHECK(erased==erase_before&&nvs_writes==writes_before);
+    CHECK(nvs_storage_read(MAINTENANCE_KEY,&first,1)==-ENOENT);
+    CHECK(nvs_storage_read(0x0201,readback,sizeof(readback))==sizeof(readback)&&
+          !memcmp(readback,calibration,sizeof(readback)));
+    /* Migration must likewise fail closed when old OTA1 data cannot coexist
+     * with OTA2; successful replacement must not be assumed by preflight. */
+    reset_nv();reset_ram();CHECK(!init_service());
+    CHECK(nvs_storage_write(0x0201,calibration,800)==800);
+    CHECK(!save_marker(MAINTENANCE_KEY,false));CHECK(!save_journal(&m,OTA_SUCCEEDED,77));
+    legacy.state=OTA_SUCCEEDED;CHECK(!store(FLEET_KEY,legacy));
+    erase_before=erased;writes_before=nvs_writes;
+    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL&&erased==erase_before&&nvs_writes==writes_before);
+    CHECK(nvs_storage_read(FLEET_KEY,&first,1)==sizeof(legacy));
+    CHECK(nvs_storage_read(0x0201,readback,800)==800&&!memcmp(readback,calibration,800));
+    return 0;
+}
 extern "C" int ota_storage_test_run()
 {
-    memset(records,0,sizeof(records)); reset_ram(); ota_manifest m=artifact();
+    reset_nv(); reset_ram(); ota_manifest m=artifact();
     const uint8_t calibration[4]={1,2,3,4}; CHECK(nvs_storage_write(0x0201,calibration,4)==4);
     CHECK(!init_service() && inhibited); /* health has not released RAM gate */
     bool lead=true; CHECK(!ota_storage_load_role(&lead) && !lead); CHECK(!ota_storage_persist_role(true));
@@ -149,9 +287,12 @@ extern "C" int ota_storage_test_run()
     CHECK(!hooks.schedule_reboot(nullptr,77,1000));CHECK(!hooks.schedule_reboot(nullptr,77,2000)&&scheduled==1);
     CHECK(hooks.schedule_reboot(nullptr,78,1000)==OTA_ERR_CONFLICT);
     ota_target targets[OTA_MAX_TARGETS]={}; targets[0].is_lead=true;
+    for (size_t i=0;i<OTA_MAX_TARGETS;++i) targets[i].identity.eui[7]=(uint8_t)(i+1);
     CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_REBOOTING));
-    CHECK(sizeof(fleet_record)<1536); ota_manifest loaded;size_t count=OTA_MAX_TARGETS;uint32_t commit;
+    CHECK(sizeof(fleet_record)==304); ota_manifest loaded;size_t count=OTA_MAX_TARGETS;uint32_t commit;
     CHECK(!ota_storage_load_campaign(&loaded,targets,&count,&commit)&&count==OTA_MAX_TARGETS&&commit==77);
+    CHECK(equal_manifest(loaded,m) && targets[0].is_lead && !targets[1].is_lead);
+    for(size_t i=0;i<count;++i) CHECK(targets[i].identity.eui[7]==i+1 && !targets[i].identity.address);
     uint8_t existing[4];CHECK(nvs_storage_read(0x0201,existing,4)==4&&!memcmp(existing,calibration,4));
     reset_ram();CHECK(!init_service()&&ota_storage_recovery_required()&&inhibited);
     ota_storage_journal restored;CHECK(!ota_storage_get_journal(&restored));
@@ -167,22 +308,23 @@ extern "C" int ota_storage_test_run()
     ++m.campaign_id;CHECK(!upload(m)&&erased==2);ota_storage_abort();CHECK(ota_storage_recovery_required());
 
     /* Power-safe preconditions precede erase, and journal failure fails closed. */
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());
+    reset_nv();reset_ram();CHECK(!init_service());
     unsigned erase_before=erased;nvs_fail=true;CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
     CHECK(erased==erase_before&&inhibited&&ota_storage_recovery_required());nvs_fail=false;
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());
+    reset_nv();reset_ram();CHECK(!init_service());
     CHECK(!ota_storage_stage_begin(&m));write_fail=true;
     CHECK(ota_storage_stage_append(0,expected_artifact,256)==OTA_ERR_STORAGE&&ota_storage_recovery_required());write_fail=false;
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());hash_fail=true;
+    reset_nv();reset_ram();CHECK(!init_service());hash_fail=true;
     CHECK(upload(m)==OTA_ERR_IMAGE&&ota_storage_recovery_required());hash_fail=false;
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());expected_artifact[1008]^=1;
+    reset_nv();reset_ram();CHECK(!init_service());expected_artifact[1008]^=1;
     CHECK(upload(m)==OTA_ERR_FORMAT&&ota_storage_recovery_required());expected_artifact[1008]^=1;
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());m.mcuboot_image_hash[0]^=1;
+    reset_nv();reset_ram();CHECK(!init_service());m.mcuboot_image_hash[0]^=1;
     CHECK(upload(m)==OTA_ERR_IMAGE&&ota_storage_recovery_required());m.mcuboot_image_hash[0]^=1;
-    memset(records,0,sizeof(records));reset_ram();CHECK(!init_service());
-    records[0].key=0x0301;records[0].len=1400;erase_before=erased;
+    reset_nv();reset_ram();CHECK(!init_service());
+    uint8_t metadata[1400]={};
+    CHECK(nvs_storage_write(0x0301,metadata,sizeof(metadata))==sizeof(metadata));erase_before=erased;
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL&&erased==erase_before);
-    return 0;
+    return journal_gc_regressions();
 }
 #ifndef OWNTECH_FREESTANDING_TEST
 #include <stdio.h>

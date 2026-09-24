@@ -198,6 +198,27 @@ static void discover_all(){
 }
 static void restore_boot_storage(){fake_owner=OTA_SLOT_NONE;fake_recovery=fake_maintenance=true;fake_reboots=0;fake_inhibited=true;}
 static const uint8_t ids[3][8]={{0,0,0,0,0,0,0,1},{0,0,0,0,0,0,0,2},{0,0,0,0,0,0,0,3}};
+static const uint8_t followers_first[3][8]={{0,0,0,0,0,0,0,2},{0,0,0,0,0,0,0,3},{0,0,0,0,0,0,0,1}};
+static int check_campaign_snapshot(uint64_t campaign){
+    ota_observation local{};ota_service_local(&local);
+    CHECK(local.status.campaign_id==campaign&&local.status.image_size==768);
+    CHECK(local.event_mask&&local.event_mask==event_mask);
+    unsigned count=0,orders=0;
+    for(unsigned i=0;i<OTA_EVENT_COUNT;i++){
+        if(local.event_mask&(1U<<i)){
+            unsigned order=local.event_order[i];CHECK(order&&order<=OTA_EVENT_COUNT&&!(orders&(1U<<order)));
+            orders|=1U<<order;++count;
+        }else CHECK(!local.event_ms[i]&&!local.event_order[i]);
+    }
+    CHECK(orders==((1U<<(count+1))-2));
+    bool found=false;
+    for(size_t i=0;i<ota_service_target_count();i++){
+        ota_observation row{};bool lead=false;uint64_t last=0;
+        CHECK(!ota_service_target(i,&row,&lead,&last));
+        if(lead){found=true;CHECK(!memcmp(&row,&local,sizeof(row)));}
+    }
+    CHECK(found);return 0;
+}
 
 static int nominal_test(){
     reset_all();initialize_runtime();CHECK(ota_service_healthy()&&!fake_inhibited);
@@ -214,11 +235,16 @@ static int nominal_test(){
     CHECK(event_order[OTA_EVENT_USB_STAGE_BEGIN]<event_order[OTA_EVENT_USB_STAGE_END]);
     CHECK(event_order[OTA_EVENT_FLASH_COMPLETE]<event_order[OTA_EVENT_VERIFY_BEGIN]);
     CHECK(event_order[OTA_EVENT_VERIFY_BEGIN]<event_order[OTA_EVENT_VERIFY_END]);
-    CHECK(!ota_service_start(42,ids,3));
-    CHECK(ota_service_start(42,ids,3)>=0); /* Retry before first worker execution. */
+    CHECK(!ota_service_start(42,followers_first,3));
+    CHECK(ota_service_start(42,followers_first,3)>=0); /* Retry before first worker execution. */
+    pump();CHECK(!staged&&participant.status.campaign_id==0);
+    int rc=check_campaign_snapshot(42);if(rc)return rc;
+    CHECK(local_snapshot.status.state==OTA_VALID&&local_snapshot.status.validated&&local_snapshot.status.offset==768);
     worker_iteration();CHECK(!service_error);
+    CHECK(participant.status.campaign_id==0);rc=check_campaign_snapshot(42);if(rc)return rc;
     for(unsigned i=0;i<500&&coordinator.phase!=OTA_COORD_VALIDATE_BARRIER;i++){
         worker_iteration();CHECK(fake_receive_timeout==K_MSEC(5)&&!service_error);
+        rc=check_campaign_snapshot(42);if(rc)return rc;
     }
     CHECK(coordinator.phase==OTA_COORD_VALIDATE_BARRIER&&fake_fleet_count==3&&!fake_reboots);
     worker_iteration();CHECK(fake_receive_timeout==K_MSEC(5)); /* Commit barrier still has a campaign deadline. */
@@ -244,6 +270,31 @@ static int nominal_test(){
     CHECK(!strncmp(ota_service_phase(),"SUCCESS",8));idle_reads=fake_identity_reads;worker_iteration();
     CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads&&fake_release_requests==2);
     discover_all();++m.campaign_id;CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY&&fake_prepares==2);
+    for(uint32_t pos=0;pos<768;pos+=256)CHECK(!ota_service_stage_data(pos,data,256));
+    CHECK(!ota_service_stage_end());pump();CHECK(staged);
+    CHECK(!ota_service_start(43,followers_first,3));pump();
+    CHECK(!staged&&participant.status.campaign_id==42);rc=check_campaign_snapshot(43);if(rc)return rc;
+    CHECK(local_snapshot.status.commit_id==0&&local_snapshot.status.pass_id==0&&local_snapshot.status.validated);
+    for(unsigned i=0;i<500&&coordinator.phase!=OTA_COORD_VALIDATE_BARRIER;i++){
+        worker_iteration();CHECK(!service_error);rc=check_campaign_snapshot(43);if(rc)return rc;
+    }
+    CHECK(coordinator.phase==OTA_COORD_VALIDATE_BARRIER&&participant.status.campaign_id==43);
+    return 0;
+}
+static int stage_abort_snapshot_test(){
+    for(unsigned start=0;start<2;start++){
+        reset_all();initialize_runtime();CHECK(!ota_service_set_role(true));discover_all();
+        ota_manifest m=make_manifest();CHECK(!ota_service_stage_begin(&m));pump();
+        uint8_t data[256]={};for(uint32_t pos=0;pos<768;pos+=256)CHECK(!ota_service_stage_data(pos,data,256));
+        CHECK(!ota_service_stage_end());pump();
+        if(start){CHECK(!ota_service_start(42,followers_first,3));pump();}
+        CHECK(participant.status.campaign_id==0);
+        CHECK(!ota_service_abort(42));pump();
+        int rc=check_campaign_snapshot(42);if(rc)return rc;
+        CHECK(local_snapshot.status.state==OTA_ABORTED&&local_snapshot.status.error);
+        CHECK(!local_snapshot.status.validated&&fake_maintenance&&fake_inhibited);
+        if(!start)CHECK(fake_journal.state==OTA_ABORTED);
+    }
     return 0;
 }
 static int bootstrap_test(){
@@ -490,7 +541,8 @@ extern "C" int ota_runtime_state_test_run(){
     rc=standalone_boot_test();if(rc)return rc;
     rc=standalone_failure_test();if(rc)return rc;
     rc=campaign_boot_health_test();if(rc)return rc;
-    rc=nominal_test();if(rc)return rc;rc=reconcile_roster_test();if(rc)return rc;
+    rc=nominal_test();if(rc)return rc;rc=stage_abort_snapshot_test();if(rc)return rc;
+    rc=reconcile_roster_test();if(rc)return rc;
     rc=queued_prepare_test();if(rc)return rc;rc=persisted_lead_participant_test();if(rc)return rc;
     rc=reconcile_failure_test();if(rc)return rc;rc=release_source_test();if(rc)return rc;
     return stale_queue_after_release_test();

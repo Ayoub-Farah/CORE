@@ -142,11 +142,19 @@ static void publish()
     ota_storage_boot_identity(&participant.identity);
     ota_observation o{};o.identity=participant.identity;
     o.status=participant.status;
-    if(staging || verifying || staged) {
+    /* START releases the staging admission flag before the coordinator reaches
+     * this Lead's PREPARE. Keep its staged observation until the participant
+     * adopts this campaign; its previous status may be idle or another campaign.
+     * This changes publication only, never participant admission or ownership. */
+    bool awaiting_adoption=staged_manifest.campaign_id && staged_manifest.campaign_id==event_campaign &&
+        participant.status.campaign_id!=staged_manifest.campaign_id;
+    if(staging || verifying || staged || awaiting_adoption) {
+        o.status={};
         o.status.campaign_id=staged_manifest.campaign_id;o.status.image_size=staged_manifest.image_size;
         o.status.offset=stage_offset;o.status.state=stage_state;o.status.error=service_error;
+        if(service_error && stage_state!=OTA_ABORTED) o.status.state=OTA_FAILED;
         o.status.flash_complete=(event_mask&(1U<<OTA_EVENT_FLASH_COMPLETE))!=0;
-        o.status.validated=staged;
+        o.status.validated=stage_state==OTA_VALID && !service_error;
     }
     if(service_error && !o.status.error) o.status.error=service_error;
     o.status.queue_depth=k_msgq_num_used_get(&ota_queue);
@@ -660,7 +668,7 @@ static void process(Work &w)
         }
         if(reconcile_active) finish_reconcile(OTA_ERR_STATE);
         discovery_active=false;atomic_clear(&discovery_requested);
-        staging=staged=verifying=false;participant.status.state=OTA_ABORTED;set_phase("ABORTED");
+        staging=staged=verifying=false;stage_state=OTA_ABORTED;participant.status.state=OTA_ABORTED;set_phase("ABORTED");
         service_error=OTA_ERR_STATE;break;
     case DISCOVER: begin_discovery();break;
     case RECONCILE: {

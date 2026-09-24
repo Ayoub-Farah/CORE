@@ -61,6 +61,14 @@ its last output. No post-upload reset is sent after an error, stall or interrupt
 transfer. Close the serial monitor before retrying **OTA -> Upload**; this command
 also handles a board left in the standard image service by an earlier attempt.
 
+If a legacy application remains enumerated but produces USB write timeouts and
+does not enter the bootloader at 1200 baud, use the board's BOOT and RESET buttons
+to enter recovery, then retry OTA upload. See the
+[OwnTech recovery procedure](https://docs.owntech.org/latest/bootloader/docs/getting_started/#recovery-mode).
+On older firmware, probing an unconsumed console can block its shared USB
+workqueue. The OTA profile avoids that console overflow path; the PC client
+also checks the other CDC interfaces when one console is inaccessible.
+
 Prepare the shared CAN bus and its wiring, termination and power arrangement
 before the receiver's first boot. Startup health requires CAN to become ready
 within its configured deadline (15 seconds in the supplied profile). An active

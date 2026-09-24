@@ -126,6 +126,14 @@ gate. Application-specific electrical safety, interrupt behavior and flash timin
 need bench tests. Public LED calls use the service's LED owner so OTA state
 indications can temporarily take priority over the application's normal pattern.
 
+The OTA profile sets `CONFIG_CONSOLE_GETCHAR_BUFSIZE=0` on the console CDC.
+Zephyr 4.0's buffered TTY overflow handler can wait for TX space from inside
+the shared USB workqueue, deadlocking both CDC interfaces when console input
+is not consumed. Disabling that TTY RX buffer removes the blocking overflow
+path; the separate SMP CDC retains interrupt-driven reception. `console_getchar()`
+still works, but a caller waiting for keyboard input now polls with 1 ms sleeps.
+The supplied LED application does not call it, so this adds no idle polling task.
+
 ### Coexistence with real-time control outside a campaign
 
 The supplied OTA profile keeps CAN available for requests, but does not enable
@@ -211,6 +219,16 @@ campaign.
 The generic application workflow passed all 60 host tests and the three firmware
 builds on 2026-09-24 (PlatformIO 6.2.0, Zephyr 4.0.0, GNU Arm 12.3.1). Measurements
 below come from the linker reports and inspected signed artifacts:
+
+Subsequent USB provisioning fixes passed 69 PC tests. A hardware check uploaded
+all 227328 bytes with MCUmgr, rebooted into the corrected dual-CDC application,
+and repeatedly selected its SMP interface after probing the unconsumed console.
+The board reported build `ota-b24bcb19601a8ab5256acf65`; USB remained responsive.
+This board was alone on CAN, so startup health stayed `FAILED` and the image was
+not confirmed. This verifies USB transfer and service access, not fleet update
+or CAN/postboot qualification. The corrected OTA build log is
+`.pio/ota-usb-console-build.log`; its upload log is
+`.pio/ota-usb-console-upload.log`.
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|

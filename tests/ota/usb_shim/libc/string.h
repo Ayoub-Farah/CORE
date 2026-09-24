@@ -9,6 +9,7 @@ void *memset(void *, int, size_t);
 int memcmp(const void *, const void *, size_t);
 void *memchr(const void *, int, size_t);
 size_t strlen(const char *);
+int strcmp(const char *, const char *);
 size_t strnlen(const char *, size_t);
 #ifdef __cplusplus
 }

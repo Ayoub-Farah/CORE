@@ -33,7 +33,9 @@ int ota_service_stage_end(void);
 int ota_service_start(uint64_t campaign, const uint8_t identities[][8], size_t count);
 int ota_service_commit(uint64_t campaign);
 int ota_service_abort(uint64_t campaign);
-int ota_service_discover(void);
+/* A new nonzero token refreshes an idle inventory; repeats poll the same scan.
+ * Zero preserves legacy cached discovery. Discovery reserves the idle service. */
+int ota_service_discover(uint64_t campaign);
 int ota_service_reconcile(uint64_t campaign, const uint8_t identities[][8],
                           size_t count, const uint8_t expected_hash[32]);
 /* Snapshot functions are safe from USB/ThingSet threads. */

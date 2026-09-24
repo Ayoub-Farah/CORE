@@ -124,6 +124,41 @@ class CampaignTests(unittest.TestCase):
         self.transport.paged = True
         self.assertEqual(self.client().run(), "SUCCESS")
 
+    def test_discovery_campaign_token_is_stable_across_polls_and_pages(self):
+        self.transport.paged = True
+        original_request = self.transport.request
+        polls = {}
+
+        def request(command, payload):
+            result = original_request(command, payload)
+            if command == "discover":
+                token = payload["campaign"]
+                if "index" not in payload:
+                    polls[token] = polls.get(token, 0) + 1
+                result["phase"] = "DISCOVERING" if polls[token] == 1 else "IDLE"
+            return result
+
+        self.transport.request = request
+        client = self.client()
+        client.probe()
+        client.discover()
+        # A new campaign must invalidate the device's completed scan cache;
+        # polling and pagination within either scan keep their original token.
+        next_journal = Journal(Path(self.temp.name) / "next-campaign.jsonl", 43)
+        try:
+            client.journal = next_journal
+            client.discover()
+        finally:
+            next_journal.close()
+        calls = [payload for command, payload in self.transport.calls if command == "discover"]
+        expected = []
+        for token in (42, 43):
+            for _ in range(2):
+                expected.append({"campaign": token})
+                expected.extend({"campaign": token, "index": index} for index in range(len(IDS)))
+        self.assertEqual(calls, expected)
+        self.assertEqual(polls, {42: 2, 43: 2})
+
     def test_failed_commit_keeps_validated_state_and_journal_error_without_reconnect(self):
         # Real two-board failure: all bytes validated, then the collective NVS
         # journal write fails before any participant COMMIT or reboot.

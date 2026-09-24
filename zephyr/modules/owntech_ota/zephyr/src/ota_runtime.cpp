@@ -43,6 +43,9 @@ static bool discovery_active, discovery_done, staged, staging, verifying;
 static bool waiting_can;
 static uint16_t probe_address=1;
 static uint64_t discovery_deadline, campaign_id;
+/* snapshot_lock protects admission, including the queued discovery interval. */
+static uint64_t discovery_token;
+static bool discovery_reserved;
 static uint32_t stage_offset;
 static int service_error, usb_result;
 static ota_state stage_state=OTA_IDLE;
@@ -165,6 +168,11 @@ static void publish()
     memcpy(o.active_version,OWNTECH_FIRMWARE_VERSION,sizeof(OWNTECH_FIRMWARE_VERSION));
     memcpy(o.active_build_id,OWNTECH_FIRMWARE_BUILD_ID,sizeof(OWNTECH_FIRMWARE_BUILD_ID));
     auto key=k_spin_lock(&snapshot_lock);
+    /* Release only with the completed snapshot, never between finishing the
+     * scan and publishing its table/phase. Reconciliation owns its own busy. */
+    if(discovery_reserved && !discovery_active && !atomic_get(&discovery_requested)) {
+        discovery_reserved=false;atomic_clear(&busy);
+    }
     memcpy(o.active_mcuboot_image_hash,local_snapshot.active_mcuboot_image_hash,32);
     o.rolled_back=local_snapshot.rolled_back;local_snapshot=o;
     diagnostics_snapshot={phase_snapshot,service_error,ota_service_local_healthy(),
@@ -415,14 +423,32 @@ extern "C" int ota_service_abort(uint64_t campaign)
        state.coordinator_phase==OTA_COORD_RECONCILE) return OTA_ERR_STATE;
     Work w{};w.type=ABORT;return enqueue(w);
 }
-extern "C" int ota_service_discover(void)
+extern "C" int ota_service_discover(uint64_t campaign)
 {
     if(!ota_service_is_lead() || !ota_service_healthy()) return OTA_ERR_STATE;
-    auto state=view();
-    if(state.coordinator_phase!=OTA_COORD_IDLE) return OTA_ERR_STATE;
-    if(state.discovery_done || !atomic_cas(&discovery_requested,0,1)) return 0;
-    set_phase("DISCOVERING",true);
-    Work w{};w.type=DISCOVER;int rc=enqueue(w);if(rc) atomic_clear(&discovery_requested);return rc;
+    auto key=k_spin_lock(&snapshot_lock);
+    if(discovery_reserved) {
+        int rc=!campaign || campaign==discovery_token?0:OTA_ERR_STATE;
+        k_spin_unlock(&snapshot_lock,key);return rc;
+    }
+    auto state=runtime_snapshot;
+    if(!ota_service_is_lead() || !ota_service_healthy() || ota_service_busy() || state.error || state.coordinator_phase!=OTA_COORD_IDLE ||
+       state.staging || state.staged || state.verifying || state.reconcile_active) {
+        k_spin_unlock(&snapshot_lock,key);return OTA_ERR_STATE;
+    }
+    if(state.discovery_done && (!campaign || campaign==discovery_token)) {
+        k_spin_unlock(&snapshot_lock,key);return 0;
+    }
+    if(!atomic_cas(&busy,0,1)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_STATE;}
+    Work w{};w.type=DISCOVER;w.command.manifest.campaign_id=campaign;
+    int rc=enqueue(w);
+    if(rc) atomic_clear(&busy);
+    else {
+        discovery_reserved=true;discovery_token=campaign;atomic_set(&discovery_requested,1);
+        runtime_snapshot.discovery_done=false;
+        phase_snapshot=diagnostics_snapshot.phase="DISCOVERING";
+    }
+    k_spin_unlock(&snapshot_lock,key);return rc;
 }
 extern "C" int ota_service_reconcile(uint64_t campaign,const uint8_t ids[][8],size_t n,const uint8_t hash[32])
 {
@@ -670,7 +696,13 @@ static void process(Work &w)
         discovery_active=false;atomic_clear(&discovery_requested);
         staging=staged=verifying=false;stage_state=OTA_ABORTED;participant.status.state=OTA_ABORTED;set_phase("ABORTED");
         service_error=OTA_ERR_STATE;break;
-    case DISCOVER: begin_discovery();break;
+    case DISCOVER: {
+        auto key=k_spin_lock(&snapshot_lock);
+        bool owner=discovery_reserved && discovery_token==w.command.manifest.campaign_id;
+        k_spin_unlock(&snapshot_lock,key);
+        if(owner) begin_discovery();
+        break;
+    }
     case RECONCILE: {
         if(reconcile_active || staging || staged || verifying || coordinator.phase!=OTA_COORD_IDLE) {
             rc=OTA_ERR_STATE;break;

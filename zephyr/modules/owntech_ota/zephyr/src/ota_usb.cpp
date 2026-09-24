@@ -119,10 +119,12 @@ static bool row(zcbor_state_t *z,const ota_observation &o,bool lead,uint64_t see
         boolean(z,"compatible",compatible) &&
         zcbor_tstr_put_lit(z,"error") && zcbor_int32_put(z,o.status.error) && zcbor_map_end_encode(z,32);
 }
-static bool status(zcbor_state_t *z,uint32_t index)
+static bool status(zcbor_state_t *z,uint32_t index,bool discovery=false)
 {
     ota_observation local{};ota_service_diagnostics d{};ota_service_snapshot(&local,&d);
-    size_t count=ota_service_target_count();
+    /* A rescan replaces the previous table. Expose pages only once complete,
+     * so an old page count cannot address a partially rebuilt inventory. */
+    size_t count=discovery && !strcmp(d.phase,"DISCOVERING")?0:ota_service_target_count();
     if(!text(z,"phase",d.phase) || !text(z,"state",d.phase) || !health(z,d) ||
        !number(z,"campaign",ota_service_campaign()) || !number(z,"pass",ota_service_pass()) ||
        !number(z,"offset",ota_service_stage_offset()) || !number(z,"target_count",count) ||
@@ -158,7 +160,7 @@ static int handle(smp_streamer *ctxt,int command)
         else rc=OTA_ERR_ARGUMENT;
         break;
     case 2:
-        rc=ota_service_discover();ok=status(z,r.index);break;
+        rc=ota_service_discover(r.campaign);ok=status(z,r.index,true);break;
     case 3:
         if(!r.campaign || r.protocol!=OTA_PROTOCOL_VERSION || r.artifact_hash.len!=32 || r.image_hash.len!=32 ||
            !r.version.len || r.version.len>=32 || !r.build.len || r.build.len>=32 ||

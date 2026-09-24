@@ -11,3 +11,5 @@ int memcmp(const void *aa,const void *bb,size_t n)
 void *memchr(const void *p,int c,size_t n)
 { const unsigned char *s=p;while(n--){if(*s==(unsigned char)c)return (void *)s;++s;}return NULL; }
 size_t strlen(const char *s) { size_t n=0;while(s[n])++n;return n; }
+int strcmp(const char *a,const char *b)
+{ while(*a && *a==*b){++a;++b;}return (unsigned char)*a-(unsigned char)*b; }

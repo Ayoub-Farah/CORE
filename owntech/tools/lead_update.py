@@ -365,7 +365,7 @@ class Campaign:
             raise CampaignError("duplicate expected identity")
         deadline = self.clock() + self.timeout
         while True:
-            result = self._collect("discover")
+            result = self._collect("discover", {"campaign": self.journal.campaign})
             if str(result.get("phase", result.get("state", ""))).upper() != "DISCOVERING":
                 break
             if self.clock() >= deadline:

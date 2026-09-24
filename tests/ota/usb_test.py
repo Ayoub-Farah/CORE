@@ -118,7 +118,7 @@ class USBTests(unittest.TestCase):
         if os.name == "nt":
             command += ["-nostdlib", "-fuse-ld=lld", "-Wl,/noentry",
                         "-Wl,/export:usb_smp_request", "-Wl,/export:usb_reset", "-Wl,/export:usb_stat",
-                        "-Wl,/export:usb_health"]
+                        "-Wl,/export:usb_health", "-Wl,/export:usb_discovery_pending"]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError(result.stdout + result.stderr)
@@ -128,6 +128,7 @@ class USBTests(unittest.TestCase):
         cls.lib.usb_stat.argtypes = [ctypes.c_uint]
         cls.lib.usb_stat.restype = ctypes.c_uint
         cls.lib.usb_health.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_int]
+        cls.lib.usb_discovery_pending.argtypes = [ctypes.c_bool]
 
     @classmethod
     def tearDownClass(cls):
@@ -188,6 +189,24 @@ class USBTests(unittest.TestCase):
                     if command == "info":
                         self.assertFalse(reply["available"])
         self.assertLess(self.serial.maximum_response, 1536)
+
+    def test_discovery_token_roundtrip_and_complete_pages_only(self):
+        token = 0xFEDCBA9876543210
+        self.lib.usb_discovery_pending(True)
+        reply = self.client.request("discover", {"campaign": token, "index": 15})
+        self.assertEqual(reply["phase"], "DISCOVERING")
+        self.assertEqual((reply["target_count"], reply["targets"]), (0, []))
+        self.assertEqual((self.lib.usb_stat(5), self.lib.usb_stat(6)),
+                         (token & 0xFFFFFFFF, token >> 32))
+        self.lib.usb_discovery_pending(False)
+        for index, expected in enumerate(IDS):
+            reply = self.client.request("discover", {"campaign": token, "index": index})
+            self.assertEqual(reply["target_count"], 3)
+            self.assertEqual(reply["targets"][0]["identity"], expected)
+            self.assertEqual((self.lib.usb_stat(5), self.lib.usb_stat(6)),
+                             (token & 0xFFFFFFFF, token >> 32))
+        self.client.request("discover")
+        self.assertEqual((self.lib.usb_stat(5), self.lib.usb_stat(6)), (0, 0))
 
     def test_full_python_campaign_over_uart_smp_cbor_native_handlers(self):
         with tempfile.TemporaryDirectory() as directory:

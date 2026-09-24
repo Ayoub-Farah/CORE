@@ -10,6 +10,7 @@ static uint8_t ids[OTA_MAX_TARGETS][8];
 static size_t target_count;
 static uint32_t accepted;
 static unsigned stage_calls, commit_calls;
+static uint64_t discovery_token;
 static bool lead_role, staged, active_target;
 static bool local_health, can_ready;
 static int health_error;
@@ -20,13 +21,16 @@ extern "C" void usb_reset(void)
     memset(&stored,0,sizeof(stored));memset(ids,0,sizeof(ids));
     for(unsigned n=0;n<3;n++) for(unsigned i=0;i<8;i++) ids[n][i]=i+1+16*n;
     target_count=3;accepted=stage_calls=commit_calls=0;
+    discovery_token=0;
     lead_role=true;staged=active_target=false;phase="IDLE";
     local_health=can_ready=true;health_error=0;
 }
 extern "C" void usb_health(bool local,bool can,int error_code)
 { local_health=local;can_ready=can;health_error=error_code;phase=error_code?"FAILED":can?"IDLE":"WAITING_CAN"; }
 extern "C" unsigned usb_stat(unsigned which)
-{ return which==0?stage_calls:which==1?commit_calls:which==2?accepted:which==3?stored.hardware_id:stored.image_content_size; }
+{ return which==0?stage_calls:which==1?commit_calls:which==2?accepted:which==3?stored.hardware_id:
+    which==5?uint32_t(discovery_token):which==6?uint32_t(discovery_token>>32):stored.image_content_size; }
+extern "C" void usb_discovery_pending(bool pending) { phase=pending?"DISCOVERING":"IDLE"; }
 extern "C" bool ota_service_busy(void) { return false; }
 extern "C" bool ota_service_healthy(void) { return local_health&&can_ready&&!health_error; }
 extern "C" bool ota_service_local_healthy(void) { return local_health; }
@@ -74,7 +78,7 @@ extern "C" void ota_service_snapshot(ota_observation *o,ota_service_diagnostics 
 }
 extern "C" int ota_service_target(size_t i,ota_observation *o,bool *lead,uint64_t *seen)
 { if(i>=target_count)return OTA_ERR_ARGUMENT;observation(o,i);*lead=i==0;*seen=123456;return 0; }
-extern "C" int ota_service_discover(void) { return 0; }
+extern "C" int ota_service_discover(uint64_t campaign) { discovery_token=campaign;return 0; }
 extern "C" int ota_service_stage_begin(const ota_manifest *m)
 {
     ++stage_calls;

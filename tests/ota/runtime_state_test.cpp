@@ -171,7 +171,7 @@ static void reset_runtime(){
     participant={};coordinator={};staged_manifest={};local_snapshot={};runtime_snapshot={};diagnostics_snapshot={"BOOT",0,false,false,false,false,false};
     memset(inventory,0,sizeof(inventory));memset(frozen,0,sizeof(frozen));inventory_count=frozen_count=0;
     discovery_active=discovery_done=staged=staging=verifying=reconcile_active=waiting_can=false;
-    probe_address=1;discovery_deadline=campaign_id=reconcile_deadline=0;stage_offset=pass_snapshot=0;
+    probe_address=1;discovery_deadline=campaign_id=reconcile_deadline=discovery_token=0;discovery_reserved=false;stage_offset=pass_snapshot=0;
     service_error=usb_result=0;stage_state=OTA_IDLE;phase_snapshot="BOOT";memset(reconcile_hash,0,32);
     reconcile_manifest={};reconcile_commit=0;storage_hooks={};event_mask=next_event_order=event_campaign=0;
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
@@ -192,8 +192,8 @@ static void reset_all(){
         memcpy(o.active_build_id,OWNTECH_FIRMWARE_BUILD_ID,sizeof(OWNTECH_FIRMWARE_BUILD_ID));fake_peer_present[i]=true;
     }
 }
-static void discover_all(){
-    (void)ota_service_discover();pump();
+static void discover_all(uint64_t token=0){
+    (void)ota_service_discover(token);pump();
     for(unsigned i=0;i<300&&discovery_active;i++){fake_now+=5;discovery_step();publish();}
 }
 static void restore_boot_storage(){fake_owner=OTA_SLOT_NONE;fake_recovery=fake_maintenance=true;fake_reboots=0;fake_inhibited=true;}
@@ -269,7 +269,9 @@ static int nominal_test(){
     CHECK(coordinator.phase==OTA_COORD_IDLE);
     CHECK(!strncmp(ota_service_phase(),"SUCCESS",8));idle_reads=fake_identity_reads;worker_iteration();
     CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads&&fake_release_requests==2);
-    discover_all();++m.campaign_id;CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY&&fake_prepares==2);
+    discover_all(43);CHECK(discovery_done&&discovery_token==43&&!ota_service_busy());
+    CHECK(participant.status.state==OTA_SUCCEEDED&&ota_service_healthy()&&!service_error);
+    ++m.campaign_id;CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY&&fake_prepares==2);
     for(uint32_t pos=0;pos<768;pos+=256)CHECK(!ota_service_stage_data(pos,data,256));
     CHECK(!ota_service_stage_end());pump();CHECK(staged);
     CHECK(!ota_service_start(43,followers_first,3));pump();
@@ -297,6 +299,60 @@ static int stage_abort_snapshot_test(){
     }
     return 0;
 }
+static int fresh_discovery_test(){
+    reset_all();initialize_runtime();CHECK(!ota_service_set_role(true));discover_all();
+    CHECK(discovery_done&&!ota_service_busy());
+    uint8_t old_hash=inventory[1].observation.active_mcuboot_image_hash[0];
+    uint64_t old_seen=inventory[1].time;
+    /* Address claims update routing immediately, but cached application status
+     * must be reread after the peer is replaced/reinitialized. */
+    fake_peers[0].identity.address=14;fake_peers[0].active_mcuboot_image_hash[0]^=1;
+    fake_peers[0].status.campaign_id=99;
+    ota_runtime_claim(fake_peers[0].identity.eui,14);
+    CHECK(inventory[1].observation.identity.address==14&&inventory[1].observation.active_mcuboot_image_hash[0]==old_hash);
+    CHECK(!ota_service_discover(0)&&!k_msgq_num_used_get(&ota_queue)&&inventory[1].time==old_seen);
+    const uint64_t token=(1ULL<<40)|42;
+    CHECK(!ota_service_discover(token));CHECK(ota_service_busy()&&discovery_reserved);
+    CHECK(!view().discovery_done&&!strncmp(ota_service_phase(),"DISCOVERING",12));
+    CHECK(!ota_service_discover(token)&&!ota_service_discover(0)&&k_msgq_num_used_get(&ota_queue)==1);
+    CHECK(ota_service_discover(token+1)==OTA_ERR_STATE);
+    ota_manifest m=make_manifest();CHECK(ota_service_stage_begin(&m)==OTA_ERR_STATE);
+    CHECK(ota_service_set_role(false)==OTA_ERR_STATE);
+    CHECK(ota_service_reconcile(42,ids,3,m.mcuboot_image_hash)==OTA_ERR_STATE);
+    worker_iteration();CHECK(discovery_active&&probe_address==2);
+    CHECK(!ota_service_discover(token)&&k_msgq_num_used_get(&ota_queue)==0&&probe_address==2);
+    for(unsigned i=0;i<300&&discovery_active;i++)worker_iteration();
+    CHECK(discovery_done&&!ota_service_busy()&&!discovery_reserved&&!service_error);
+    bool found=false;
+    for(unsigned i=0;i<inventory_count;i++)if(!memcmp(inventory[i].observation.identity.eui,ids[1],8)){
+        found=true;CHECK(inventory[i].observation.identity.address==14&&inventory[i].time>old_seen);
+        CHECK(inventory[i].observation.active_mcuboot_image_hash[0]!=old_hash&&inventory[i].observation.status.campaign_id==99);
+    }
+    CHECK(found);uint64_t deadline=discovery_deadline;
+    CHECK(!ota_service_discover(token)&&!ota_service_discover(0)&&!k_msgq_num_used_get(&ota_queue));
+    CHECK(discovery_deadline==deadline&&!discovery_active);
+    CHECK(!ota_service_discover(token+1));worker_iteration();
+    CHECK(discovery_active&&discovery_deadline>deadline);
+    for(unsigned i=0;i<300&&discovery_active;i++)worker_iteration();
+    CHECK(!ota_service_busy());
+    CHECK(!ota_service_stage_begin(&m));
+    CHECK(ota_service_discover(token+1)==OTA_ERR_STATE&&ota_service_discover(0)==OTA_ERR_STATE);
+    worker_iteration();CHECK(staging&&ota_service_discover(token+2)==OTA_ERR_STATE);
+
+    reset_all();initialize_runtime();CHECK(!ota_service_set_role(true));discover_all();
+    Work refresh{};refresh.type=REFRESH;
+    for(unsigned i=0;i<CONFIG_OWNTECH_OTA_QUEUE_DEPTH;i++)CHECK(!enqueue(refresh));
+    CHECK(ota_service_discover(token)==OTA_ERR_QUEUE_FULL);
+    CHECK(!discovery_reserved&&!ota_service_busy()&&discovery_token==0&&view().discovery_done);
+    while(k_msgq_num_used_get(&ota_queue))worker_iteration();
+    CHECK(!ota_service_discover(token));worker_iteration();CHECK(discovery_active);
+    fake_now=discovery_deadline;worker_iteration();
+    CHECK(!ota_service_busy()&&!discovery_reserved&&!discovery_active&&service_error==OTA_ERR_TIMEOUT);
+    reset_all();initialize_runtime();CHECK(!ota_service_set_role(true));
+    CHECK(!ota_service_reconcile(42,ids,3,m.mcuboot_image_hash));
+    CHECK(ota_service_discover(token)==OTA_ERR_STATE&&ota_service_discover(0)==OTA_ERR_STATE);
+    return 0;
+}
 static int bootstrap_test(){
     reset_all();fake_confirmed=false;initialize_runtime();CHECK(fake_confirms==1&&ota_service_healthy());
     reset_all();fake_confirmed=false;fake_health_result=OTA_ERR_HEALTH;initialize_runtime();
@@ -317,7 +373,7 @@ static int standalone_boot_test(){
     CHECK(!memcmp(observation.active_mcuboot_image_hash,fake_active_hash,32)&&observation.confirmed);
     CHECK(!strncmp(diag.phase,"WAITING_CAN",12)&&diag.local_healthy&&!diag.healthy&&!diag.can_ready&&!diag.busy);
     CHECK(!ota_service_set_role(true));ota_service_snapshot(&observation,&diag);CHECK(diag.is_lead);
-    CHECK(ota_service_discover()==OTA_ERR_STATE);
+    CHECK(ota_service_discover(0)==OTA_ERR_STATE);
     ota_manifest manifest=make_manifest();CHECK(ota_service_stage_begin(&manifest)==OTA_ERR_STATE);
     ota_command command{};command.type=OTA_CMD_PREPARE;command.manifest=manifest;command.lead_address=2;
     memcpy(command.lead_eui,ids[1],8);CHECK(ota_runtime_command(&command,2)==OTA_ERR_STATE);
@@ -331,7 +387,7 @@ static int standalone_boot_test(){
     ota_service_snapshot(&observation,&diag);
     CHECK(!strncmp(diag.phase,"IDLE",5)&&diag.local_healthy&&diag.healthy&&diag.can_ready&&!diag.error);
     CHECK(observation.healthy&&observation.confirmed&&!fake_inhibited);
-    CHECK(!ota_service_discover());worker_iteration();CHECK(discovery_active);
+    CHECK(!ota_service_discover(0));worker_iteration();CHECK(discovery_active);
     /* Full queues already wake the worker; no readiness notification is lost. */
     reset_all();fake_confirmed=false;fake_can.ready=0;initialize_runtime();
     Work refresh{};refresh.type=REFRESH;
@@ -491,7 +547,7 @@ static int idle_worker_test(){
     CHECK(!ota_service_set_role(true)&&ota_service_is_lead());
     /* Discovery arrives after the worker chose an indefinite wait. */
     fake_wait_event=[](){
-        fake_event_result=ota_service_discover();ota_observation queued{};ota_service_diagnostics diag{};
+        fake_event_result=ota_service_discover(0);ota_observation queued{};ota_service_diagnostics diag{};
         ota_service_snapshot(&queued,&diag);
         if(strncmp(diag.phase,"DISCOVERING",12))fake_event_result=OTA_ERR_STATE;
     };worker_iteration();
@@ -542,6 +598,7 @@ extern "C" int ota_runtime_state_test_run(){
     rc=standalone_failure_test();if(rc)return rc;
     rc=campaign_boot_health_test();if(rc)return rc;
     rc=nominal_test();if(rc)return rc;rc=stage_abort_snapshot_test();if(rc)return rc;
+    rc=fresh_discovery_test();if(rc)return rc;
     rc=reconcile_roster_test();if(rc)return rc;
     rc=queued_prepare_test();if(rc)return rc;rc=persisted_lead_participant_test();if(rc)return rc;
     rc=reconcile_failure_test();if(rc)return rc;rc=release_source_test();if(rc)return rc;

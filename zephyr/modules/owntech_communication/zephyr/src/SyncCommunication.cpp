@@ -71,7 +71,8 @@ void SyncCommunication::initSlave()
 	/* HRTIM_SCIN pin configuration */
 	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOB);
 
-#ifdef CONFIG_SHIELD_TWIST_V1_4_1
+#if defined(CONFIG_SHIELD_TWIST_V1_4_1) || defined(CONFIG_SHIELD_TWIST_V1_4_2)
+	/* TWIST 1.4.1/1.4.2 uses PB2/AF13 for SYNC IN. Leave PB6 for CAN TX. */
 	LL_GPIO_SetPinMode      (GPIOB, LL_GPIO_PIN_2, LL_GPIO_MODE_ALTERNATE);
 	LL_GPIO_SetPinSpeed     (GPIOB,
 							 LL_GPIO_PIN_2,

@@ -293,8 +293,18 @@ hardware update through postboot reconciliation has not yet passed.
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
 | USB | 96872 | 31616 | 97208 | 227328 |
-| OTA | 217748 | 97572 | 218084 | 227328 |
-| USB_LEAD | 217748 | 97572 | 218084 | 227328 |
+| OTA | 218484 | 97572 | 218820 | 227328 |
+| USB_LEAD | 218484 | 97572 | 218820 | 227328 |
+| OTA_RECOVERY (separate maintenance image) | 105588 | 31360 | 105924 | 227328 |
+
+After the NVS correction, all 130 host/native tests pass. Both normal OTA
+environments compile to `ota-0dcaaff159634ec78f2ca713`, MCUboot hash
+`ef76db03b2465e703c6441cfb028cb5bb4449fc55ca03a29b0ba97551fcd9c82`.
+Logs: `.pio/ota-nvs-recovery-tests.log`, `.pio/ota-nvs-fixed-build.log`,
+`.pio/usb-lead-nvs-fixed-build.log`. The separate recovery build also passes;
+its final ELF contains the recovery entry point and excludes automatic image
+confirmation and the ordinary user main. Neither the recovery image nor these
+corrected normal images has yet been installed on the affected boards.
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
@@ -311,7 +321,7 @@ configuration-cache invalidation and identity restoration with real CMake after
 build-directory removal.
 
 The useful image must remain below the provisional 221184-byte capacity. The
-current OTA application has 3100 bytes left within that bound; application code
+current OTA application has 2364 bytes left within that bound; application code
 and enabled libraries share that budget with the service.
 Linker RAM allocations are not measured stack high-water marks. Generated
 binaries and build/test logs are local artifacts, not committed source.

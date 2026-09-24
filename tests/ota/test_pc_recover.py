@@ -120,6 +120,54 @@ class RecoveryUploadTests(unittest.TestCase):
         self.assertEqual(events[1]["image_state"]["images"][0]["hash"], "cc" * 32)
         self.assertEqual(events[-1]["event"], "RECOVERY_INSPECTION_PASSED")
 
+    def test_empty_initial_image_list_blocks_inspect_and_apply_without_mutation(self):
+        self.device.images = []
+
+        def empty_image_state():
+            self.device.calls.append(("image_state",))
+            return {"images": [], "splitStatus": 0}
+
+        self.device.image_state = empty_image_state
+        for apply in (False, True):
+            self.device.calls.clear()
+            with self.subTest(apply=apply), self.assertRaisesRegex(ValueError,
+                    "empty image list:.*recognizes no image; primary/secondary state cannot be verified; "
+                    "no recovery action is authorized from this state"):
+                self.run_recovery(apply=apply)
+            self.assertEqual(self.device.calls, [("info",), ("image_state",), ("close",)])
+            self.assertEqual(self.mutations(), [])
+            self.upload.assert_not_called()
+            events = [json.loads(line) for line in self.log.read_text().splitlines()]
+            self.assertEqual(events[-2]["event"], "RECOVERY_INSPECT")
+            self.assertEqual(events[-2]["image_state"], {"images": [], "splitStatus": 0})
+            self.assertEqual(events[-1]["event"], "RECOVERY_STOPPED")
+            self.assertIn("empty image list", events[-1]["error"])
+
+    def test_empty_list_after_mutation_preserves_the_logged_action_and_stops(self):
+        for after_upload in (False, True):
+            self.device = Device()
+            self.factory.return_value = self.device
+            if after_upload:
+                self.upload.side_effect = lambda *args: self.device.images.clear()
+            else:
+                request = self.device._request
+
+                def erase_then_unrecognized(*args):
+                    reply = request(*args)
+                    self.device.images.clear()
+                    return reply
+
+                self.device._request = erase_then_unrecognized
+            with self.subTest(after_upload=after_upload), self.assertRaisesRegex(ValueError, "empty image list"):
+                self.run_recovery(apply=True)
+            self.assertEqual(self.mutations(), [(2, 1, 5, {"slot": 1})])
+            self.assertEqual(self.device.calls[-1], ("close",))
+            events = [json.loads(line) for line in self.log.read_text().splitlines()]
+            self.assertEqual(events[-2]["event"], "RECOVERY_AFTER_UPLOAD" if after_upload else "RECOVERY_AFTER_ERASE")
+            self.assertEqual(events[-1]["event"], "RECOVERY_STOPPED")
+            self.assertNotIn("erased", events[-1]["error"])
+            self.assertNotIn("no mutation", events[-1]["error"])
+
     def test_apply_erases_only_secondary_and_resets_once_after_exact_reinspection(self):
         self.assertEqual(self.run_recovery(apply=True)["result"], "RESET_REQUESTED")
         self.assertEqual(self.mutations(), [(2, 1, 5, {"slot": 1}), (2, 0, 5, {})])

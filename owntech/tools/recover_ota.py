@@ -53,6 +53,8 @@ def verify_inputs(config_path, image_path, manifest_path, target_identity):
 
 def _slots(state):
     require(isinstance(state, dict) and isinstance(state.get("images"), list), "invalid bootloader image state")
+    require(bool(state["images"]), "empty image list: the bootloader recognizes no image; "
+            "primary/secondary state cannot be verified; no recovery action is authorized from this state")
     result = {}
     for row in state["images"]:
         require(isinstance(row, dict) and type(row.get("slot")) is int and row["slot"] in (0, 1),

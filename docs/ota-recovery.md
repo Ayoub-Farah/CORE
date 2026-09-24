@@ -179,8 +179,60 @@ The post-repair dump SHA-256 is
 The detailed comparison is preserved in the permanent `after-analysis.json`.
 Local execution logs are under `.pio/swd-recovery-20260924/`, including
 `openocd-sparse-recovery-reset-halt.log` and `sparse-recovery-console.log`.
-This establishes successful guarded recovery of the first board. It does not
-establish recovery of the second board or a complete subsequent fleet update.
+This establishes successful guarded recovery of the first board. The second
+board's separate USB recovery is recorded below; a complete subsequent fleet
+update remains unverified.
+
+## Second-board interrupted revert and USB repair
+
+The second board (`3232500B00290043`, EUI `1ccd6d8ab16b213e`) initially returned
+only slot 1 through the bootloader image service. Two identical halted SWD
+backups showed an interrupted **REVERT**, with 34 of 107 primary-sector moves
+complete and no swap half-operation complete. The installed bootloader again
+matched OwnTech v1.1.0 exactly. Its primary trailer had valid magic,
+`swap_info=4`, `copy_done=FF` and `image_ok=1`; the secondary trailer was erased.
+
+This establishes why slot 0 was omitted on this board. The move algorithm
+copies primary sectors upward by one 2048-byte sector, starting at the end.
+During that process its normal header/TLV offsets need not describe a complete
+image. MCUboot reconstructs the locations from its durable progress entries;
+the Zephyr image-list service reads the ordinary offsets. Offline reconstruction
+of both logical images produced the expected `78abe6d3...` hash. The local OTA1
+journal and maintenance marker had valid CRCs, with `VALID`, commit zero and the
+expected campaign. Holding BOOT stops before `boot_go()`, so it also stops an
+already interrupted swap from resuming. See the
+[v1.1.0 move algorithm](https://github.com/owntech-foundation/bootloader/blob/v1.1.0/boot/bootutil/src/swap_move.c).
+This does not retroactively establish the cause of the first board's earlier
+empty-list response.
+
+After these checks, one explicit USB OS-reset request let MCUboot finish the
+recorded revert. A fresh full read verified 107 completed moves and 214 completed
+swap half-operations, `copy_done=1`, `image_ok=1`, and intact physical images in
+both slots with the expected hash. Bootloader and all 4096 NVS bytes were
+unchanged. The restored application reported its original hash, local health
+and active confirmation; it remained in campaign failure while isolated from
+CAN. Evidence is in `.pio/swd-board2-20260924/after-usb-revert-analysis.json`,
+`flash-first-read.bin`, `flash-after-usb-revert.bin` and
+`after-revert-app-info.json`. No flash or RAM programming through SWD was used
+on this board; the debugger was used for diagnosis and backups.
+
+The ST-Link was physically disconnected before installing the repair image.
+After another physical BOOT + RESET entry, the USB client used
+`--after-revert --apply`: the original primary was confirmed, and the exact
+campaign secondary was nonpending. It erased only that secondary, verified the
+unchanged primary, uploaded the helper in 12 seconds, verified its exact hash
+and pending state, then requested one USB reset. The helper reported
+`OTA_RECOVERY RECOVERED rc=0 EUI=1ccd6d8ab16b213e confirmed=1`, with outputs
+inhibited. It confirmed itself through its guarded recovery transaction; no
+external confirmation was forced.
+
+The USB journal is
+`.pio/ota-recovery-61c6c4384740260e-1ccd6d8ab16b213e.jsonl`; upload and console
+evidence are `.pio/swd-board2-20260924/usb-recovery-apply.log` and
+`usb-recovery-console.log`. The last complete second-board dump was taken
+**after the revert and before the helper**. Its NVS preservation comparison must
+not be presented as a post-helper flash comparison. Helper completion is
+established by the USB transaction and explicit recovery-success console report.
 
 ## Prepare a repair image
 
@@ -219,12 +271,38 @@ must select their existing MCUmgr executable. If an erase or upload stops, do
 not repeat blindly: the slot state has changed and the original preflight will
 correctly refuse a fresh attempt.
 
+### A board whose revert has already completed
+
+The default inspection requires the staged secondary to be pending. If a
+separately verified revert has completed, add `--after-revert` to both inspection
+and application commands:
+
+```powershell
+python owntech/tools/recover_ota.py --config .pio/ota-recovery-config/owntech_ota_recovery_config.json --image .pio/ota-artifacts/OTA_RECOVERY/firmware.mcuboot.bin --manifest .pio/ota-artifacts/OTA_RECOVERY/firmware.mcuboot.json --serial <USB-serial> --identity <board-EUI> --after-revert --inspect
+```
+
+After a successful inspection, use the same arguments with `--apply` instead of
+`--inspect`, adding `--mcumgr owntech/third_party/mcumgr.exe` on Windows.
+`--after-revert` does **not** initiate or resume a revert. It changes only the
+initial secondary-state requirement from pending to nonpending. The exact
+original primary must still be active, confirmed and nonpending; the exact
+campaign secondary must be inactive and unconfirmed. All campaign, identity,
+artifact and subsequent upload guards remain enforced. After uploading the
+helper, the client always requires that new helper to be pending before reset.
+The recovery-client suite covers these checks in 17 passing tests.
+
+An empty or partial image list fails both modes. Do not select `--after-revert`
+to bypass missing images or to infer that a move has completed. Diagnose the
+interrupted state before any separate decision to resume it; the second-board
+case above used complete backups and verified progress/content evidence.
+
 The apply operation must establish all of the following before erasure:
 
 1. The application OTA command is explicitly unsupported and the standard
    image service responds on the selected USB interface.
 2. Slot 0 is active and confirmed, with the original hash recorded for that
-   board. Slot 1 contains exactly the staged campaign hash and is not active.
+   board. Slot 1 contains exactly the staged campaign hash and is inactive and
+   unconfirmed: pending by default, nonpending only with `--after-revert`.
 3. The repair artifact matches its signed-image manifest and generated guards.
 
 Only slot 1 is erased. The client rereads the slots, verifies that slot 0 is
@@ -253,8 +331,12 @@ The CAN transfer and original failure above were observed on hardware. All 130
 host/native tests pass, including the NVS replacement regression, corrected
 repeated writes, guard refusals, interrupted repair transactions, and an ARM
 fixture compiled with the installed image's short-enum layout.
-The first board's scoped SWD repair above passed on hardware, including normal
-helper confirmation and a complete before/after flash comparison. The USB repair
-procedure must still pass its own actual bootloader slot checks on each board.
+The first board's scoped SWD repair passed on hardware, including normal helper
+confirmation and a complete before/after flash comparison. The second board's
+interrupted revert resumed through USB, with bootloader/NVS preservation proved
+before installing the helper. Its subsequent guarded USB helper installation
+and self-confirmed recovery succeeded with ST-Link disconnected; no complete
+post-helper second-board dump is claimed. Each further board must pass its own
+actual bootloader slot checks.
 A complete corrected CAN campaign through reboot, reconciliation and maintenance
 release has not yet been validated on hardware.

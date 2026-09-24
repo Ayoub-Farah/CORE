@@ -42,9 +42,9 @@ signature key produce `firmware.mcuboot.bin`. No bootloader is built, installed,
 downloaded or modified by `lead_update`; no key is generated. The manifest
 records the resolved signing key path and the image's public key digest, without
 copying private key material. The currently resolved fallback is MCUboot's
-published example RSA key, as in the original chain. The first board's installed
-bootloader was subsequently matched byte for byte to OwnTech v1.1.0 during SWD
-recovery. This does not qualify every board's bootloader or the complete fleet
+published example RSA key, as in the original chain. Both diagnosed boards'
+installed bootloaders were subsequently matched byte for byte to OwnTech v1.1.0
+using SWD backups. This does not qualify every board's bootloader or the complete fleet
 signature/swap workflow.
 
 The full padded file must fit `0x37800` bytes. Useful content (header, program,
@@ -343,9 +343,35 @@ from the live NVS view by tombstones. The primary helper's recomputed hash match
 its TLV and `image_ok=1`. Permanent before/after dumps, analysis and option/UID
 data are stored in
 [`recovery-backups/2026-09-24-3232500B002B002D/`](../recovery-backups/2026-09-24-3232500B002B002D/).
-This validates first-board recovery. Normal USB initialization and a complete
-corrected fleet cycle remain separate hardware checks; no completed corrected
-CAN update through postboot reconciliation is claimed here.
+This validates first-board recovery; the second board followed the separate
+USB procedure below.
+
+The second board (`3232500B00290043`, EUI `1ccd6d8ab16b213e`) initially listed
+only its secondary through USB. Identical full SWD reads proved an interrupted
+REVERT: 34 of 107 move operations complete, with a coherent MCUboot progress
+journal. Reconstructing the displaced sectors produced the expected `78abe6d3...`
+hash for both logical images. This explains its omitted primary image; it does
+not establish the cause of the first board's earlier empty list. One USB reset
+then let MCUboot complete the revert. Full readback confirmed both physical
+image hashes, completed progress, an active confirmed original, and byte-for-byte
+preservation of the bootloader and NVS.
+
+With ST-Link physically disconnected, the second board subsequently received
+the guarded helper entirely through USB using `recover_ota.py --after-revert
+--apply`. The client verified the original confirmed primary and exact nonpending
+campaign secondary, erased only the secondary, uploaded the helper in 12 seconds,
+checked its pending hash, and requested reset. The console reported
+`RECOVERED rc=0 EUI=1ccd6d8ab16b213e confirmed=1`; the helper performed its own
+guarded confirmation. No flash or RAM programming through SWD was used on this
+board. The last full dump preceded the helper, so the NVS preservation proof
+applies to the revert, not a complete post-helper comparison.
+
+The explicit `--after-revert` mode does not trigger a rollback and cannot bypass
+empty/partial image lists or unconfirmed primaries. Its client suite has 17
+passing tests. See [the second-board evidence and mode safeguards](ota-recovery.md#second-board-interrupted-revert-and-usb-repair).
+Normal USB initialization and a complete corrected fleet cycle remain separate
+hardware checks; no completed corrected CAN update through postboot
+reconciliation is claimed here.
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached

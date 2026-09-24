@@ -28,17 +28,19 @@ K_MSGQ_DEFINE(ota_queue,sizeof(Work),CONFIG_OWNTECH_OTA_QUEUE_DEPTH,4);
 static K_MUTEX_DEFINE(api_lock);
 static K_SEM_DEFINE(usb_done,0,1);
 static k_spinlock snapshot_lock;
-static atomic_t losses, initialized, busy, healthy, lead_role;
+static atomic_t losses, initialized, busy, healthy, local_healthy, can_ready, lead_role;
 static atomic_t identity_conflict, discovery_requested, stage_end_requested, usb_pending, reconcile_mode, release_pending;
 static atomic_t refresh_pending;
 static ota_participant participant;
 static ota_coordinator coordinator;
 static ota_manifest staged_manifest;
 static ota_observation local_snapshot;
+static ota_service_diagnostics diagnostics_snapshot={"BOOT",0,false,false,false,false,false};
 struct Seen { ota_observation observation; uint64_t time; bool valid; };
 static Seen inventory[OTA_MAX_TARGETS], frozen[OTA_MAX_TARGETS];
 static uint8_t inventory_count, frozen_count;
 static bool discovery_active, discovery_done, staged, staging, verifying;
+static bool waiting_can;
 static uint16_t probe_address=1;
 static uint64_t discovery_deadline, campaign_id;
 static uint32_t stage_offset;
@@ -100,6 +102,8 @@ extern "C" const char *ota_state_name(ota_state s)
 }
 extern "C" bool ota_service_busy(void) { return atomic_get(&busy); }
 extern "C" bool ota_service_healthy(void) { return atomic_get(&healthy); }
+extern "C" bool ota_service_local_healthy(void) { return atomic_get(&local_healthy); }
+extern "C" bool ota_service_can_ready(void) { return atomic_get(&can_ready); }
 extern "C" bool ota_service_is_lead(void) { return atomic_get(&lead_role); }
 /* Worker-owned state is exposed only as a coherent snapshot. */
 struct RuntimeView {
@@ -124,12 +128,16 @@ extern "C" const char *ota_service_phase(void) {
     auto key=k_spin_lock(&snapshot_lock);const char *name=phase_snapshot;
     k_spin_unlock(&snapshot_lock,key);return name;
 }
-static void set_phase(const char *name) {
+static void set_phase(const char *name,bool expose_admission=false) {
     /* All callers use immutable string literals, so returned pointers stay valid. */
-    auto key=k_spin_lock(&snapshot_lock);phase_snapshot=name;k_spin_unlock(&snapshot_lock,key);
+    auto key=k_spin_lock(&snapshot_lock);phase_snapshot=name;
+    if(expose_admission) diagnostics_snapshot.phase=name;
+    k_spin_unlock(&snapshot_lock,key);
 }
+static void update_can_readiness();
 static void publish()
 {
+    update_can_readiness();
     participant.identity.address=thingset_can_get_inst()->node_addr;
     ota_storage_boot_identity(&participant.identity);
     ota_observation o{};o.identity=participant.identity;
@@ -151,6 +159,8 @@ static void publish()
     auto key=k_spin_lock(&snapshot_lock);
     memcpy(o.active_mcuboot_image_hash,local_snapshot.active_mcuboot_image_hash,32);
     o.rolled_back=local_snapshot.rolled_back;local_snapshot=o;
+    diagnostics_snapshot={phase_snapshot,service_error,ota_service_local_healthy(),
+                          ota_service_healthy(),ota_service_can_ready(),ota_service_busy(),ota_service_is_lead()};
     runtime_snapshot={campaign_id,stage_offset,staged_manifest.image_size,pass_snapshot,
         service_error,coordinator.phase,stage_state,staged,staging,verifying,
         discovery_done,reconcile_active,participant.reboot_scheduled};
@@ -178,6 +188,13 @@ extern "C" int ota_service_target(size_t i,ota_observation *o,bool *is_lead,uint
     *o=table[i].observation;*last=table[i].time;*is_lead=!memcmp(o->identity.eui,eui64,8);
     k_spin_unlock(&snapshot_lock,key);return 0;
 }
+extern "C" void ota_service_snapshot(ota_observation *o,ota_service_diagnostics *d) {
+    auto key=k_spin_lock(&snapshot_lock);*o=local_snapshot;*d=diagnostics_snapshot;
+    /* Admission may reserve the worker before its next publication. Reflect
+     * that reservation immediately so USB cannot advertise a free service. */
+    d->busy=ota_service_busy();d->is_lead=ota_service_is_lead();
+    k_spin_unlock(&snapshot_lock,key);
+}
 static int enqueue(Work &w);
 static void request_refresh()
 {
@@ -187,6 +204,7 @@ static void request_refresh()
      * the current address. No extra work item or periodic retry is necessary. */
     if(enqueue(w)) atomic_clear(&refresh_pending);
 }
+static void can_state_changed(void *) { request_refresh(); }
 extern "C" void ota_runtime_claim(const uint8_t eui[8],uint8_t address)
 {
     if(!address || address>=254) return;
@@ -231,6 +249,7 @@ extern "C" void ota_runtime_report(const uint8_t *data,size_t n,uint8_t source)
 extern "C" int ota_runtime_command(const ota_command *cmd,uint8_t source)
 {
     if(!cmd || !cmd->manifest.campaign_id) return OTA_ERR_ARGUMENT;
+    if(!ota_service_healthy()) return OTA_ERR_STATE;
     if(source!=cmd->lead_address || cmd->adopt) return OTA_ERR_IDENTITY;
     bool found=false;
     auto key=k_spin_lock(&snapshot_lock);
@@ -302,8 +321,13 @@ static ota_coordinator_hooks hooks={nullptr,control,observe,read_image,send_repo
 
 extern "C" int ota_service_set_role(bool value)
 {
-    if(!atomic_get(&initialized) || ota_storage_recovery_required() || !atomic_cas(&busy,0,1)) return OTA_ERR_STATE;
-    int rc=ota_storage_persist_role(value);if(!rc) atomic_set(&lead_role,value);
+    if(!atomic_get(&initialized) || !ota_service_local_healthy() || ota_service_error() || !boot_is_img_confirmed() ||
+       ota_storage_recovery_required() || ota_storage_maintenance() || !atomic_cas(&busy,0,1)) return OTA_ERR_STATE;
+    int rc=ota_storage_persist_role(value);
+    if(!rc) {
+        auto key=k_spin_lock(&snapshot_lock);atomic_set(&lead_role,value);
+        diagnostics_snapshot.is_lead=value;k_spin_unlock(&snapshot_lock,key);
+    }
     atomic_clear(&busy);return rc;
 }
 extern "C" int ota_service_stage_begin(const ota_manifest *m)
@@ -311,14 +335,14 @@ extern "C" int ota_service_stage_begin(const ota_manifest *m)
     if(!m || !ota_service_is_lead() || !ota_service_healthy() ||
        !atomic_cas(&busy,0,1)) return OTA_ERR_STATE;
     Work w{};w.type=STAGE_BEGIN;w.command.manifest=*m;
-    set_phase("ERASE_BEGIN");
+    set_phase("ERASE_BEGIN",true);
     auto key=k_spin_lock(&snapshot_lock);
     accepted_start={};accepted_reconcile={};accepted_prepare_campaign=0;
     runtime_snapshot.campaign=m->campaign_id;runtime_snapshot.image_size=m->image_size;
     runtime_snapshot.offset=0;runtime_snapshot.staging_state=OTA_PREPARING;
     local_snapshot.status.campaign_id=m->campaign_id;local_snapshot.status.state=OTA_PREPARING;
     k_spin_unlock(&snapshot_lock,key);
-    int rc=enqueue(w);if(rc) {atomic_clear(&busy);set_phase("FAILED");}return rc;
+    int rc=enqueue(w);if(rc) {atomic_clear(&busy);set_phase("FAILED",true);}return rc;
 }
 extern "C" int ota_service_stage_data(uint32_t off,const uint8_t *data,size_t n)
 {
@@ -385,16 +409,17 @@ extern "C" int ota_service_abort(uint64_t campaign)
 }
 extern "C" int ota_service_discover(void)
 {
-    if(!ota_service_is_lead()) return OTA_ERR_STATE;
+    if(!ota_service_is_lead() || !ota_service_healthy()) return OTA_ERR_STATE;
     auto state=view();
     if(state.coordinator_phase!=OTA_COORD_IDLE) return OTA_ERR_STATE;
     if(state.discovery_done || !atomic_cas(&discovery_requested,0,1)) return 0;
-    set_phase("DISCOVERING");
+    set_phase("DISCOVERING",true);
     Work w{};w.type=DISCOVER;int rc=enqueue(w);if(rc) atomic_clear(&discovery_requested);return rc;
 }
 extern "C" int ota_service_reconcile(uint64_t campaign,const uint8_t ids[][8],size_t n,const uint8_t hash[32])
 {
     if(!ids || !hash || !campaign || !n || n>OTA_MAX_TARGETS || !ota_service_is_lead() ||
+       !ota_service_can_ready() ||
        !same_roster(&ids[0][0],n,&ids[0][0],n)) return OTA_ERR_ARGUMENT;
     auto key=k_spin_lock(&snapshot_lock);
     if(accepted_reconcile.valid) {
@@ -406,7 +431,7 @@ extern "C" int ota_service_reconcile(uint64_t campaign,const uint8_t ids[][8],si
     if(!atomic_cas(&busy,0,1)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_STATE;}
     accepted_reconcile.valid=true;accepted_reconcile.campaign=campaign;accepted_reconcile.count=n;
     memcpy(accepted_reconcile.ids,ids,n*8);memcpy(accepted_reconcile.hash,hash,32);
-    runtime_snapshot.campaign=campaign;phase_snapshot="POSTBOOT_CHECK";
+    runtime_snapshot.campaign=campaign;phase_snapshot=diagnostics_snapshot.phase="POSTBOOT_CHECK";
     Work w{};w.type=RECONCILE;w.command.manifest.campaign_id=campaign;w.length=n;
     memcpy(w.data,ids,n*8);memcpy(w.command.manifest.mcuboot_image_hash,hash,32);
     int rc=enqueue(w);if(rc) {accepted_reconcile={};atomic_clear(&busy);}
@@ -716,6 +741,24 @@ static void reconcile_step()
     }
     if(k_uptime_get()>(int64_t)reconcile_deadline) finish_reconcile(OTA_ERR_TIMEOUT);
 }
+/* Called only by the worker, including every publication. A CAN notification
+ * whose FIFO insertion loses to a full queue is therefore not lost. */
+static void update_can_readiness()
+{
+    if(!waiting_can || service_error || !ota_service_local_healthy()) return;
+    auto can=thingset_can_get_inst();
+    if(atomic_get(&can->init_error)) {
+        waiting_can=false;service_error=OTA_ERR_TRANSPORT;
+        atomic_clear(&local_healthy);ota_safety_restore(true);set_phase("FAILED");
+    }
+    else if(atomic_get(&can->ready)) {
+        waiting_can=false;
+        if(ota_network_init()) {
+            service_error=OTA_ERR_TRANSPORT;ota_safety_restore(true);set_phase("FAILED");
+        }
+        else {atomic_set(&can_ready,1);atomic_set(&healthy,1);set_phase("IDLE");}
+    }
+}
 static void initialize_runtime()
 {
     int rc=ota_storage_init();bool role=false;
@@ -726,53 +769,77 @@ static void initialize_runtime()
     tracked.prepare=tracked_prepare;tracked.flush=tracked_flush;tracked.validate=tracked_validate;tracked.journal=tracked_journal;
     ota_participant_init(&participant,&id,&tracked,ota_storage_recovery_required());
     if(rc) service_error=OTA_ERR_JOURNAL;
-    uint64_t deadline=k_uptime_get()+CONFIG_OWNTECH_OTA_HEALTH_TIMEOUT_MS;
-    while(!atomic_get(&thingset_can_get_inst()->ready) && k_uptime_get()<(int64_t)deadline) k_sleep(K_MSEC(20));
-    if(!service_error && atomic_get(&thingset_can_get_inst()->ready)) {
-        rc=ota_network_init();
-        if(!rc) rc=ota_storage_active_hash(local_snapshot.active_mcuboot_image_hash);
-        if(!rc) rc=owntech_ota_check_health();
-        ota_storage_journal j{};int jr=ota_storage_get_journal(&j);
-        if(!jr && j.campaign_id) {
-            campaign_id=j.campaign_id;event_campaign=j.campaign_id;
-            participant.status.campaign_id=j.campaign_id;participant.status.commit_id=j.commit_id;
-            participant.status.image_size=j.image_size;
-            participant.manifest.campaign_id=j.campaign_id;participant.manifest.image_size=j.image_size;
-            memcpy(participant.manifest.version,j.version,32);memcpy(participant.manifest.build_id,j.build_id,32);
-            memcpy(participant.manifest.mcuboot_image_hash,j.mcuboot_image_hash,32);
-            memcpy(participant.manifest.artifact_sha256,j.artifact_sha256,32);
-            memcpy(participant.lead_eui,j.lead_eui,8);
-            event_mask=j.event_mask;memcpy(event_ms,j.event_ms,sizeof(event_ms));
-            memcpy(event_order,j.event_order,sizeof(event_order));
-            next_event_order=0;uint32_t orders=0;uint8_t count=0;
-            if(event_mask&~((1U<<OTA_EVENT_COUNT)-1)) rc=OTA_ERR_JOURNAL;
-            for(size_t i=0;i<OTA_EVENT_COUNT;i++) if(event_mask&(1U<<i)) {
-                ++count;
-                uint8_t order=event_order[i];
-                if(!order || order>OTA_EVENT_COUNT || (orders&(1U<<order))) rc=OTA_ERR_JOURNAL;
-                else {orders|=1U<<order;if(order>next_event_order) next_event_order=order;}
-            }
-            else if(event_ms[i] || event_order[i]) rc=OTA_ERR_JOURNAL;
-            if(next_event_order!=count) rc=OTA_ERR_JOURNAL;
-            if(!rc) event(OTA_EVENT_POSTBOOT_CHECK);
-            if(j.state==OTA_SUCCEEDED && !ota_storage_maintenance()) participant.status.state=OTA_SUCCEEDED;
-            if(j.state==OTA_VALID || j.state==OTA_COMMITTED || j.state==OTA_REBOOTING || j.state==OTA_SUCCEEDED) {
-                participant.status.offset=j.image_size;participant.status.flash_complete=true;participant.status.validated=true;
-            }
+
+    /* Identity is useful even when CAN or application validation fails. Never
+     * substitute an unpublished zero hash for the actual running image. */
+    if(!service_error && ota_storage_active_hash(local_snapshot.active_mcuboot_image_hash)) service_error=OTA_ERR_HEALTH;
+    ota_storage_journal j{};int jr=ota_storage_get_journal(&j);
+    if(jr) service_error=OTA_ERR_JOURNAL;
+    bool strict_boot=j.campaign_id || ota_storage_maintenance() || ota_storage_recovery_required();
+    if(!jr && j.campaign_id) {
+        campaign_id=j.campaign_id;event_campaign=j.campaign_id;
+        participant.status.campaign_id=j.campaign_id;participant.status.commit_id=j.commit_id;
+        participant.status.image_size=j.image_size;
+        participant.manifest.campaign_id=j.campaign_id;participant.manifest.image_size=j.image_size;
+        memcpy(participant.manifest.version,j.version,32);memcpy(participant.manifest.build_id,j.build_id,32);
+        memcpy(participant.manifest.mcuboot_image_hash,j.mcuboot_image_hash,32);
+        memcpy(participant.manifest.artifact_sha256,j.artifact_sha256,32);
+        memcpy(participant.lead_eui,j.lead_eui,8);
+        event_mask=j.event_mask;memcpy(event_ms,j.event_ms,sizeof(event_ms));
+        memcpy(event_order,j.event_order,sizeof(event_order));
+        next_event_order=0;uint32_t orders=0;uint8_t count=0;
+        if(event_mask&~((1U<<OTA_EVENT_COUNT)-1)) service_error=OTA_ERR_JOURNAL;
+        for(size_t i=0;i<OTA_EVENT_COUNT;i++) if(event_mask&(1U<<i)) {
+            ++count;
+            uint8_t order=event_order[i];
+            if(!order || order>OTA_EVENT_COUNT || (orders&(1U<<order))) service_error=OTA_ERR_JOURNAL;
+            else {orders|=1U<<order;if(order>next_event_order) next_event_order=order;}
         }
-        if(!jr && j.campaign_id && memcmp(j.mcuboot_image_hash,local_snapshot.active_mcuboot_image_hash,32))
+        else if(event_ms[i] || event_order[i]) service_error=OTA_ERR_JOURNAL;
+        if(next_event_order!=count) service_error=OTA_ERR_JOURNAL;
+        if(j.state==OTA_SUCCEEDED && !ota_storage_maintenance()) participant.status.state=OTA_SUCCEEDED;
+        if(j.state==OTA_VALID || j.state==OTA_COMMITTED || j.state==OTA_REBOOTING || j.state==OTA_SUCCEEDED) {
+            participant.status.offset=j.image_size;participant.status.flash_complete=true;participant.status.validated=true;
+        }
+        if(memcmp(j.mcuboot_image_hash,local_snapshot.active_mcuboot_image_hash,32) ||
+           strncmp(j.version,OWNTECH_FIRMWARE_VERSION,32) || strncmp(j.build_id,OWNTECH_FIRMWARE_BUILD_ID,32))
             local_snapshot.rolled_back=true;
-        if(!jr && j.campaign_id && (strncmp(j.version,OWNTECH_FIRMWARE_VERSION,32) ||
-           strncmp(j.build_id,OWNTECH_FIRMWARE_BUILD_ID,32))) local_snapshot.rolled_back=true;
-        if(!rc && !boot_is_img_confirmed()) {
-            if(!jr && j.campaign_id && (local_snapshot.rolled_back ||
-               (j.state!=OTA_COMMITTED && j.state!=OTA_REBOOTING && j.state!=OTA_SUCCEEDED))) rc=OTA_ERR_HEALTH;
-            else rc=boot_write_img_confirmed();
-        }
-        if(!rc) {atomic_set(&healthy,1);if(!ota_storage_maintenance()) ota_safety_restore(false);}
-        else service_error=OTA_ERR_HEALTH;
-    } else if(!service_error) service_error=OTA_ERR_TRANSPORT;
-    atomic_set(&initialized,1);publish();set_phase(service_error?"FAILED":ota_storage_recovery_required()?"RECOVERY_REQUIRED":"IDLE");
+        if(local_snapshot.rolled_back || (!boot_is_img_confirmed() &&
+           j.state!=OTA_COMMITTED && j.state!=OTA_REBOOTING && j.state!=OTA_SUCCEEDED)) service_error=OTA_ERR_HEALTH;
+    }
+    else if(strict_boot) service_error=OTA_ERR_JOURNAL;
+
+    auto can=thingset_can_get_inst();
+    thingset_can_set_state_callback(can_state_changed,nullptr);
+    uint64_t deadline=k_uptime_get()+CONFIG_OWNTECH_OTA_HEALTH_TIMEOUT_MS;
+    /* A successfully started controller is required even for USB-only first
+     * provisioning. ACK/address acquisition is a separate network condition. */
+    while(!service_error && !atomic_get(&can->driver_started) && !atomic_get(&can->init_error) &&
+          k_uptime_get()<(int64_t)deadline) k_sleep(K_MSEC(20));
+    if(!service_error && (!atomic_get(&can->driver_started) || atomic_get(&can->init_error))) service_error=OTA_ERR_TRANSPORT;
+    if(!service_error && owntech_ota_check_health()) service_error=OTA_ERR_HEALTH;
+    if(!service_error) atomic_set(&local_healthy,1);
+
+    /* Campaign images keep the collective postboot barrier. A late peer must
+     * not turn a failed campaign boot into an implicitly accepted image. */
+    while(!service_error && strict_boot && !atomic_get(&can->ready) && !atomic_get(&can->init_error) &&
+          k_uptime_get()<(int64_t)deadline) k_sleep(K_MSEC(20));
+    if(!service_error && (atomic_get(&can->init_error) || (strict_boot && !atomic_get(&can->ready)))) service_error=OTA_ERR_TRANSPORT;
+    if(!service_error && atomic_get(&can->ready)) {
+        if(ota_network_init()) service_error=OTA_ERR_TRANSPORT;
+        else atomic_set(&can_ready,1);
+    }
+    if(!service_error && strict_boot) event(OTA_EVENT_POSTBOOT_CHECK);
+    if(!service_error && !boot_is_img_confirmed() && boot_write_img_confirmed()) service_error=OTA_ERR_HEALTH;
+    if(!service_error) {
+        if(ota_service_can_ready()) atomic_set(&healthy,1);
+        else waiting_can=true;
+        if(!ota_storage_maintenance()) ota_safety_restore(false);
+    }
+    set_phase(service_error?"FAILED":waiting_can?"WAITING_CAN":ota_storage_recovery_required()?"RECOVERY_REQUIRED":"IDLE");
+    atomic_set(&initialized,1);
+    /* Recheck after enabling FIFO delivery, closing a ready-during-init race. */
+    publish();
 }
 static void stream_status_poll()
 {

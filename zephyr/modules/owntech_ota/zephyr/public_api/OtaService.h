@@ -14,6 +14,15 @@ void ota_safety_restore(bool inhibit);
 int ota_safety_enter(void);
 bool ota_service_busy(void);
 bool ota_service_healthy(void);
+/* Local validation/confirmation may complete before a CAN peer is present.
+ * healthy remains the admission gate for CAN fleet operations. */
+bool ota_service_local_healthy(void);
+bool ota_service_can_ready(void);
+struct ota_service_diagnostics {
+    const char *phase;
+    int error;
+    bool local_healthy, healthy, can_ready, busy, is_lead;
+};
 bool ota_service_is_lead(void);
 void ota_feedback_state(enum ota_state state);
 void ota_feedback_application_led(int action); /* 0 off, 1 on, 2 toggle */
@@ -29,6 +38,8 @@ int ota_service_reconcile(uint64_t campaign, const uint8_t identities[][8],
                           size_t count, const uint8_t expected_hash[32]);
 /* Snapshot functions are safe from USB/ThingSet threads. */
 void ota_service_local(struct ota_observation *);
+/* Identity and boot/network state from the same worker publication. */
+void ota_service_snapshot(struct ota_observation *, struct ota_service_diagnostics *);
 int ota_service_target(size_t index, struct ota_observation *, bool *is_lead,
                        uint64_t *last_seen_ms);
 size_t ota_service_target_count(void);

@@ -78,6 +78,12 @@ static bool bytes(zcbor_state_t *z,const char *key,const uint8_t *p,size_t n)
 { return zcbor_tstr_encode_ptr(z,key,strlen(key)) && zcbor_bstr_encode_ptr(z,reinterpret_cast<const char *>(p),n); }
 static bool error(zcbor_state_t *z,int rc)
 { return zcbor_tstr_put_lit(z,"rc") && zcbor_int32_put(z,rc<0?rc:0); }
+static bool health(zcbor_state_t *z,const ota_service_diagnostics &d)
+{
+    return boolean(z,"local_healthy",d.local_healthy) &&
+        boolean(z,"healthy",d.healthy) && boolean(z,"can_ready",d.can_ready) &&
+        zcbor_tstr_put_lit(z,"error") && zcbor_int32_put(z,d.error);
+}
 static void identity_text(const uint8_t eui[8],char str[17])
 {
     constexpr char hex[]="0123456789abcdef";
@@ -115,8 +121,9 @@ static bool row(zcbor_state_t *z,const ota_observation &o,bool lead,uint64_t see
 }
 static bool status(zcbor_state_t *z,uint32_t index)
 {
+    ota_observation local{};ota_service_diagnostics d{};ota_service_snapshot(&local,&d);
     size_t count=ota_service_target_count();
-    if(!text(z,"phase",ota_service_phase()) || !text(z,"state",ota_service_phase()) ||
+    if(!text(z,"phase",d.phase) || !text(z,"state",d.phase) || !health(z,d) ||
        !number(z,"campaign",ota_service_campaign()) || !number(z,"pass",ota_service_pass()) ||
        !number(z,"offset",ota_service_stage_offset()) || !number(z,"target_count",count) ||
        !zcbor_tstr_put_lit(z,"targets") || !zcbor_list_start_encode(z,1)) return false;
@@ -132,17 +139,18 @@ static int handle(smp_streamer *ctxt,int command)
     int rc=0;bool ok=true;
     switch(command) {
     case 0: {
-        ota_observation o{};ota_service_local(&o);char id[17];identity_text(o.identity.eui,id);
+        ota_observation o{};ota_service_diagnostics d{};ota_service_snapshot(&o,&d);
+        char id[17];identity_text(o.identity.eui,id);
         ok=text(z,"service","owntech-ota") && number(z,"protocol",OTA_PROTOCOL_VERSION) &&
-            text(z,"identity",id) && text(z,"role",ota_service_is_lead()?"lead":"follower") &&
+            text(z,"identity",id) && text(z,"role",d.is_lead?"lead":"follower") &&
             text(z,"version",o.active_version) && text(z,"build_id",o.active_build_id) &&
             bytes(z,"mcuboot_image_hash",o.active_mcuboot_image_hash,32) &&
-            boolean(z,"available",ota_service_healthy()&&!ota_service_busy()&&o.identity.slot_available) &&
+            boolean(z,"available",d.healthy&&!d.busy&&o.identity.slot_available) &&
             boolean(z,"active_confirmed",o.identity.active_confirmed) && boolean(z,"slot_available",o.identity.slot_available) &&
             number(z,"slot_size",o.identity.usable_slot_size) && number(z,"useful_capacity",o.identity.usable_image_size) &&
             number(z,"hardware_id",o.identity.hardware_id) && number(z,"layout_id",o.identity.layout_id) &&
             number(z,"bootloader_id",o.identity.bootloader_id) && text(z,"upload","stage_data") &&
-            text(z,"phase",ota_service_phase());break;
+            text(z,"phase",d.phase) && health(z,d);break;
     }
     case 1:
         if(r.role.len==4 && !memcmp(r.role.value,"lead",4)) rc=ota_service_set_role(true);

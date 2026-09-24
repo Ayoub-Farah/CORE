@@ -117,7 +117,8 @@ class USBTests(unittest.TestCase):
         command = [cxx, "-shared", *map(str, objects), "-o", str(output)]
         if os.name == "nt":
             command += ["-nostdlib", "-fuse-ld=lld", "-Wl,/noentry",
-                        "-Wl,/export:usb_smp_request", "-Wl,/export:usb_reset", "-Wl,/export:usb_stat"]
+                        "-Wl,/export:usb_smp_request", "-Wl,/export:usb_reset", "-Wl,/export:usb_stat",
+                        "-Wl,/export:usb_health"]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError(result.stdout + result.stderr)
@@ -126,6 +127,7 @@ class USBTests(unittest.TestCase):
         cls.lib.usb_smp_request.restype = ctypes.c_int
         cls.lib.usb_stat.argtypes = [ctypes.c_uint]
         cls.lib.usb_stat.restype = ctypes.c_uint
+        cls.lib.usb_health.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_int]
 
     @classmethod
     def tearDownClass(cls):
@@ -159,6 +161,8 @@ class USBTests(unittest.TestCase):
         self.assertEqual(info["identity"], IDS[0])
         self.assertEqual((info["slot_size"], info["useful_capacity"]), (227328, 221184))
         self.assertTrue(info["available"] and info["active_confirmed"] and info["slot_available"])
+        self.assertTrue(info["local_healthy"] and info["healthy"] and info["can_ready"])
+        self.assertEqual(info["error"], 0)
         inventory = self.client.request("discover")
         self.assertEqual(inventory["target_count"], 3)
         self.assertEqual(len(inventory["targets"]), 1)
@@ -167,6 +171,22 @@ class USBTests(unittest.TestCase):
             self.assertEqual(row["identity"], expected)
             self.assertTrue(row["compatible"] and row["available"])
             self.assertEqual(len(row["mcuboot_image_hash"]), 32)
+        self.assertLess(self.serial.maximum_response, 1536)
+
+    def test_standalone_and_failed_health_are_visible_in_info_and_status(self):
+        for local, can, error, phase in ((True, False, 0, "WAITING_CAN"),
+                                        (False, False, -17, "FAILED")):
+            self.lib.usb_health(local, can, error)
+            for command in ("info", "status"):
+                with self.subTest(command=command, phase=phase):
+                    reply = self.client.request(command)
+                    self.assertEqual(reply["phase"], phase)
+                    self.assertEqual(reply["local_healthy"], local)
+                    self.assertFalse(reply["healthy"])
+                    self.assertFalse(reply["can_ready"])
+                    self.assertEqual(reply["error"], error)
+                    if command == "info":
+                        self.assertFalse(reply["available"])
         self.assertLess(self.serial.maximum_response, 1536)
 
     def test_full_python_campaign_over_uart_smp_cbor_native_handlers(self):

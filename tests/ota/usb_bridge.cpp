@@ -11,6 +11,8 @@ static size_t target_count;
 static uint32_t accepted;
 static unsigned stage_calls, commit_calls;
 static bool lead_role, staged, active_target;
+static bool local_health, can_ready;
+static int health_error;
 static const char *phase;
 
 extern "C" void usb_reset(void)
@@ -19,11 +21,17 @@ extern "C" void usb_reset(void)
     for(unsigned n=0;n<3;n++) for(unsigned i=0;i<8;i++) ids[n][i]=i+1+16*n;
     target_count=3;accepted=stage_calls=commit_calls=0;
     lead_role=true;staged=active_target=false;phase="IDLE";
+    local_health=can_ready=true;health_error=0;
 }
+extern "C" void usb_health(bool local,bool can,int error_code)
+{ local_health=local;can_ready=can;health_error=error_code;phase=error_code?"FAILED":can?"IDLE":"WAITING_CAN"; }
 extern "C" unsigned usb_stat(unsigned which)
 { return which==0?stage_calls:which==1?commit_calls:which==2?accepted:which==3?stored.hardware_id:stored.image_content_size; }
 extern "C" bool ota_service_busy(void) { return false; }
-extern "C" bool ota_service_healthy(void) { return true; }
+extern "C" bool ota_service_healthy(void) { return local_health&&can_ready&&!health_error; }
+extern "C" bool ota_service_local_healthy(void) { return local_health; }
+extern "C" bool ota_service_can_ready(void) { return can_ready; }
+extern "C" int ota_service_error(void) { return health_error; }
 extern "C" bool ota_service_is_lead(void) { return lead_role; }
 extern "C" int ota_service_set_role(bool lead) { lead_role=lead;return 0; }
 extern "C" const char *ota_service_phase(void) { return phase; }
@@ -59,6 +67,11 @@ static void observation(ota_observation *o,size_t index)
     if(active_target)memcpy(o->active_mcuboot_image_hash,stored.mcuboot_image_hash,32);
 }
 extern "C" void ota_service_local(ota_observation *o) { observation(o,0); }
+extern "C" void ota_service_snapshot(ota_observation *o,ota_service_diagnostics *d)
+{
+    observation(o,0);
+    *d={phase,health_error,local_health,ota_service_healthy(),can_ready,false,lead_role};
+}
 extern "C" int ota_service_target(size_t i,ota_observation *o,bool *lead,uint64_t *seen)
 { if(i>=target_count)return OTA_ERR_ARGUMENT;observation(o,i);*lead=i==0;*seen=123456;return 0; }
 extern "C" int ota_service_discover(void) { return 0; }

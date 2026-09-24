@@ -6,11 +6,14 @@
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (0)
 
 uint8_t eui64[8]={0,0,0,0,0,0,0,1};
-static thingset_can_context fake_can={1,1};
+static thingset_can_context fake_can={1,1,1,0};
+static thingset_can_state_callback_t fake_can_callback;
+static void *fake_can_callback_arg;
 static uint64_t fake_now;
 static bool fake_confirmed=true,fake_inhibited=true,fake_role,fake_recovery,fake_maintenance;
 static bool fake_flushed;
-static int fake_health_result,fake_network_result;
+static int fake_health_result,fake_network_result,fake_hash_result,fake_journal_result;
+static unsigned fake_network_inits;
 static unsigned fake_confirms,fake_prepares,fake_appends,fake_flushes,fake_reboots,fake_release_requests;
 static ota_slot_owner fake_owner=OTA_SLOT_NONE;
 static ota_storage_journal fake_journal;
@@ -26,6 +29,7 @@ static uint8_t fake_lead[8];
 static unsigned fake_identity_reads,fake_receive_calls;
 static int fake_receive_timeout;
 static void (*fake_wait_event)();
+static void (*fake_sleep_event)();
 static int fake_event_result;
 static void pump();
 static int local_flush(void *);
@@ -34,7 +38,7 @@ extern "C" int strncmp(const char *a,const char *b,size_t n){
 }
 
 int64_t k_uptime_get(){return (int64_t)fake_now;}
-void k_sleep(int ms){fake_now+=ms;}
+void k_sleep(int ms){fake_now+=ms;if(fake_sleep_event){auto event=fake_sleep_event;fake_sleep_event=nullptr;event();}}
 void runtime_test_msgq_wait(k_msgq *q,int timeout){
     ++fake_receive_calls;fake_receive_timeout=timeout;
     if(!q->count && timeout!=K_NO_WAIT){
@@ -46,6 +50,10 @@ void runtime_test_msgq_wait(k_msgq *q,int timeout){
 }
 int k_sem_take(k_sem *s,int){if(!s->count)pump();if(!s->count)return -1;--s->count;return 0;}
 thingset_can_context *thingset_can_get_inst(){return &fake_can;}
+void thingset_can_set_state_callback(thingset_can_state_callback_t callback,void *arg){
+    fake_can_callback=callback;fake_can_callback_arg=arg;if(callback)callback(arg);
+}
+static void can_changed(){if(fake_can_callback)fake_can_callback(fake_can_callback_arg);}
 bool boot_is_img_confirmed(){return fake_confirmed;}
 int boot_write_img_confirmed(){++fake_confirms;fake_confirmed=true;return 0;}
 int thingset_can_announce_address(int){return 0;}
@@ -85,8 +93,8 @@ void ota_storage_boot_identity(ota_identity *id){
     id->hardware_id=1;id->layout_id=2;id->bootloader_id=3;
     id->active_confirmed=fake_confirmed;id->slot_available=fake_owner==OTA_SLOT_NONE&&!fake_recovery;
 }
-int ota_storage_active_hash(uint8_t hash[32]){memcpy(hash,fake_active_hash,32);return 0;}
-int ota_storage_get_journal(ota_storage_journal *j){*j=fake_journal;return 0;}
+int ota_storage_active_hash(uint8_t hash[32]){if(fake_hash_result)return fake_hash_result;memcpy(hash,fake_active_hash,32);return 0;}
+int ota_storage_get_journal(ota_storage_journal *j){*j=fake_journal;return fake_journal_result;}
 static int local_journal(void *,const ota_manifest *m,ota_state s,uint32_t commit){
     fake_journal.campaign_id=m->campaign_id;fake_journal.commit_id=commit;fake_journal.image_size=m->image_size;
     fake_journal.state=s;memcpy(fake_journal.lead_eui,fake_lead,8);
@@ -129,7 +137,7 @@ static int local_validate(void *,const ota_manifest *){return 0;}
 static int local_reboot(void *,uint32_t,uint32_t){++fake_reboots;return 0;}
 static void local_close(void *){fake_recovery=fake_maintenance;}
 void ota_storage_hooks(ota_participant_hooks *h){*h={nullptr,local_prepare,local_append,local_flush,local_validate,local_journal,local_reboot,local_close};}
-extern "C" int ota_network_init(){return fake_network_result;}
+extern "C" int ota_network_init(){++fake_network_inits;return fake_network_result;}
 extern "C" int ota_network_command(const ota_target *target,const ota_command *cmd){
     unsigned i=target->identity.eui[7]-2;if(i>=2||!fake_peer_present[i])return OTA_ERR_TIMEOUT;
     auto &s=fake_peers[i].status;s.campaign_id=cmd->manifest.campaign_id;s.image_size=cmd->manifest.image_size;
@@ -159,21 +167,22 @@ static ota_manifest make_manifest(){
     memcpy(m.build_id,OWNTECH_FIRMWARE_BUILD_ID,sizeof(OWNTECH_FIRMWARE_BUILD_ID));return m;
 }
 static void reset_runtime(){
-    losses=initialized=busy=healthy=lead_role=identity_conflict=discovery_requested=stage_end_requested=usb_pending=reconcile_mode=release_pending=refresh_pending=0;
-    participant={};coordinator={};staged_manifest={};local_snapshot={};runtime_snapshot={};
+    losses=initialized=busy=healthy=local_healthy=can_ready=lead_role=identity_conflict=discovery_requested=stage_end_requested=usb_pending=reconcile_mode=release_pending=refresh_pending=0;
+    participant={};coordinator={};staged_manifest={};local_snapshot={};runtime_snapshot={};diagnostics_snapshot={"BOOT",0,false,false,false,false,false};
     memset(inventory,0,sizeof(inventory));memset(frozen,0,sizeof(frozen));inventory_count=frozen_count=0;
-    discovery_active=discovery_done=staged=staging=verifying=reconcile_active=false;
+    discovery_active=discovery_done=staged=staging=verifying=reconcile_active=waiting_can=false;
     probe_address=1;discovery_deadline=campaign_id=reconcile_deadline=0;stage_offset=pass_snapshot=0;
     service_error=usb_result=0;stage_state=OTA_IDLE;phase_snapshot="BOOT";memset(reconcile_hash,0,32);
     reconcile_manifest={};reconcile_commit=0;storage_hooks={};event_mask=next_event_order=event_campaign=0;
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
     accepted_start={};accepted_reconcile={};accepted_prepare_campaign=next_stream_poll=stream_poll_target=0;
-    ota_queue.head=ota_queue.count=0;k_sem_reset(&usb_done);fake_now=0;fake_can.ready=1;fake_can.node_addr=1;
-    fake_identity_reads=fake_receive_calls=0;fake_receive_timeout=K_NO_WAIT;fake_wait_event=nullptr;fake_event_result=0;
+    ota_queue.head=ota_queue.count=0;k_sem_reset(&usb_done);fake_now=0;fake_can={1,1,1,0};
+    fake_can_callback=nullptr;fake_can_callback_arg=nullptr;fake_network_inits=0;
+    fake_identity_reads=fake_receive_calls=0;fake_receive_timeout=K_NO_WAIT;fake_wait_event=fake_sleep_event=nullptr;fake_event_result=0;
 }
 static void reset_all(){
     reset_runtime();fake_confirmed=true;fake_inhibited=true;fake_role=fake_recovery=fake_maintenance=false;
-    fake_health_result=fake_network_result=0;fake_confirms=fake_prepares=fake_appends=fake_flushes=fake_reboots=fake_release_requests=0;
+    fake_health_result=fake_network_result=fake_hash_result=fake_journal_result=0;fake_confirms=fake_prepares=fake_appends=fake_flushes=fake_reboots=fake_release_requests=0;
     fake_owner=OTA_SLOT_NONE;fake_journal={};fake_manifest={};fake_fleet_manifest={};fake_fleet_count=0;fake_offset=fake_fleet_commit=0;fake_flushed=false;
     memset(fake_active_hash,0xbb,32);memset(fake_lead,0,8);
     for(unsigned i=0;i<2;i++){
@@ -193,7 +202,10 @@ static const uint8_t ids[3][8]={{0,0,0,0,0,0,0,1},{0,0,0,0,0,0,0,2},{0,0,0,0,0,0
 static int nominal_test(){
     reset_all();initialize_runtime();CHECK(ota_service_healthy()&&!fake_inhibited);
     CHECK(!ota_service_set_role(true));discover_all();CHECK(discovery_done&&inventory_count==3);
-    ota_manifest m=make_manifest();CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY);
+    ota_manifest m=make_manifest();CHECK(!ota_service_stage_begin(&m));
+    ota_observation queued{};ota_service_diagnostics queued_diag{};ota_service_snapshot(&queued,&queued_diag);
+    CHECK(!strncmp(queued_diag.phase,"ERASE_BEGIN",12)&&queued_diag.busy&&queued.status.campaign_id==42);
+    worker_iteration();CHECK(staging&&stage_state==OTA_READY);
     unsigned idle_reads=fake_identity_reads;worker_iteration();
     CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads&&ota_service_busy());
     uint8_t data[256]={};for(uint32_t pos=0;pos<768;pos+=256)CHECK(!ota_service_stage_data(pos,data,256));
@@ -243,6 +255,85 @@ static int bootstrap_test(){
     CHECK(!fake_confirms&&!ota_service_healthy()&&fake_inhibited&&local_snapshot.rolled_back);
     return 0;
 }
+static int standalone_boot_test(){
+    reset_all();fake_confirmed=false;fake_can.ready=0;fake_can.driver_started=0;
+    fake_sleep_event=[](){fake_can.driver_started=1;can_changed();};
+    initialize_runtime();
+    CHECK(fake_now==20&&fake_confirms==1&&fake_confirmed&&!fake_inhibited&&!service_error);
+    CHECK(ota_service_local_healthy()&&!ota_service_healthy()&&!ota_service_can_ready());
+    CHECK(!fake_network_inits&&!strncmp(ota_service_phase(),"WAITING_CAN",12));
+    ota_observation observation{};ota_service_diagnostics diag{};ota_service_snapshot(&observation,&diag);
+    CHECK(!memcmp(observation.active_mcuboot_image_hash,fake_active_hash,32)&&observation.confirmed);
+    CHECK(!strncmp(diag.phase,"WAITING_CAN",12)&&diag.local_healthy&&!diag.healthy&&!diag.can_ready&&!diag.busy);
+    CHECK(!ota_service_set_role(true));ota_service_snapshot(&observation,&diag);CHECK(diag.is_lead);
+    CHECK(ota_service_discover()==OTA_ERR_STATE);
+    ota_manifest manifest=make_manifest();CHECK(ota_service_stage_begin(&manifest)==OTA_ERR_STATE);
+    ota_command command{};command.type=OTA_CMD_PREPARE;command.manifest=manifest;command.lead_address=2;
+    memcpy(command.lead_eui,ids[1],8);CHECK(ota_runtime_command(&command,2)==OTA_ERR_STATE);
+    CHECK(!fake_prepares&&!k_msgq_num_used_get(&ota_queue));
+    unsigned reads=fake_identity_reads;fake_now=100000;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads&&fake_confirms==1&&!service_error);
+    /* Readiness arriving exactly as the worker sleeps must wake it once. */
+    fake_wait_event=[](){fake_can.ready=1;can_changed();can_changed();};worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&ota_service_healthy()&&ota_service_can_ready());
+    CHECK(fake_network_inits==1&&fake_confirms==1&&!k_msgq_num_used_get(&ota_queue));
+    ota_service_snapshot(&observation,&diag);
+    CHECK(!strncmp(diag.phase,"IDLE",5)&&diag.local_healthy&&diag.healthy&&diag.can_ready&&!diag.error);
+    CHECK(observation.healthy&&observation.confirmed&&!fake_inhibited);
+    CHECK(!ota_service_discover());worker_iteration();CHECK(discovery_active);
+    /* Full queues already wake the worker; no readiness notification is lost. */
+    reset_all();fake_confirmed=false;fake_can.ready=0;initialize_runtime();
+    Work refresh{};refresh.type=REFRESH;
+    for(unsigned i=0;i<CONFIG_OWNTECH_OTA_QUEUE_DEPTH;i++)CHECK(!enqueue(refresh));
+    fake_can.ready=1;can_changed();CHECK(!atomic_get(&refresh_pending));worker_iteration();
+    CHECK(ota_service_healthy()&&fake_network_inits==1&&fake_confirms==1);
+    while(k_msgq_num_used_get(&ota_queue))worker_iteration();
+    reads=fake_identity_reads;worker_iteration();CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads);
+    return 0;
+}
+static int standalone_failure_test(){
+    for(unsigned failure=0;failure<6;failure++) {
+        reset_all();fake_confirmed=false;fake_can.ready=0;
+        if(failure==0){fake_can.driver_started=0;fake_can.init_error=-5;}
+        if(failure==1)fake_can.driver_started=0; /* bounded local driver timeout */
+        if(failure==2)fake_health_result=OTA_ERR_HEALTH;
+        if(failure==3)fake_hash_result=OTA_ERR_STORAGE;
+        if(failure==4)fake_journal_result=OTA_ERR_JOURNAL;
+        if(failure==5){fake_can.ready=1;fake_network_result=OTA_ERR_TRANSPORT;}
+        initialize_runtime();
+        CHECK(!fake_confirms&&!ota_service_healthy()&&fake_inhibited&&service_error);
+        CHECK(!strncmp(ota_service_phase(),"FAILED",7)&&ota_service_set_role(true)==OTA_ERR_STATE);
+        CHECK(!waiting_can);
+        if(failure==1)CHECK(fake_now==CONFIG_OWNTECH_OTA_HEALTH_TIMEOUT_MS);
+        if(failure!=3)CHECK(!memcmp(local_snapshot.active_mcuboot_image_hash,fake_active_hash,32));
+        if(failure==0||failure==1)CHECK(!ota_service_local_healthy()&&service_error==OTA_ERR_TRANSPORT);
+    }
+    reset_all();fake_confirmed=false;fake_can.ready=0;initialize_runtime();
+    fake_can.init_error=-5;can_changed();worker_iteration();
+    CHECK(!ota_service_local_healthy()&&!ota_service_healthy()&&fake_inhibited&&service_error==OTA_ERR_TRANSPORT);
+    CHECK(!waiting_can&&fake_confirms==1&&ota_service_set_role(true)==OTA_ERR_STATE);
+    return 0;
+}
+static int campaign_boot_health_test(){
+    reset_all();auto manifest=make_manifest();local_journal(nullptr,&manifest,OTA_REBOOTING,77);
+    restore_boot_storage();fake_confirmed=false;fake_can.ready=0;initialize_runtime();
+    CHECK(fake_now==CONFIG_OWNTECH_OTA_HEALTH_TIMEOUT_MS&&service_error==OTA_ERR_TRANSPORT);
+    CHECK(!fake_confirms&&!fake_confirmed&&!ota_service_healthy()&&fake_inhibited&&!waiting_can);
+    CHECK(ota_service_local_healthy()&&!memcmp(local_snapshot.active_mcuboot_image_hash,fake_active_hash,32));
+    fake_can.ready=1;can_changed();worker_iteration();
+    CHECK(!fake_confirms&&!ota_service_healthy()&&fake_inhibited&&!strncmp(ota_service_phase(),"FAILED",7));
+    CHECK(!fake_network_inits&&!(event_mask&(1U<<OTA_EVENT_POSTBOOT_CHECK)));
+    reset_all();local_journal(nullptr,&manifest,OTA_REBOOTING,77);restore_boot_storage();fake_confirmed=false;
+    initialize_runtime();CHECK(fake_confirms==1&&ota_service_healthy()&&fake_inhibited&&fake_maintenance);
+    CHECK(event_mask&(1U<<OTA_EVENT_POSTBOOT_CHECK));
+    CHECK(ota_service_set_role(true)==OTA_ERR_STATE);
+    reset_all();local_journal(nullptr,&manifest,OTA_REBOOTING,77);restore_boot_storage();fake_confirmed=true;
+    fake_journal.mcuboot_image_hash[0]^=1;initialize_runtime();
+    CHECK(!ota_service_healthy()&&local_snapshot.rolled_back&&fake_inhibited&&service_error==OTA_ERR_HEALTH);
+    reset_all();fake_maintenance=fake_recovery=true;fake_confirmed=false;initialize_runtime();
+    CHECK(!fake_confirms&&!ota_service_healthy()&&fake_inhibited&&service_error==OTA_ERR_JOURNAL);
+    return 0;
+}
 static int reconcile_roster_test(){
     reset_all();fake_role=true;fake_manifest=make_manifest();fake_fleet_manifest=fake_manifest;fake_fleet_count=3;fake_fleet_commit=77;
     for(unsigned i=0;i<3;i++){memcpy(fake_fleet[i].identity.eui,ids[i],8);fake_fleet[i].is_lead=i==0;}
@@ -283,6 +374,8 @@ static int prepare_reconcile(){
         fake_peers[i].status.image_size=fake_manifest.image_size;fake_peers[i].status.state=OTA_RECOVERY_REQUIRED;
     }
     CHECK(!ota_service_reconcile(42,ids,3,fake_manifest.mcuboot_image_hash));
+    ota_observation queued{};ota_service_diagnostics queued_diag{};ota_service_snapshot(&queued,&queued_diag);
+    CHECK(!strncmp(queued_diag.phase,"POSTBOOT_CHECK",15)&&queued_diag.busy);
     CHECK(ota_service_busy());ota_manifest next=make_manifest();++next.campaign_id;
     CHECK(ota_service_stage_begin(&next)==OTA_ERR_STATE);
     pump();for(unsigned i=0;i<300&&discovery_active;i++){fake_now+=5;discovery_step();publish();}
@@ -346,7 +439,11 @@ static int idle_worker_test(){
     CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads&&!ota_service_busy());
     CHECK(!ota_service_set_role(true)&&ota_service_is_lead());
     /* Discovery arrives after the worker chose an indefinite wait. */
-    fake_wait_event=[](){fake_event_result=ota_service_discover();};worker_iteration();
+    fake_wait_event=[](){
+        fake_event_result=ota_service_discover();ota_observation queued{};ota_service_diagnostics diag{};
+        ota_service_snapshot(&queued,&diag);
+        if(strncmp(diag.phase,"DISCOVERING",12))fake_event_result=OTA_ERR_STATE;
+    };worker_iteration();
     CHECK(!fake_event_result&&fake_receive_timeout==K_FOREVER&&discovery_active&&probe_address==2);
     for(unsigned i=0;i<300&&discovery_active;i++)worker_iteration();
     CHECK(discovery_done&&inventory_count==3&&!strncmp(ota_service_phase(),"IDLE",5));
@@ -390,6 +487,9 @@ extern "C" int ota_runtime_state_test_run(){
     int rc=idle_worker_test();if(rc)return rc;
     rc=participant_worker_wake_test();if(rc)return rc;
     rc=bootstrap_test();if(rc)return rc;
+    rc=standalone_boot_test();if(rc)return rc;
+    rc=standalone_failure_test();if(rc)return rc;
+    rc=campaign_boot_health_test();if(rc)return rc;
     rc=nominal_test();if(rc)return rc;rc=reconcile_roster_test();if(rc)return rc;
     rc=queued_prepare_test();if(rc)return rc;rc=persisted_lead_participant_test();if(rc)return rc;
     rc=reconcile_failure_test();if(rc)return rc;rc=release_source_test();if(rc)return rc;

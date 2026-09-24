@@ -93,7 +93,13 @@ extern "C" int ota_service_start(uint64_t campaign,const uint8_t targets[][8],si
     memcpy(ids,targets,n*8);target_count=n;phase="ALL_VALIDATED";return 0;
 }
 extern "C" int ota_service_commit(uint64_t campaign)
-{ if(campaign!=stored.campaign_id)return OTA_ERR_STATE;++commit_calls;active_target=true;phase="REBOOTING";return 0; }
+{
+    if(campaign!=stored.campaign_id)return OTA_ERR_STATE;
+    ++commit_calls;
+    /* This codec fixture simulates a completed reboot immediately; the new
+     * active image and POSTBOOT_CHECK event must have a matching boot phase. */
+    active_target=true;phase="RECOVERY_REQUIRED";return 0;
+}
 extern "C" int ota_service_abort(uint64_t) { phase="ABORTED";return 0; }
 extern "C" int ota_service_reconcile(uint64_t campaign,const uint8_t targets[][8],size_t n,const uint8_t hash[32])
 {

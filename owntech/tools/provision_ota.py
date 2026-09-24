@@ -61,23 +61,40 @@ def _provision_readiness(info):
 
 
 def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monotonic,
-              sleep=time.sleep, output=print):
-    """One explicit initialization; a live service is never reset or uploaded."""
+              sleep=time.sleep, output=print, legacy_console=False):
+    """Initialize one board; ordinary uploads first preserve a live receiver."""
     bootstrapped = False
-    try:
-        transport = connection.connect()
-    except ReceiverProbeTimeout:
-        output("No application receiver on USB serial %s; initializing through the existing bootloader" % connection.serial_number)
+    if legacy_console:
+        # An SMP probe itself can overflow a legacy application's 16-byte
+        # console buffer and block its USB workqueue before 1200-baud entry.
+        # This explicit mode therefore checks topology without UART writes.
+        # Count every interface of the selected physical board, even when
+        # --port selected one interface of a current double-CDC OTA receiver.
+        ports = [port for port in connection.enumerate()
+                 if port.vid == 0x2FE3 and port.serial_number == connection.serial_number]
+        if len(ports) != 1 or (connection.bootstrap_port and ports[0].device != connection.bootstrap_port):
+            raise CampaignError("legacy-console initialization requires exactly one CDC interface on the selected "
+                                "USB board; use ordinary OTA upload for a live OTA receiver. No reset/upload was sent")
+        connection.bootstrap_port = ports[0].device
+        output("Explicit legacy-console initialization on USB serial %s; entering at 1200 baud before any SMP probe"
+               % connection.serial_number)
         transport = connection.bootstrap(image, mcumgr)
         bootstrapped = True
-    except CommandError as error:
-        if not error.unsupported:
-            raise CampaignError("USB command rejected; no reset/upload was sent: %s" % error) from error
-        output("OTA service unsupported on USB serial %s; checking the existing image service" % connection.serial_number)
-        transport = connection.bootstrap(image, mcumgr, enter_bootloader=False)
-        bootstrapped = True
-    except ProtocolError as error:
-        raise CampaignError("USB replied but the response is invalid; no reset/upload was sent: %s" % error) from error
+    else:
+        try:
+            transport = connection.connect()
+        except ReceiverProbeTimeout:
+            output("No application receiver on USB serial %s; initializing through the existing bootloader" % connection.serial_number)
+            transport = connection.bootstrap(image, mcumgr)
+            bootstrapped = True
+        except CommandError as error:
+            if not error.unsupported:
+                raise CampaignError("USB command rejected; no reset/upload was sent: %s" % error) from error
+            output("OTA service unsupported on USB serial %s; checking the existing image service" % connection.serial_number)
+            transport = connection.bootstrap(image, mcumgr, enter_bootloader=False)
+            bootstrapped = True
+        except ProtocolError as error:
+            raise CampaignError("USB replied but the response is invalid; no reset/upload was sent: %s" % error) from error
     deadline = clock() + timeout
     expected_identity = None
     while True:
@@ -140,6 +157,8 @@ def main(argv=None):
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--serial", help="stable USB serial; required if several OwnTech boards are attached")
     parser.add_argument("--port", help="console interface for initial 1200-baud entry")
+    parser.add_argument("--legacy-console", action="store_true",
+                        help="explicitly initialize a legacy single-CDC application: enter at 1200 baud before any SMP probe")
     parser.add_argument("--mcumgr", type=Path, required=True, help="existing OwnTech mcumgr application uploader")
     parser.add_argument("--version")
     parser.add_argument("--build-id")
@@ -152,7 +171,7 @@ def main(argv=None):
         _, manifest = prepare_manifest(args.image, profile=load_profile(args.profile) if args.profile else None,
                                        version=args.version, build_id=args.build_id)
         connection = USBConnection(args.serial, args.port, timeout=args.timeout)
-        provision(connection, args.image, manifest, args.mcumgr, timeout=args.timeout)
+        provision(connection, args.image, manifest, args.mcumgr, timeout=args.timeout, legacy_console=args.legacy_console)
         return 0
     except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
         print("OTA initialization failed: %s" % error, file=sys.stderr)

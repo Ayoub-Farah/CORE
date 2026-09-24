@@ -154,7 +154,11 @@ class USBConnection:
                     else:
                         raise CampaignError("application service replied on %s; refusing bootloader upload. "
                                             "Rerun OTA to check it or use USB_LEAD for a live OTA application" % port.device)
-                    candidate.image_state()
+                    image_state = candidate.image_state()
+                    if not image_state["images"]:
+                        raise CampaignError("bootloader returned an empty image list: no image recognized; "
+                                            "primary/secondary state cannot be verified. Stopping before firmware "
+                                            "upload and post-upload reset; 1200-baud entry may already have occurred")
                     ready.append(port.device)
                 except ReceiverProbeTimeout as error:
                     unresolved |= replied
@@ -188,8 +192,21 @@ class USBConnection:
             select_port(self.enumerate(), self.serial_number, self.bootstrap_port)
             print("Entering bootloader on %s (USB serial %s)" % (self.bootstrap_port, self.serial_number), flush=True)
             # Match PlatformIO's TouchSerialPort, including the DTR transition.
-            with serial.Serial(self.bootstrap_port, baudrate=1200, timeout=0.2) as console:
-                console.setDTR(False)
+            try:
+                with serial.Serial(self.bootstrap_port, baudrate=1200, timeout=0.2) as console:
+                    console.setDTR(False)
+            except OSError as error:
+                # Windows may lose the CDC device inside SetCommState because
+                # setting 1200 baud already triggered the board's reset.
+                # pyserial embeds WinError's repr instead of retaining winerror.
+                # Access-denied/busy/ordinary configuration errors still stop.
+                detached = getattr(error, "winerror", None) in (433, 1167) or (
+                    str(error).startswith("Cannot configure port") and
+                    re.search(r"\b(?:OSError|WindowsError)\(.*?,\s*(?:433|1167)\)\s*$", str(error)) is not None)
+                if not detached:
+                    raise
+                print("USB disappeared during 1200-baud entry; checking the image service on the same serial "
+                      "without repeating the reset", flush=True)
             time.sleep(0.4)
         print("Waiting for the image service on USB serial %s..." % self.serial_number, flush=True)
         self.device = self._wait_image_service()

@@ -97,6 +97,76 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(self.receiver.calls, [("info", {})])
         self.connection.bootstrap.assert_not_called()
 
+    def test_explicit_legacy_entry_touches_1200_before_any_smp_and_needs_no_can_peer(self):
+        self.waiting_can()
+        events = []
+        connection = USBConnection.__new__(USBConnection)
+        connection.serial_number = "physical-one"
+        connection.bootstrap_port = "COM1"
+        connection.transport = None
+        connection.timeout = 1
+        connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")]
+        connection.connect = Mock(side_effect=AssertionError("no application probe before 1200"))
+        connection.reconnect = Mock(side_effect=lambda: events.append("reconnect") or self.receiver)
+        candidate = Mock()
+
+        def smp_info(command):
+            self.assertEqual(events[0], "touch1200")
+            events.append("bootloader_info")
+            raise CommandError("unsupported", response={"rc": 8})
+
+        candidate.request.side_effect = smp_info
+        candidate.image_state.side_effect = lambda: events.append("image_state") or {
+            "images": [{"slot": 0, "version": "old", "hash": b"h" * 32}]}
+        serial = MagicMock(side_effect=lambda *args, **kwargs: events.append("touch1200") or MagicMock())
+        with tempfile.TemporaryDirectory() as directory:
+            mcumgr = Path(directory) / "mcumgr.exe"
+            mcumgr.touch()
+            with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
+                 patch("lead_update.SerialSMP", return_value=candidate), patch("lead_update.time.sleep"), \
+                 patch("lead_update.upload_image", side_effect=lambda *args: events.append("upload")), \
+                 patch("lead_update.subprocess.run", side_effect=lambda *args, **kwargs: events.append("reset")):
+                result = provision(connection, Path("exact.mcuboot.bin"), self.manifest, mcumgr,
+                                   legacy_console=True, output=lambda _: None)
+        self.assertEqual(events, ["touch1200", "bootloader_info", "image_state", "upload", "reset", "reconnect"])
+        serial.assert_called_once_with("COM1", baudrate=1200, timeout=0.2)
+        connection.connect.assert_not_called()
+        self.assertEqual(result["result"], "PROVISIONED")
+        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
+        self.assertEqual(result["info"]["role"], "follower")
+        self.assertEqual(self.receiver.calls, [("info", {})])
+
+    def test_explicit_legacy_entry_rejects_multiple_cdc_even_with_a_selected_port(self):
+        console = SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")
+        smp = SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM2")
+        other = SimpleNamespace(vid=0x2FE3, serial_number="different", device="COM1")
+        self.connection.bootstrap_port = "COM1"
+        for ports in ([console, smp], [], [other], [smp]):
+            self.connection.enumerate = lambda: ports
+            with self.subTest(ports=ports), self.assertRaisesRegex(CampaignError, "exactly one CDC interface"):
+                self.run_provision(legacy_console=True)
+            self.connection.bootstrap.assert_not_called()
+            self.connection.connect.assert_not_called()
+        self.assertEqual(self.receiver.calls, [])
+
+    def test_legacy_cli_validates_artifact_and_selection_before_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "firmware.mcuboot.bin"
+            image.write_bytes(b"invalid")
+            args = ["--image", str(image), "--mcumgr", "unused", "--legacy-console"]
+            with patch("provision_ota.USBConnection") as connection, redirect_stderr(io.StringIO()):
+                self.assertEqual(main(args), 1)
+            connection.assert_not_called()
+            image.write_bytes(artifact())
+            ports = [SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1"),
+                     SimpleNamespace(vid=0x2FE3, serial_number="two", device="COM2")]
+            with patch.dict(sys.modules, {"serial.tools.list_ports": SimpleNamespace(comports=lambda: ports)}), \
+                 patch("lead_update.SerialSMP") as smp, patch.object(USBConnection, "bootstrap") as bootstrap, \
+                 redirect_stderr(io.StringIO()):
+                self.assertEqual(main(args), 1)
+            smp.assert_not_called()
+            bootstrap.assert_not_called()
+
     def test_waiting_for_can_peer_is_initialized_read_only_without_network_health(self):
         self.waiting_can()
         sleep = Mock()
@@ -452,6 +522,74 @@ class ProvisionTests(unittest.TestCase):
             run.assert_called_once_with(base + ["reset"], check=True, timeout=15)
             connection.reconnect.assert_called_once()
 
+    def test_1200_configuration_disconnect_requires_same_serial_image_service_before_upload(self):
+        detached = OSError("Cannot configure port, something went wrong. Original message: "
+                           "OSError(22, 'A device which does not exist was specified.', None, 433)")
+        for ready in (True, False):
+            with self.subTest(ready=ready), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "mcumgr.exe"
+                executable.touch()
+                connection = USBConnection.__new__(USBConnection)
+                connection.serial_number = "one"
+                connection.bootstrap_port = "COM1"
+                connection.transport = None
+                connection.timeout = 1
+                console = SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1")
+                boot = SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM7")
+                unrelated = SimpleNamespace(vid=0x2FE3, serial_number="other", device="COM8")
+                connection.enumerate = Mock(side_effect=lambda: [console] if connection.enumerate.call_count == 1
+                                            else [boot, unrelated])
+                connection.reconnect = Mock(return_value=self.receiver)
+                candidate = Mock()
+                candidate.request.side_effect = CommandError("unsupported", response={"rc": 8})
+                candidate.image_state.return_value = {"images": [{"slot": 0, "version": "old", "hash": b"h" * 32}]}
+                factory = Mock(return_value=candidate) if ready else Mock(side_effect=TransportError("occupied boot port"))
+                serial = Mock(side_effect=detached)
+                with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
+                     patch("lead_update.SerialSMP", factory), patch("lead_update.time.monotonic", side_effect=count(step=0.05)), \
+                     patch("lead_update.time.sleep"), patch("lead_update.upload_image") as upload, \
+                     patch("lead_update.subprocess.run") as reset:
+                    if ready:
+                        self.assertIs(connection.bootstrap(Path("exact.mcuboot.bin"), executable), self.receiver)
+                    else:
+                        with self.assertRaisesRegex(CampaignError, "image service did not become ready"):
+                            connection.bootstrap(Path("exact.mcuboot.bin"), executable)
+                serial.assert_called_once_with("COM1", baudrate=1200, timeout=0.2)
+                self.assertTrue(factory.called)
+                self.assertTrue(all(call.args[0] == "COM7" for call in factory.call_args_list))
+                if ready:
+                    candidate.request.assert_called_once_with("info")
+                    candidate.image_state.assert_called_once_with()
+                    candidate.close.assert_called_once_with()
+                    upload.assert_called_once()
+                    reset.assert_called_once()
+                    self.assertIn("dev=COM7,baud=115200,mtu=128", upload.call_args.args[0])
+                else:
+                    upload.assert_not_called()
+                    reset.assert_not_called()
+                    connection.reconnect.assert_not_called()
+
+    def test_1200_access_denied_or_unknown_configuration_error_is_not_a_disconnect(self):
+        errors = (PermissionError(13, "Access denied"), OSError(22, "Invalid configuration"),
+                  OSError("Cannot configure port. Original message: OSError(13, 'Access denied', None, 5)"))
+        for error in errors:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "mcumgr.exe"
+                executable.touch()
+                connection = USBConnection.__new__(USBConnection)
+                connection.serial_number = "one"
+                connection.bootstrap_port = "COM1"
+                connection.transport = None
+                connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1")]
+                connection._wait_image_service = Mock()
+                with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=Mock(side_effect=error))}), \
+                     patch("lead_update.upload_image") as upload, patch("lead_update.subprocess.run") as reset:
+                    with self.assertRaises(OSError):
+                        connection.bootstrap(Path("exact.mcuboot.bin"), executable)
+                connection._wait_image_service.assert_not_called()
+                upload.assert_not_called()
+                reset.assert_not_called()
+
     def test_image_service_wait_follows_same_serial_to_new_com_and_reads_standard_image_state(self):
         state = {"images": [{"slot": 0, "version": "1.0.0", "hash": b"h" * 32}]}
         streams, factory = self.use_wire_connection({
@@ -477,6 +615,7 @@ class ProvisionTests(unittest.TestCase):
             (response(self.info), CampaignError),
             (response({"rc": 8}) + response({"rc": 0}, sequence=1, group=1, operation=1), ProtocolError),
             (response({"rc": 8}) + response({"rc": 8}, sequence=1, group=1, operation=1), CommandError),
+            (response({"rc": 8}) + response({"images": [], "splitStatus": 0}, sequence=1, group=1, operation=1), CampaignError),
         )
         for lines, error_type in cases:
             with self.subTest(error_type=error_type):
@@ -487,6 +626,40 @@ class ProvisionTests(unittest.TestCase):
                 upload.assert_not_called()
                 reset.assert_not_called()
                 streams["COM1"].close.assert_called_once()
+
+    def test_empty_bootloader_image_list_blocks_upload_and_post_upload_reset_after_either_entry(self):
+        for enter_bootloader in (False, True):
+            with self.subTest(enter_bootloader=enter_bootloader), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "mcumgr.exe"
+                executable.touch()
+                connection = USBConnection.__new__(USBConnection)
+                connection.serial_number = "one"
+                connection.bootstrap_port = "COM1"
+                connection.timeout = 1
+                connection.transport = None
+                connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1")]
+                connection.reconnect = Mock()
+                candidate = Mock()
+                candidate.request.side_effect = CommandError("unsupported", response={"rc": 8})
+                candidate.image_state.return_value = {"images": [], "splitStatus": 0}
+                serial = MagicMock()
+                with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
+                     patch("lead_update.SerialSMP", return_value=candidate), patch("lead_update.time.sleep"), \
+                     patch("lead_update.upload_image") as upload, patch("lead_update.subprocess.run") as reset, \
+                     self.assertRaisesRegex(CampaignError, "empty image list: no image recognized") as failure:
+                    connection.bootstrap(Path("exact.mcuboot.bin"), executable, enter_bootloader=enter_bootloader)
+                self.assertIn("primary/secondary state cannot be verified", str(failure.exception))
+                self.assertIn("1200-baud entry may already have occurred", str(failure.exception))
+                candidate.request.assert_called_once_with("info")
+                candidate.image_state.assert_called_once_with()
+                candidate.close.assert_called_once_with()
+                upload.assert_not_called()
+                reset.assert_not_called()
+                connection.reconnect.assert_not_called()
+                if enter_bootloader:
+                    serial.assert_called_once_with("COM1", baudrate=1200, timeout=0.2)
+                else:
+                    serial.assert_not_called()
 
     def test_silent_busy_or_unresolved_image_service_times_out_without_upload_or_reset(self):
         for failure in (ReceiverProbeTimeout("silent port"), TransportError("busy port"),

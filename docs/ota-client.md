@@ -54,7 +54,7 @@ this path even when its version differs. Remove the assertion after provisioning
 No bootloader download, installation target or new signing key is involved.
 By default the initial application is the campaign image. To observe a complete
 A → B transition on the Lead too, build `OTA_BLINK_A` first and set
-`custom_ota_bootstrap_image = .pio/build/OTA_BLINK_A/firmware.mcuboot.bin` while
+`custom_ota_bootstrap_image = .pio/ota-artifacts/OTA_BLINK_A/firmware.mcuboot.bin` while
 running the B task. The standalone equivalent is `--bootstrap-image PATH`.
 The initial image is independently inspected with the same compatibility/size
 profile; its version can differ from the campaign target. It must provide the
@@ -90,7 +90,7 @@ from lead_update import USBConnection
 from smp_transport import ReceiverProbeTimeout
 from ota_artifact import inspect_image
 
-image = Path(".pio/build/OTA_BLINK_A/firmware.mcuboot.bin")
+image = Path(".pio/ota-artifacts/OTA_BLINK_A/firmware.mcuboot.bin")
 inspect_image(image.read_bytes(), version="1.0.0")
 link = USBConnection(serial_number="EXACT_FOLLOWER_USB_SERIAL")
 # For an old application with multiple CDC ports, also pass device="COM9"
@@ -121,6 +121,18 @@ serial; leaving it in the default follower role is intentional. Then run the B
 The task persists the Lead role, verifies the complete inventory, stages B and
 updates all three boards. Initial application resets occur before this campaign.
 
+CAN startup health has a 15-second bound. Before the first A receiver boots,
+the bus must have an active ACK-capable CAN peer: an existing CAN/OTA application
+or a bench adapter. Connected boards running old USB-only applications are not
+sufficient. If health fails or the image remains unconfirmed, stop and correct
+the bench/provisioning setup; inspect status before any reset, because an
+unconfirmed image may roll back and require existing-bootloader recovery.
+Verify each board with
+`python owntech/tools/lead_update.py --status --serial EXACT_BOARD_USB_SERIAL`:
+the application must report available with its active image confirmed; checking
+only the A version and role is insufficient. Do not reset any board once USB
+staging or the campaign has begun.
+
 ## Artifact and limits
 
 The inspector uses the Python standard library:
@@ -128,9 +140,13 @@ The inspector uses the Python standard library:
 Ordinary builds also run this check immediately after the existing signer and
 write the adjacent `.json` manifest. Invalid padding/structure or useful content
 over the separate capacity limit fails the build before upload.
+The same verified binary and manifest are also saved in
+`.pio/ota-artifacts/<environment>/`. Use this stable snapshot for initial A
+provisioning: a first build of another environment can cause PlatformIO to remove
+`.pio/build`, while the snapshot directory remains intact.
 
 ```sh
-python owntech/scripts/ota_artifact.py inspect .pio/build/USB_LEAD/firmware.mcuboot.bin --output firmware.mcuboot.json
+python owntech/scripts/ota_artifact.py inspect .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin --output firmware.mcuboot.json
 ```
 
 It validates MCUboot header, TLV bounds, SHA256 TLV, signature/key TLV structure,
@@ -167,10 +183,10 @@ The standalone client requires Python 3 and `pyserial`; PlatformIO's Python
 already supplies it. CBOR and SMP framing need no extra packages.
 
 ```sh
-python owntech/tools/lead_update.py --image .pio/build/USB_LEAD/firmware.mcuboot.bin --build-id ota-blink-B --serial YOUR_USB_SERIAL_NUMBER --expected-count 3
+python owntech/tools/lead_update.py --image .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin --build-id ota-blink-B --serial YOUR_USB_SERIAL_NUMBER --expected-count 3
 python owntech/tools/lead_update.py --status --serial YOUR_USB_SERIAL_NUMBER
-python owntech/tools/lead_update.py --reconcile-journal .pio/build/USB_LEAD/campaign-ID.jsonl
-python owntech/tools/lead_update.py --abort-journal .pio/build/USB_LEAD/campaign-ID.jsonl
+python owntech/tools/lead_update.py --reconcile-journal ota-journals/campaign-ID.jsonl
+python owntech/tools/lead_update.py --abort-journal ota-journals/campaign-ID.jsonl
 ```
 
 `--status` is a read-only snapshot: it calls only `info` and paginated `status`.
@@ -178,8 +194,11 @@ It requires neither an image nor an expected fleet and performs no discovery,
 role selection, bootstrap, upload or reset. Run it while the campaign client is
 closed because each USB port has one reader.
 
-Each campaign creates or verifies `firmware.mcuboot.json` and writes a timestamped
-JSONL journal in the build directory. The journal contains USB serial, Lead EUI-64, immutable
+Each campaign creates or verifies the image's adjacent `firmware.mcuboot.json`
+and writes a timestamped JSONL journal under `ota-journals/` in the current
+project/working directory. This location survives normal PlatformIO build
+cleanup; `--journal PATH` still selects an explicit journal file. The journal
+contains USB serial, Lead EUI-64, immutable
 target set, version/hash domains, transitions and errors. Recovery reloads this
 set from the journal; it does not substitute newly discovered devices. Partial
 image writes are never resumed after a reset. An aborted or failed campaign

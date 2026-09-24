@@ -55,9 +55,20 @@ def artifact_post_action(source, target, env):
         profile, _, version, build_id = artifact_options(env)
         from ota_artifact import inspect_image
         image = Path(env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin"))
-        manifest = inspect_image(image.read_bytes(), profile, version, build_id)
+        artifact = image.read_bytes()
+        manifest = inspect_image(artifact, profile, version, build_id)
         manifest["filename"] = image.name
-        image.with_suffix(".json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        content = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        image.with_suffix(".json").write_text(content, encoding="utf-8")
+        environment = env.subst("$PIOENV")
+        if not environment or "$" in environment or Path(environment).name != environment or environment in (".", ".."):
+            raise ValueError("cannot resolve a safe PlatformIO environment for the OTA snapshot")
+        snapshots = Path(env.subst("$PROJECT_DIR")) / ".pio" / "ota-artifacts" / environment
+        snapshots.mkdir(parents=True, exist_ok=True)
+        # Copy the bytes already inspected, never reread a concurrently changed
+        # build output. This directory survives PlatformIO clean_build_dir().
+        (snapshots / image.name).write_bytes(artifact)
+        (snapshots / image.with_suffix(".json").name).write_text(content, encoding="utf-8")
         print("OTA artifact checked: %d useful / %d transmitted bytes" % (manifest["useful_size"], manifest["artifact_size"]))
         return 0
     except (OSError, ValueError) as error:

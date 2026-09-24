@@ -549,7 +549,7 @@ def main(argv=None):
                                              load_profile(args.profile) if args.profile else None,
                                              args.version, args.build_id)
         campaign_id = secrets.randbits(63) or 1
-        journal = Journal(args.journal or args.image.parent / ("campaign-%016x.jsonl" % campaign_id), campaign_id)
+        journal = Journal(args.journal or Path.cwd() / "ota-journals" / ("campaign-%016x.jsonl" % campaign_id), campaign_id)
         connection = USBConnection(args.serial, args.port)
         journal.emit("USB_SELECTED", usb_serial=connection.serial_number)
         journal.emit("PROBE_LEAD", usb_serial=connection.serial_number, state="BEGIN")

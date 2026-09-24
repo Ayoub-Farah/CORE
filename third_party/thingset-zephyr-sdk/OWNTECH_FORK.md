@@ -36,6 +36,10 @@ override selects this directory. ThingSet node C remains separately pinned at
   `thingset_can_get_request_source[_inst]` exposes the actual peer only during
   synchronous ThingSet command execution in the receiving thread.
 - `ready` is published after CAN claims, filters and ISO-TP binding succeed.
+  `driver_started` is published after the controller and claim RX filter start,
+  before peer ACK/address claiming; `init_error` reports terminal startup failures.
+  `thingset_can_set_state_callback[_inst]` registers a synchronized notification
+  with immediate replay, invoked outside its lock without periodic polling.
   `THINGSET_CAN_ALLOW_ADDRESS_WRITE=n` protects the address object for OTA profiles.
   Legacy DFU fails on write/flush errors and cannot reboot an uninitialized writer;
   it must remain disabled in the OTA profile to preserve one slot owner.
@@ -48,7 +52,9 @@ boundaries. Both classical CAN and FD/BRS builds exercise delayed responses,
 source/route mismatch, callback/timeout ordering, owned payload lifetime,
 oversized RX, server buffer ownership, request peer scope, reassembly loss and
 recovery, staggered/prolonged pool expiry and return to idle, sequence wrapping, overflow, TX error/late completion,
-fragmentation, padding, claims and discovery probes. It is a deterministic
+fragmentation, padding, claims and discovery probes. Startup tests exercise
+driver start before peer wait, late callback registration/reentrancy, and driver,
+filter, ISO-TP and timeout failures. It is a deterministic
 transport regression test, not proof of interrupt scheduling or hardware timing.
 
 Run `python tests/ota/sdk_fork_test.py` to verify the normalized-source SHA-256

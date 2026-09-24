@@ -103,17 +103,19 @@ static void host_advance_timer(struct k_timer *t,int64_t until){
 }
 #define K_TIMER_DEFINE(n,fn,unused) struct k_timer n={.handler=fn}
 struct k_work {int unused;};
-struct k_work_delayable {struct k_work work;};
+struct k_work_delayable {struct k_work work;void (*handler)(struct k_work *);};
+static bool host_run_work;
 static struct k_work_delayable *k_work_delayable_from_work(struct k_work *w){return (struct k_work_delayable *)w;}
-static void k_work_init_delayable(struct k_work_delayable *w,void (*fn)(struct k_work *)){}
-static void thingset_sdk_reschedule_work(struct k_work_delayable *w,k_timeout_t t){}
+static void k_work_init_delayable(struct k_work_delayable *w,void (*fn)(struct k_work *)){w->handler=fn;}
+static void thingset_sdk_reschedule_work(struct k_work_delayable *w,k_timeout_t t){if(host_run_work&&w->handler)w->handler(&w->work);}
 struct k_event {uint32_t flags;};
+static void (*host_event_wait_hook)(struct k_event *);
 static void k_event_init(struct k_event *e){e->flags=0;}
 static void k_event_post(struct k_event *e,uint32_t f){e->flags|=f;}
 static void k_event_set(struct k_event *e,uint32_t f){e->flags=f;}
 static void k_event_clear(struct k_event *e,uint32_t f){e->flags&=~f;}
 static uint32_t k_event_test(struct k_event *e,uint32_t f){return e->flags&f;}
-static uint32_t k_event_wait(struct k_event *e,uint32_t f,bool reset,k_timeout_t t){return e->flags&f;}
+static uint32_t k_event_wait(struct k_event *e,uint32_t f,bool reset,k_timeout_t t){if(host_event_wait_hook)host_event_wait_hook(e);return e->flags&f;}
 struct device {const char *name;};
 static bool device_is_ready(const struct device *d){return d!=NULL;}
 #ifdef CONFIG_CAN_FD_MODE
@@ -135,6 +137,7 @@ static uint8_t can_dlc_to_bytes(uint8_t dlc){const uint8_t n[]={0,1,2,3,4,5,6,7,
 static uint8_t can_bytes_to_dlc(size_t n){for(uint8_t i=0;i<16;i++)if(can_dlc_to_bytes(i)>=n)return i;return 15;}
 typedef void (*host_can_cb)(const struct device *,int,void *);
 static int host_can_error,host_can_async_error,host_filter_count;
+static int host_can_start_error,host_can_start_count,host_can_mode_error,host_filter_fail_at;
 static bool host_can_defer;
 static host_can_cb host_pending_cb;
 static void *host_pending_arg;
@@ -145,11 +148,11 @@ static int can_send(const struct device *dev,const struct can_frame *frame,k_tim
  assert(host_frame_count<ARRAY_SIZE(host_frames));host_frames[host_frame_count++]=*frame;
  if(cb){if(host_can_defer){host_pending_cb=cb;host_pending_arg=arg;}else cb(dev,host_can_async_error,arg);}return 0;
 }
-static int can_add_rx_filter(const struct device *d,void (*fn)(const struct device *,struct can_frame *,void *),void *arg,const struct can_filter *f){return host_filter_count++;}
+static int can_add_rx_filter(const struct device *d,void (*fn)(const struct device *,struct can_frame *,void *),void *arg,const struct can_filter *f){int n=host_filter_count++;return n==host_filter_fail_at?-ENOSPC:n;}
 static void can_remove_rx_filter(const struct device *d,int id){}
 static int can_get_capabilities(const struct device *d,can_mode_t *m){*m=CAN_MODE_FD;return 0;}
-static int can_set_mode(const struct device *d,can_mode_t m){return 0;}
-static int can_start(const struct device *d){return 0;}
+static int can_set_mode(const struct device *d,can_mode_t m){return host_can_mode_error;}
+static int can_start(const struct device *d){host_can_start_count++;return host_can_start_error;}
 static int can_get_state(const struct device *d,void *state,struct can_bus_err_cnt *e){e->tx_err_cnt=0;return 0;}
 static uint32_t sys_rand32_get(void){return 42;}
 #define ISOTP_FAST_ADDRESSING_MODE_CUSTOM 1
@@ -168,13 +171,13 @@ struct net_buf {uint8_t *data;size_t len;struct net_buf *frags;};
 struct isotp_fast_ctx {struct isotp_fast_addr (*get_tx_addr_callback)(const struct isotp_fast_addr *);void (*sent_callback)(int,void *);};
 static size_t net_buf_frags_len(struct net_buf *b){size_t n=0;for(;b;b=b->frags)n+=b->len;return n;}
 static size_t net_buf_linearize(void *dst,size_t cap,struct net_buf *b,size_t offset,size_t length){size_t n=0;for(;b&&n<cap&&n<length;b=b->frags){size_t k=MIN(b->len,MIN(cap-n,length-n));memcpy((uint8_t*)dst+n,b->data,k);n+=k;}return n;}
-static int host_isotp_error;
+static int host_isotp_error,host_isotp_bind_error;
 static bool host_isotp_defer;
 static const uint8_t *host_isotp_data;
 static void *host_isotp_arg;
 static struct isotp_fast_ctx *host_isotp_ctx;
 static int isotp_fast_send(struct isotp_fast_ctx *ctx,const uint8_t *buf,size_t n,struct isotp_fast_addr addr,void *arg){host_isotp_data=buf;host_isotp_arg=arg;host_isotp_ctx=ctx;if(!host_isotp_defer)ctx->sent_callback(host_isotp_error,arg);return host_isotp_error;}
-static int isotp_fast_bind(struct isotp_fast_ctx *ctx,const struct device *d,struct isotp_fast_addr a,const struct isotp_fast_opts *o,void (*rx)(struct net_buf *,int,struct isotp_fast_addr,void *),void *arg,void (*err)(int8_t,struct isotp_fast_addr,void *),void (*tx)(int,void *)){ctx->sent_callback=tx;return 0;}
+static int isotp_fast_bind(struct isotp_fast_ctx *ctx,const struct device *d,struct isotp_fast_addr a,const struct isotp_fast_opts *o,void (*rx)(struct net_buf *,int,struct isotp_fast_addr,void *),void *arg,void (*err)(int8_t,struct isotp_fast_addr,void *),void (*tx)(int,void *)){ctx->sent_callback=tx;return host_isotp_bind_error;}
 enum thingset_data_format {THINGSET_BIN_IDS_VALUES};
 struct shared_buffer {struct k_sem lock;uint8_t *data;size_t size;};
 static uint8_t host_shared_data[600];

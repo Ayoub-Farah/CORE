@@ -37,6 +37,9 @@ static void setup(void)
     host_filter_count=0;host_process_count=0;completions=0;claims=0;reports=0;
     received_len=0;last_send=last_receive=0;
     host_process_hook=NULL;host_thread=(void *)1;
+    host_can_start_error=host_can_start_count=host_can_mode_error=0;
+    host_isotp_bind_error=0;host_filter_fail_at=-1;
+    host_run_work=false;host_event_wait_hook=NULL;
 }
 static uint32_t response_id(void){return THINGSET_CAN_PRIO_REQRESP|THINGSET_CAN_TARGET_SET(1)|2;}
 static int request(uint8_t *bytes,size_t n){return thingset_can_send_inst(&instance,bytes,n,2,0,completed,&instance,K_MSEC(100));}
@@ -52,6 +55,87 @@ static void fragment(uint8_t src,uint8_t msg,uint32_t type,uint8_t seq,size_t n,
         .dlc=can_bytes_to_dlc(n),.flags=CAN_FRAME_IDE};
     memset(frame.data,byte,sizeof(frame.data));
     thingset_can_report_rx_cb(&dev,&frame,&instance);
+}
+static int state_count,state_started[8],state_ready[8],state_error[8];
+static void state_changed(void *arg)
+{
+    struct thingset_can *can=arg;
+    assert(can==&instance&&!can->state_lock.held);
+    assert(state_count<8);
+    state_started[state_count]=atomic_get(&can->driver_started);
+    state_ready[state_count]=atomic_get(&can->ready);
+    state_error[state_count++]=atomic_get(&can->init_error);
+}
+static void state_remove_callback(void *arg)
+{
+    state_changed(arg);
+    /* Reentrant registration must be safe: callbacks execute outside lock. */
+    thingset_can_set_state_callback_inst(arg,NULL,NULL);
+}
+static void waiting_for_peer(struct k_event *event)
+{
+    assert(state_count==2&&state_started[1]&&!state_ready[1]&&!state_error[1]);
+    assert(atomic_get(&instance.driver_started)&&!atomic_get(&instance.ready));
+}
+static void peer_timeout(struct k_event *event)
+{
+    waiting_for_peer(event);
+    event->flags|=EVENT_ADDRESS_CLAIM_TIMED_OUT;
+}
+static void setup_startup(void)
+{
+    setup();atomic_clear(&instance.ready);state_count=0;host_run_work=true;
+    host_event_wait_hook=waiting_for_peer;
+    thingset_can_set_state_callback_inst(&instance,state_changed,&instance);
+    assert(state_count==1&&!state_started[0]&&!state_ready[0]&&!state_error[0]);
+}
+static void test_startup_notifications(void)
+{
+    setup_startup();
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==0);
+    assert(state_count==3&&state_started[2]&&state_ready[2]&&!state_error[2]);
+    assert(!instance.timeout_timer.active&&!thingset_can_report_expiry_timer.active);
+    host_advance_timer(&instance.timeout_timer,10000);assert(state_count==3);
+    /* Registering after READY replays current state with no polling. */
+    thingset_can_set_state_callback_inst(&instance,state_changed,&instance);
+    assert(state_count==4&&state_started[3]&&state_ready[3]&&!state_error[3]);
+    thingset_can_set_state_callback_inst(&instance,state_remove_callback,&instance);
+    assert(state_count==5&&instance.state_callback==NULL);
+
+    setup_startup();host_can_start_error=-EIO;
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==-EIO);
+    assert(state_count==2&&!state_started[1]&&!state_ready[1]&&state_error[1]==-EIO);
+    assert(host_can_start_count==1&&!instance.timeout_timer.active);
+    setup_startup();
+    assert(thingset_can_init_inst(&instance,NULL,0,K_MSEC(1000))==-ENODEV);
+    assert(state_count==2&&!state_started[1]&&state_error[1]==-ENODEV);
+    assert(host_can_start_count==0);
+
+    setup_startup();host_can_start_error=-EALREADY;
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==0);
+    assert(state_count==3&&state_started[2]&&state_ready[2]);
+    setup_startup();host_event_wait_hook=peer_timeout;
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==-ETIMEDOUT);
+    assert(state_count==3&&state_started[2]&&!state_ready[2]&&state_error[2]==-ETIMEDOUT);
+    assert(!instance.timeout_timer.active);
+    /* Claim-filter failure must precede local-start success; a later discovery
+     * filter/binding failure still reports the already completed local startup. */
+    for(int index=0;index<2;index++) {
+        setup_startup();host_filter_fail_at=index;
+        assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==-ENOSPC);
+        assert(state_count==index+2&&state_started[index+1]==index);
+        assert(!state_ready[index+1]&&state_error[index+1]==-ENOSPC);
+        assert(!instance.timeout_timer.active);
+    }
+    setup_startup();host_isotp_bind_error=-ENOMEM;
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==-ENOMEM);
+    assert(state_count==3&&state_started[2]&&!state_ready[2]&&state_error[2]==-ENOMEM);
+#ifdef CONFIG_CAN_FD_MODE
+    setup_startup();host_can_mode_error=-EIO;
+    assert(thingset_can_init_inst(&instance,&dev,0,K_MSEC(1000))==-ENODEV);
+    assert(state_count==2&&!state_started[1]&&state_error[1]==-ENODEV);
+    assert(host_can_start_count==0&&!instance.timeout_timer.active);
+#endif
 }
 static void test_client(void)
 {
@@ -269,7 +353,7 @@ static void test_sender_and_discovery(void)
 }
 int main(void)
 {
-    test_client();test_server_ownership();test_reports();test_report_timer_lifecycle();test_sender_and_discovery();
+    test_startup_notifications();test_client();test_server_ownership();test_reports();test_report_timer_lifecycle();test_sender_and_discovery();
     puts("ThingSet public transport: client lifecycle, RX, raw sender and discovery OK");
     return 0;
 }

@@ -813,6 +813,42 @@ static void thingset_can_timeout_timer_expired(struct k_timer *timer)
     k_event_set(&ts_can->events, EVENT_ADDRESS_CLAIM_TIMED_OUT);
 }
 
+static void thingset_can_publish_startup(struct thingset_can *ts_can, bool started,
+                                        bool ready, int error)
+{
+    k_spinlock_key_t key = k_spin_lock(&ts_can->state_lock);
+    bool changed = atomic_get(&ts_can->driver_started) != started
+                   || atomic_get(&ts_can->ready) != ready
+                   || atomic_get(&ts_can->init_error) != error;
+    atomic_set(&ts_can->driver_started, started);
+    atomic_set(&ts_can->ready, ready);
+    atomic_set(&ts_can->init_error, error);
+    thingset_can_state_callback_t callback = changed ? ts_can->state_callback : NULL;
+    void *arg = ts_can->state_callback_arg;
+    k_spin_unlock(&ts_can->state_lock, key);
+    if (callback != NULL) {
+        callback(arg);
+    }
+}
+
+static int thingset_can_startup_failed(struct thingset_can *ts_can, int error)
+{
+    thingset_can_publish_startup(ts_can, atomic_get(&ts_can->driver_started), false, error);
+    return error;
+}
+
+void thingset_can_set_state_callback_inst(struct thingset_can *ts_can,
+                                          thingset_can_state_callback_t callback, void *arg)
+{
+    k_spinlock_key_t key = k_spin_lock(&ts_can->state_lock);
+    ts_can->state_callback = callback;
+    ts_can->state_callback_arg = arg;
+    k_spin_unlock(&ts_can->state_lock, key);
+    if (callback != NULL) {
+        callback(arg);
+    }
+}
+
 int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can_dev,
                            uint8_t bus_number, k_timeout_t timeout)
 {
@@ -822,12 +858,12 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
     int filter_id;
     int err;
 
+    thingset_can_publish_startup(ts_can, false, false, 0);
     if (!device_is_ready(can_dev)) {
         LOG_ERR("CAN device not ready");
-        return -ENODEV;
+        return thingset_can_startup_failed(ts_can, -ENODEV);
     }
 
-    atomic_clear(&ts_can->ready);
     k_sem_init(&ts_can->request_response.sem, 1, 1);
     k_timer_init(&ts_can->request_response.timer, thingset_can_reqresp_timeout_handler, NULL);
     k_mutex_init(&ts_can->report_lock);
@@ -871,20 +907,21 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
         }
         else {
             LOG_ERR("Failed to enable CAN-FD mode");
-            return -ENODEV;
+            err = -ENODEV;
+            goto failed;
         }
     }
     else {
         LOG_ERR("CAN device does not support CAN-FD; recompile with CAN_FD_MODE set to false.");
         /* there is no point continuing, as we will still assume a 64-byte payload everywhere */
-        return -ENODEV;
+        err = -ENODEV;
+        goto failed;
     }
 #endif
 
     err = can_start(ts_can->dev);
     if (err != 0 && err != -EALREADY) {
-        k_timer_stop(&ts_can->timeout_timer);
-        return err;
+        goto failed;
     }
 
     struct can_filter addr_claim_filter = {
@@ -906,14 +943,18 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
         can_add_rx_filter(ts_can->dev, thingset_can_addr_claim_rx_cb, ts_can, &addr_claim_filter);
     if (filter_id < 0) {
         LOG_ERR("Unable to add addr_claim filter: %d", filter_id);
-        k_timer_stop(&ts_can->timeout_timer);
-        return filter_id;
+        err = filter_id;
+        goto failed;
     }
+
+    /* Local driver/filter startup needs no ACK peer or claimed address. */
+    thingset_can_publish_startup(ts_can, true, false, 0);
 
     while (1) {
         if (k_event_test(&ts_can->events, EVENT_ADDRESS_CLAIM_TIMED_OUT)) {
             can_remove_rx_filter(ts_can->dev, filter_id);
-            return -ETIMEDOUT;
+            err = -ETIMEDOUT;
+            goto failed;
         }
         k_event_clear(&ts_can->events, EVENT_ADDRESS_CLAIM_MSG_SENT
                                            | EVENT_ADDRESS_CLAIMING_FINISHED
@@ -945,8 +986,8 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
         }
         else if (event & EVENT_ADDRESS_CLAIM_TIMED_OUT) {
             LOG_ERR("Address claim timed out");
-            k_timer_stop(&ts_can->timeout_timer);
-            return -ETIMEDOUT;
+            err = -ETIMEDOUT;
+            goto failed;
         }
         else {
             struct can_bus_err_cnt err_cnt_before;
@@ -959,8 +1000,8 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
                                  false, K_MSEC(100));
             if (event & EVENT_ADDRESS_CLAIM_TIMED_OUT) {
                 LOG_ERR("Address claim timed out");
-                k_timer_stop(&ts_can->timeout_timer);
-                return -ETIMEDOUT;
+                err = -ETIMEDOUT;
+                goto failed;
             }
             else if (!(event & EVENT_ADDRESS_CLAIM_MSG_SENT)) {
                 k_sleep(K_MSEC(100));
@@ -1000,7 +1041,8 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
                                   &addr_discovery_filter);
     if (filter_id < 0) {
         LOG_ERR("Unable to add addr_discovery filter: %d", filter_id);
-        return filter_id;
+        err = filter_id;
+        goto failed;
     }
 
     struct isotp_fast_addr rx_addr = {
@@ -1013,9 +1055,9 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
                          thingset_can_reqresp_recv_error_callback,
                          thingset_can_reqresp_sent_callback);
     if (err != 0) {
-        return err;
+        goto failed;
     }
-    atomic_set(&ts_can->ready, 1);
+    thingset_can_publish_startup(ts_can, true, true, 0);
 
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
     thingset_sdk_reschedule_work(&ts_can->live_reporting_work, K_NO_WAIT);
@@ -1025,6 +1067,10 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
 #endif
 
     return 0;
+
+failed:
+    k_timer_stop(&ts_can->timeout_timer);
+    return thingset_can_startup_failed(ts_can, err);
 }
 
 void thingset_can_set_addr_claim_rx_callback_inst(struct thingset_can *ts_can,
@@ -1234,6 +1280,11 @@ void thingset_can_set_addr_claim_rx_callback(thingset_can_addr_claim_rx_callback
 int thingset_can_get_request_source(uint8_t *source, uint8_t *route)
 {
     return thingset_can_get_request_source_inst(&ts_can_single, source, route);
+}
+
+void thingset_can_set_state_callback(thingset_can_state_callback_t callback, void *arg)
+{
+    thingset_can_set_state_callback_inst(&ts_can_single, callback, arg);
 }
 
 int thingset_can_send(uint8_t *tx_buf, size_t tx_len, uint8_t target_addr, uint8_t route,

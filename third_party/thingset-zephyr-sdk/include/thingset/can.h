@@ -201,6 +201,12 @@ extern "C" {
  */
 typedef void (*thingset_can_addr_claim_rx_callback_t)(const uint8_t eui64[8], uint8_t source_addr);
 
+/** Startup-state notification; inspect driver_started, ready and init_error.
+ * The callback must not block. Notifications carry no stale state snapshot;
+ * no callback is issued periodically in the idle state.
+ */
+typedef void (*thingset_can_state_callback_t)(void *arg);
+
 /**
  * Callback typedef for received multi-frame reports (type 0x1) via CAN
  *
@@ -314,7 +320,22 @@ struct thingset_can
     uint8_t msg_no;
     /** Set only once CAN filters and the ISO-TP endpoint are ready. */
     atomic_t ready;
+    /** Driver and claim RX filter initialized; peer ACK/address claim may be pending. */
+    atomic_t driver_started;
+    /** Negative errno for terminal initialization failure, otherwise zero. */
+    atomic_t init_error;
+    struct k_spinlock state_lock;
+    thingset_can_state_callback_t state_callback;
+    void *state_callback_arg;
 };
+
+/** Register a startup notification and immediately replay current state.
+ * Registration/publication are synchronized; callbacks run outside state_lock.
+ * NULL unregisters. An already dispatched callback may still finish after
+ * replacement, so its argument must remain valid until initialization finishes.
+ */
+void thingset_can_set_state_callback_inst(struct thingset_can *ts_can,
+                                          thingset_can_state_callback_t callback, void *arg);
 
 /**
  * Send a complete private or ThingSet multi-frame report. Thread context only.
@@ -449,6 +470,7 @@ int thingset_can_send_report(const char *path, enum thingset_data_format format)
 
 int thingset_can_send_raw_report(const uint8_t *data, size_t length, k_timeout_t timeout);
 void thingset_can_set_addr_claim_rx_callback(thingset_can_addr_claim_rx_callback_t cb);
+void thingset_can_set_state_callback(thingset_can_state_callback_t callback, void *arg);
 int thingset_can_probe_address(uint8_t target_addr, k_timeout_t timeout);
 int thingset_can_announce_address(k_timeout_t timeout);
 int thingset_can_get_request_source(uint8_t *source, uint8_t *route);

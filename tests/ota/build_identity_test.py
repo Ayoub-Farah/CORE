@@ -4,6 +4,9 @@ import copy
 import json
 from pathlib import Path
 import runpy
+import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -17,7 +20,8 @@ from ota_build_identity import (effective_settings, fingerprint,
 
 
 class FakeBoard:
-    def __init__(self, options):
+    def __init__(self, options, updates):
+        self.updates = updates
         self.build = {"cpu": "cortex-m4", "zephyr": {
             "cmake_extra_args": options["board_build.zephyr.cmake_extra_args"],
             "bootloader": {"app_version": options.get(
@@ -31,11 +35,15 @@ class FakeBoard:
             result = result[component]
         return result
 
+    def update(self, key, value):
+        self.updates[key] = value
+
 
 class FakeEnv(dict):
     def __init__(self, root, name="OTA"):
         super().__init__(PIOENV=name)
         self.root = root
+        self.board_updates = {}
         self.options = {
             "platform": "ststm32@19.0.0", "framework": ["zephyr"], "board": "spin",
             "build_flags": ["-std=c++2a", "-fsingle-precision-constant"],
@@ -49,6 +57,7 @@ class FakeEnv(dict):
                     "$PROJECT_INCLUDE_DIR": self.root / "include",
                     "$PROJECT_LIBDEPS_DIR": self.root / "owntech/lib",
                     "$PROJECT_LIB_DIR": self.root / "owntech/lib",
+                    "$PROJECT_WORKSPACE_DIR": self.root / ".pio",
                     "$BUILD_DIR": self.root / ".pio/build" / self["PIOENV"]}.get(value, value))
 
     def GetProjectOptions(self, as_dict=False):
@@ -58,7 +67,7 @@ class FakeEnv(dict):
         return types.SimpleNamespace(get=lambda section, key: str(self.root / "owntech/lib"))
 
     def BoardConfig(self):
-        return FakeBoard(self.options)
+        return FakeBoard(self.options, self.board_updates)
 
     def PioPlatform(self):
         return types.SimpleNamespace(get_installed_packages=lambda: [
@@ -189,6 +198,109 @@ class IdentityTest(unittest.TestCase):
                              "-D", "BUILD_ENV_NAME:STRING=USB_LEAD",
                              "'-DEXTRA_CONF_FILE=\"file with spaces.conf\"'"]})[
                                  "options"]["board_build.zephyr.cmake_extra_args"])
+
+    def test_config_changes_invalidate_cache_but_source_contents_remain_incremental(self):
+        env = FakeEnv(self.root)
+        files = ("zephyr/profiles/ota.conf", "zephyr/profiles/ota_usb.overlay",
+                 "zephyr/modules/service/Kconfig", "zephyr/boards/spin.dts",
+                 "zephyr/boards/pins.dtsi", "zephyr/modules/service/module.yml",
+                 "zephyr/CMakeLists.txt", "zephyr/options.cmake",
+                 "owntech/lib/OTA/control/lib.conf", "west.yml")
+        for path in files:
+            if not (self.root / path).exists():
+                self.put(path, "original configuration\n")
+        first = generate_for_environment(env)
+        cache = self.root / ".pio/build/OTA/CMakeCache.txt"
+        stamp = self.root / ".pio/ota-generated/OTA/configuration.sha256"
+        original_stamp = stamp.read_bytes()
+        cache.write_text("keep cache", encoding="utf-8")
+        self.put("src/main.cpp", "int value = 2;\n")
+        after = generate_for_environment(env)
+        self.assertNotEqual(first["build_id"], after["build_id"])
+        self.assertEqual(original_stamp, stamp.read_bytes())
+        self.assertEqual("keep cache", cache.read_text())
+        self.put("include/application.h", "#define APP_VALUE 2\n")
+        generate_for_environment(env)
+        self.assertTrue(cache.is_file())
+        for path in files:
+            with self.subTest(path=path):
+                cache.write_text("old configuration", encoding="utf-8")
+                original = (self.root / path).read_bytes()
+                (self.root / path).write_bytes(original + b"# changed\n")
+                generate_for_environment(env)
+                self.assertFalse(cache.exists())
+                # The persistent stamp prevents another configure after success.
+                cache.write_text("new configuration", encoding="utf-8")
+                generate_for_environment(env)
+                self.assertEqual("new configuration", cache.read_text())
+
+    def test_added_removed_sources_and_effective_flags_refresh_configuration(self):
+        env = FakeEnv(self.root)
+        generate_for_environment(env)
+        cache = self.root / ".pio/build/OTA/CMakeCache.txt"
+        cache.write_text("old")
+        self.put("src/new_module.cpp", "int another = 1;\n")
+        generate_for_environment(env)
+        self.assertFalse(cache.exists())
+        cache.write_text("new")
+        (self.root / "src/new_module.cpp").unlink()
+        generate_for_environment(env)
+        self.assertFalse(cache.exists())
+        cache.write_text("new")
+        env.options["custom_ota_serial"] = "another-board"
+        env.options["custom_ota_expected_count"] = 5
+        generate_for_environment(env)
+        self.assertTrue(cache.is_file())
+        env.options["build_flags"] = ["-DAPP_MODE=2"]
+        generate_for_environment(env)
+        self.assertFalse(cache.exists())
+
+    def test_durable_identity_restored_by_real_cmake_after_builder_cleanup(self):
+        cmake = shutil.which("cmake")
+        if not cmake:
+            installed = Path.home() / ".platformio/packages/tool-cmake/bin/cmake.exe"
+            cmake = str(installed) if installed.is_file() else None
+        if not cmake:
+            self.skipTest("CMake is needed to exercise its identity restore helper")
+        env = FakeEnv(self.root / "checkout with spaces")
+        first = generate_for_environment(env)
+        durable = Path(env["OWNTECH_OTA_IDENTITY_DIR"])
+        build = Path(env.subst("$BUILD_DIR"))
+        original = (build / "ota_generated/owntech_build_info.h").read_bytes()
+        args = shlex.split(env.board_updates["build.zephyr.cmake_extra_args"])
+        self.assertIn("-DBUILD_ENV_NAME=OTA", args)
+        self.assertIn("-DOWNTECH_BUILD_PROFILE=ota", args)
+        self.assertIn("-DOWNTECH_OTA_IDENTITY_DIR=" + durable.resolve().as_posix(), args)
+        # Model PlatformIO's documented full build cleanup, only in our fixture.
+        self.assertIn(self.root.resolve(), build.resolve().parents)
+        shutil.rmtree(build)
+        self.assertTrue((durable / "configuration.sha256").is_file())
+        self.assertEqual(original, (durable / "owntech_build_info.h").read_bytes())
+        build.mkdir(parents=True)
+        subprocess.run([cmake, "-DOWNTECH_OTA_IDENTITY_DIR=" + durable.resolve().as_posix(),
+                        "-P", str(REPO / "zephyr/ota_identity.cmake")], cwd=build,
+                       check=True, capture_output=True, text=True)
+        self.assertEqual(original, (build / "ota_generated/owntech_build_info.h").read_bytes())
+        self.assertEqual(first, json.loads((build / "ota_generated/identity.json").read_text()))
+        cache = build / "CMakeCache.txt"
+        cache.write_text("successful configure")
+        self.assertEqual(first, generate_for_environment(env))
+        self.assertTrue(cache.is_file())
+
+    def test_pre_hook_without_file_and_injected_path_do_not_change_identity(self):
+        env = FakeEnv(self.root)
+        script = REPO / "owntech/scripts/pre_ota_identity.py"
+        namespace = {"env": env, "Import": lambda _: None}
+        exec(compile(script.read_text(), str(script), "exec"), namespace)
+        self.assertNotIn("__file__", namespace)
+        first = env["OWNTECH_OTA_BUILD_ID"]
+        # Also test a repeated call whose BoardConfig already has the injected
+        # argument: it cannot create a self-referential changing fingerprint.
+        env.options["board_build.zephyr.cmake_extra_args"] = env.board_updates[
+            "build.zephyr.cmake_extra_args"]
+        self.assertEqual(first, generate_for_environment(env)["build_id"])
+        args = shlex.split(env.board_updates["build.zephyr.cmake_extra_args"])
+        self.assertEqual(1, sum(arg.startswith("-DOWNTECH_OTA_IDENTITY_DIR=") for arg in args))
 
 
 if __name__ == "__main__":

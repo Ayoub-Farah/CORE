@@ -26,7 +26,7 @@ _COMPILE_OPTIONS = {
 _SKIP_OPTIONS = {"build_cache_dir", "build_dir"}
 _IGNORED_CMAKE_DEFINES = {
     "BUILD_ENV_NAME", "OWNTECH_FIRMWARE_VERSION", "OWNTECH_FIRMWARE_BUILD_ID",
-    "CMAKE_BINARY_DIR", "CMAKE_INSTALL_PREFIX",
+    "CMAKE_BINARY_DIR", "CMAKE_INSTALL_PREFIX", "OWNTECH_OTA_IDENTITY_DIR",
 }
 
 
@@ -41,7 +41,7 @@ def normalize_version(value="1.0.0"):
     return "%d.%d.%d+%d" % tuple(parts)
 
 
-def _cmake_args(value):
+def _cmake_args(value, ignored=_IGNORED_CMAKE_DEFINES):
     values = value if isinstance(value, (list, tuple)) else [value]
     args = []
     for item in values:
@@ -54,7 +54,7 @@ def _cmake_args(value):
             index += 1
             arg += args[index]
         name = arg[2:].split("=", 1)[0].split(":", 1)[0] if arg.startswith("-D") else ""
-        if name not in _IGNORED_CMAKE_DEFINES:
+        if name not in ignored:
             result.append(arg)
         index += 1
     return result
@@ -113,7 +113,7 @@ def _source_files(directory):
             yield path.relative_to(directory).as_posix(), path
 
 
-def fingerprint(project_dir, version, settings, source_roots=None):
+def fingerprint(project_dir, version, settings, source_roots=None, configuration_only=False):
     """Hash canonical paths and content; no timestamps, absolute paths or Git IDs."""
     project_dir = Path(project_dir)
     version = normalize_version(version)
@@ -135,7 +135,12 @@ def fingerprint(project_dir, version, settings, source_roots=None):
     add("settings", json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
     for prefix, directory in sorted(roots, key=lambda root: root[0]):
         for relative, path in _source_files(directory):
-            content = path.read_bytes()
+            configuration = (path.name.startswith("Kconfig") or path.name.endswith("_defconfig")
+                             or path.name in {"CMakeLists.txt", "library.json", "library.properties"}
+                             or path.suffix.lower() in {".cmake", ".conf", ".overlay", ".dts", ".dtsi", ".yaml", ".yml"})
+            # CMake needs a refresh for source additions/removals, but ordinary
+            # C/C++ edits must retain incremental compilation. Always hash names.
+            content = path.read_bytes() if not configuration_only or configuration else b""
             # Git's CRLF conversion should not distinguish identical C/C++ inputs.
             if b"\0" not in content:
                 content = content.replace(b"\r\n", b"\n")
@@ -145,7 +150,8 @@ def fingerprint(project_dir, version, settings, source_roots=None):
                      "owntech/scripts/pre_ota_identity.py", "owntech/scripts/pre_version.py"):
         path = project_dir / relative
         if path.is_file():
-            add(relative, path.read_bytes().replace(b"\r\n", b"\n"))
+            content = path.read_bytes() if not configuration_only or relative == "west.yml" else b""
+            add(relative, content.replace(b"\r\n", b"\n"))
             count += 1
     result = digest.hexdigest()
     return {"schema": SCHEMA, "version": version, "build_id": "ota-" + result[:24],
@@ -179,8 +185,9 @@ def generate_for_environment(env):
     for key in ("build_flags", "build_unflags", "build_src_filter", "build_type"):
         if key.upper() in env:
             options[key] = env[key.upper()]
-    board_build = env.BoardConfig().get("build", {})
-    version = normalize_version(env.BoardConfig().get("build.zephyr.bootloader.app_version", "1.0.0"))
+    board = env.BoardConfig()
+    board_build = board.get("build", {})
+    version = normalize_version(board.get("build.zephyr.bootloader.app_version", "1.0.0"))
     platform = env.PioPlatform()
     packages = {
         package.metadata.name: str(package.metadata.version)
@@ -205,9 +212,31 @@ def generate_for_environment(env):
                 roots.append(("private_libraries/" + directory.name, directory))
     settings = effective_settings(options, board_build, packages, project_dir)
     identity = fingerprint(project_dir, version, settings, roots)
-    output_dir = Path(env.subst("$BUILD_DIR")) / "ota_generated"
+    configuration = fingerprint(project_dir, version, settings, roots, configuration_only=True)
+    environment = env["PIOENV"]
+    if not environment or Path(environment).name != environment or environment in {".", ".."}:
+        raise ValueError("Unsafe OTA environment name")
+    build_dir = Path(env.subst("$BUILD_DIR"))
+    durable_dir = Path(env.subst("$PROJECT_WORKSPACE_DIR")) / "ota-generated" / environment
+    # Zephyr's PlatformIO builder deletes BUILD_DIR before reconfiguration.
+    # Preserve identity outside it, then CMake can restore the exact same bytes.
+    write_identity(durable_dir, identity)
+    stamp = durable_dir / "configuration.sha256"
+    digest = configuration["source_sha256"] + "\n"
+    previous = stamp.read_text(encoding="utf-8") if stamp.is_file() else None
+    if previous != digest:
+        cache = build_dir / "CMakeCache.txt"
+        if cache.is_file():
+            cache.unlink()
+        stamp.write_text(digest, encoding="utf-8")
+    args = _cmake_args(board.get("build.zephyr.cmake_extra_args", ""),
+                       ignored={"OWNTECH_OTA_IDENTITY_DIR"})
+    args.append("-DOWNTECH_OTA_IDENTITY_DIR=" + durable_dir.resolve().as_posix())
+    board.update("build.zephyr.cmake_extra_args", " ".join(shlex.quote(arg) for arg in args))
+    output_dir = build_dir / "ota_generated"
     write_identity(output_dir, identity)
     env["OWNTECH_OTA_VERSION"] = identity["version"]
     env["OWNTECH_OTA_BUILD_ID"] = identity["build_id"]
     env["OWNTECH_OTA_IDENTITY_FILE"] = str(output_dir / "identity.json")
+    env["OWNTECH_OTA_IDENTITY_DIR"] = str(durable_dir)
     return identity

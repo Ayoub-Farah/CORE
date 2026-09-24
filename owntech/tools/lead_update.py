@@ -73,20 +73,34 @@ class USBConnection:
         if not 1 <= len(candidates) <= 4:
             raise TransportError("same USB serial is absent or has too many interfaces")
         selected = []
+        transport_errors = []
         try:
             for port in candidates:
-                candidate = SerialSMP(port.device)
+                candidate = None
                 try:
+                    candidate = SerialSMP(port.device)
                     info = candidate.request("info")
                     if info.get("service") != "owntech-ota" or info.get("protocol") != 1:
                         raise CampaignError("USB interface replied with an incompatible OTA service")
                     selected.append((port.device, candidate, info))
                 except ReceiverProbeTimeout:
-                    candidate.close()
+                    if candidate:
+                        candidate.close()
+                except TransportError as error:
+                    # A blocked console CDC must not hide the application's
+                    # separate SMP CDC. It also cannot prove receiver absence.
+                    transport_errors.append((port.device, error))
+                    if candidate:
+                        candidate.close()
                 except Exception:
-                    candidate.close()
+                    if candidate:
+                        candidate.close()
                     raise
             if not selected:
+                if transport_errors:
+                    details = "; ".join("%s: %s" % item for item in transport_errors)
+                    raise TransportError("no application receiver could be selected; receiver absence has not "
+                                         "been proven (%s)" % details) from transport_errors[0][1]
                 raise ReceiverProbeTimeout("no application receiver replied on the selected USB board")
             if len(selected) != 1:
                 raise CampaignError("multiple compatible SMP interfaces on the same USB board")

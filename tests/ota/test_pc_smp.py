@@ -80,6 +80,7 @@ class SMPTests(unittest.TestCase):
         for lines, error in ((response({"rc": 5}), CommandError),
                              (response({}, command=3), ProtocolError),
                              (response({}, group=65), ProtocolError),
+                             ([b"\x06\x09truncated"], ProtocolError),
                              ([b"\x06\x09!bad!\n"], ProtocolError)):
             client = SerialSMP("fake", serial_factory=Serial)
             client.serial.lines = lines
@@ -87,7 +88,7 @@ class SMPTests(unittest.TestCase):
                 client.request("info")
 
     def test_silent_or_console_only_probe_preserves_timeout_type(self):
-        for lines in ([], [b"application log\n"]):
+        for lines in ([], [b"application log\n"], [b"~~~~~~~~"]):
             with self.subTest(lines=lines):
                 client = SerialSMP("fake", serial_factory=Serial)
                 client.serial.lines = list(lines)

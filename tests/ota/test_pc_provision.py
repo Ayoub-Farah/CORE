@@ -152,6 +152,75 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(len(streams["COM2"].written), 2)
         self.assertEqual(self.receiver.calls, [])
 
+    def test_real_console_write_timeout_or_open_failure_does_not_hide_smp_cdc(self):
+        for failure in ("write", "open"):
+            for console_first in (True, False):
+                with self.subTest(failure=failure, console_first=console_first):
+                    lines = {"COM12": [], "COM31": response(self.info) + response(self.info, sequence=1)}
+                    if not console_first:
+                        lines = dict(reversed(list(lines.items())))
+                    streams, factory = self.use_wire_connection(lines)
+                    if failure == "write":
+                        streams["COM12"].write = Mock(side_effect=OSError("Write timeout"))
+                    else:
+                        def open_port(port, **kwargs):
+                            if port == "COM12":
+                                raise OSError("Access denied")
+                            return streams[port]
+                        factory.side_effect = open_port
+                    result = self.run_provision()
+                    self.assertEqual(result["result"], "ALREADY_INITIALIZED")
+                    self.assertEqual(self.connection.device, "COM31")
+                    self.connection.bootstrap.assert_not_called()
+                    streams["COM31"].close.assert_not_called()
+                    self.assertEqual([call.args[0] for call in factory.call_args_list], list(lines))
+                    if failure == "write":
+                        streams["COM12"].close.assert_called_once()
+
+    def test_real_cdc_transport_errors_dominate_silence_and_never_bootstrap(self):
+        for second_port in ("silent", "open_failure", "write_timeout"):
+            with self.subTest(second_port=second_port):
+                streams, factory = self.use_wire_connection({"COM12": [], "COM31": []})
+                streams["COM12"].write = Mock(side_effect=OSError("Write timeout"))
+                if second_port == "write_timeout":
+                    streams["COM31"].write = Mock(side_effect=OSError("Write timeout"))
+                elif second_port == "open_failure":
+                    def open_port(port, **kwargs):
+                        if port == "COM31":
+                            raise OSError("Access denied")
+                        return streams[port]
+                    factory.side_effect = open_port
+                with self.assertRaisesRegex(TransportError, "receiver absence has not been proven") as failure, \
+                     patch("lead_update.upload_image") as upload, patch("lead_update.subprocess.run") as reset:
+                    self.run_provision()
+                self.assertNotIsInstance(failure.exception, ReceiverProbeTimeout)
+                self.assertIn("COM12", str(failure.exception))
+                self.assertEqual([call.args[0] for call in factory.call_args_list], ["COM12", "COM31"])
+                self.connection.bootstrap.assert_not_called()
+                upload.assert_not_called()
+                reset.assert_not_called()
+                streams["COM12"].close.assert_called_once()
+                if second_port != "open_failure":
+                    streams["COM31"].close.assert_called_once()
+
+    def test_real_incompatible_or_malformed_cdc_blocks_even_after_a_valid_receiver(self):
+        for invalid_lines in (response({"service": "other", "protocol": 1}), [b"\x06\x09!invalid!\n"]):
+            with self.subTest(invalid_lines=invalid_lines):
+                streams, _ = self.use_wire_connection({"COM31": response(self.info), "COM12": invalid_lines})
+                with self.assertRaises(CampaignError):
+                    self.run_provision()
+                self.connection.bootstrap.assert_not_called()
+                streams["COM31"].close.assert_called_once()
+                streams["COM12"].close.assert_called_once()
+
+    def test_real_multiple_valid_smp_cdc_interfaces_remain_ambiguous(self):
+        streams, _ = self.use_wire_connection({"COM31": response(self.info), "COM12": response(self.info)})
+        with self.assertRaisesRegex(CampaignError, "multiple compatible SMP interfaces"):
+            self.run_provision()
+        self.connection.bootstrap.assert_not_called()
+        streams["COM31"].close.assert_called_once()
+        streams["COM12"].close.assert_called_once()
+
     def test_real_partial_smp_response_never_bootstraps(self):
         frames = response(self.info)
         self.assertGreater(len(frames), 1)

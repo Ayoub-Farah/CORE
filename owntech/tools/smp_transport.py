@@ -156,13 +156,13 @@ class SerialSMP:
             line = self.serial.readline(MAX_PACKET * 2)
             if not line:
                 continue
-            if not line.endswith(b"\n"):
-                raise ProtocolError("unterminated/oversized SMP line")
             prefix = line[:2]
             if prefix not in (b"\x06\x09", b"\x04\x14"):
                 # Zephyr UART MCUmgr reserves its own framed lines; never treat
                 # application console output as a response or bootstrap evidence.
                 continue
+            if not line.endswith(b"\n"):
+                raise ProtocolError("unterminated/oversized SMP line")
             saw_frame = True
             try:
                 chunk = base64.b64decode(line[2:].strip(), validate=True)

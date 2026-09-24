@@ -35,6 +35,8 @@
 #include <zephyr/fs/nvs.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
+#include <errno.h>
+#include <limits.h>
 
 /* CMSIS */
 #include <arm_math.h>
@@ -47,6 +49,7 @@
 static const uint16_t current_storage_version = 0x0001; 
 static uint16_t storage_version_in_nvs = 0;
 static bool initialized = false;
+K_MUTEX_DEFINE(storage_mutex);
 
 /* Device-tree related macros */
 #define NVS_PARTITION storage_partition
@@ -194,52 +197,38 @@ static int8_t _nvs_storage_init()
 
 /* Public functions */
 
-int8_t nvs_storage_store_data(uint16_t data_id,
-							  const void* data,
-							  uint8_t data_size)
+int nvs_storage_write(uint16_t data_id, const void *data, size_t size)
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return error;
-	}
-
-	int rc = _nvs_storage_store_version();
-	if (rc != 0)
-	{
-		return rc;
-	}
-
-	rc = nvs_write(&fs, data_id, data, data_size);
-
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	if (rc == 0) rc = _nvs_storage_store_version();
+	if (rc == 0) rc = nvs_write(&fs, data_id, data, size);
+	k_mutex_unlock(&storage_mutex);
 	return rc;
 }
 
-int8_t nvs_storage_retrieve_data(uint16_t data_id,
-								 void* data_buffer,
-								 uint8_t data_buffer_size)
+int nvs_storage_read(uint16_t data_id, void *data, size_t size)
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return error;
-	}
-
-	int rc = nvs_read(&fs, data_id, data_buffer, 1);
-
-	if (rc > 1) /* There is more than 1 byte of data */
-	{
-		if (rc > data_buffer_size)
-		{
-			/* Indicate that provided buffer is too small to retrieve data */
-			return -1;
-		}
-
-		rc = nvs_read(&fs, data_id, data_buffer, rc);
-	}
-
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	if (rc == 0) rc = nvs_read(&fs, data_id, data, size);
+	k_mutex_unlock(&storage_mutex);
 	return rc;
 }
+
+int8_t nvs_storage_store_data(uint16_t data_id, const void* data, uint8_t data_size)
+{
+    int rc = nvs_storage_write(data_id, data, data_size);
+    return rc > INT8_MAX ? -EOVERFLOW : rc;
+}
+
+int8_t nvs_storage_retrieve_data(uint16_t data_id, void* data_buffer, uint8_t data_buffer_size)
+{
+    int rc = nvs_storage_read(data_id, data_buffer, data_buffer_size);
+    if (rc > data_buffer_size) return -1;
+    return rc > INT8_MAX ? -EOVERFLOW : rc;
+}
+
 
 int8_t nvs_storage_clear_all_stored_data()
 {

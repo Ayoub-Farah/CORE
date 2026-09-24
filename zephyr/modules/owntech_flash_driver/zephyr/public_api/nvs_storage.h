@@ -30,6 +30,7 @@
 
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,6 +132,12 @@ uint16_t nvs_storage_get_version_in_nvs();
  * @return Free space in bytes on success, negative value on error.
  */
 int32_t nvs_storage_get_free_space();
+
+/* Full-length API for structured journals. Uses the same mounted NVS owner and
+ * namespace as the legacy API; returns the byte count or a negative errno.
+ * nvs_write may return zero when the value was already present. */
+int nvs_storage_write(uint16_t data_id, const void *data, size_t size);
+int nvs_storage_read(uint16_t data_id, void *data, size_t size);
 
 
 #ifdef __cplusplus

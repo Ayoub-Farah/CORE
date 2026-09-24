@@ -13,7 +13,7 @@ if "lead_update" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE
     COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
 
 
-from ota_pio import artifact_options, artifact_post_action, connection_options, mcumgr_path, register_usb_init
+from ota_pio import artifact_options, connection_options, mcumgr_path, register_artifact_validation, register_usb_init
 
 register_usb_init(env)
 
@@ -42,10 +42,10 @@ def lead_update_action(source, target, env):
     return main(args)
 
 
-env.AddPostAction("$BUILD_DIR/${PROGNAME}.mcuboot.bin", artifact_post_action)
+register_artifact_validation(env)
 env.AddCustomTarget(
     name="lead_update",
-    dependencies=["$BUILD_DIR/${PROGNAME}.mcuboot.bin"],
+    dependencies=env.Alias("mcuboot-image"),
     actions=[env.VerboseAction(lead_update_action, "Updating the frozen USB/CAN fleet")],
     title="Update Lead and CAN fleet",
     description="Build/sign, probe, stage exact image, broadcast, validate and verify every reboot",

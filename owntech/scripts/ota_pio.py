@@ -108,6 +108,13 @@ def usb_init_action(source, target, env):
     return provision_action(source, target, env, legacy_console=True)
 
 
+def register_artifact_validation(env):
+    # Pre-scripts run before STSTM32 resolves PROGNAME. Reuse the framework's
+    # alias node, whose signed-file dependency is added with the final name.
+    # A string here could instead create a file named "mcuboot-image".
+    env.AddPostAction(env.Alias("mcuboot-image"), artifact_post_action)
+
+
 def register_usb_init(env):
     """The explicit target authorizes legacy entry; ordinary upload stays unchanged."""
     from SCons.Script import COMMAND_LINE_TARGETS
@@ -115,7 +122,7 @@ def register_usb_init(env):
         COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
     env.AddCustomTarget(
         name="ota_init",
-        dependencies=["$BUILD_DIR/${PROGNAME}.mcuboot.bin"],
+        dependencies=env.Alias("mcuboot-image"),
         actions=[env.VerboseAction(usb_init_action, "Initializing the selected board over USB")],
         title="Initialize board over USB",
         description="Build/sign and initialize one legacy single-CDC board without a CAN campaign",

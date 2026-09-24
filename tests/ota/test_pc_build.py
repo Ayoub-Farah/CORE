@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -25,6 +26,8 @@ class Environment:
         self.project = project or build.parent
         self.post = []
         self.tasks = {}
+        self.aliases = {}
+        self.dependencies = []
 
     def subst(self, value):
         return value.replace("$PROJECT_DIR", str(self.project)).replace("$BUILD_DIR", str(self.build)).replace("${PROGNAME}", "firmware").replace("$PIOENV", "USB_LEAD")
@@ -43,6 +46,14 @@ class Environment:
 
     def AddPostAction(self, target, action):
         self.post.append((target, action))
+
+    def Alias(self, name):
+        if name not in self.aliases:
+            self.aliases[name] = SimpleNamespace(name=name)
+        return [self.aliases[name]]
+
+    def Depends(self, target, dependency):
+        self.dependencies.append((target, dependency))
 
     def AddCustomTarget(self, **kwargs):
         self.task = kwargs
@@ -117,7 +128,7 @@ class BuildTests(unittest.TestCase):
                                init_globals={"env": env, "Import": lambda name: None})
             self.assertEqual(len(env.post), 1)
             target, post = env.post[0]
-            self.assertEqual(target, "$BUILD_DIR/${PROGNAME}.mcuboot.bin")
+            self.assertEqual(target, env.Alias("mcuboot-image"))
             image = build / "firmware.mcuboot.bin"
             image.write_bytes(artifact())
             with redirect_stdout(io.StringIO()):
@@ -153,6 +164,7 @@ class BuildTests(unittest.TestCase):
                 runpy.run_path(str(ROOT / "owntech/scripts/pre_target_ota.py"),
                                init_globals={"env": env, "Import": lambda name: None})
             self.assertEqual(script.COMMAND_LINE_TARGETS, ["mcuboot-image", "upload"])
+            self.assertEqual(env.dependencies, [(env.Alias("upload"), env.Alias("mcuboot-image"))])
             self.assertEqual(len(env.post), 1)
             self.assertEqual(set(env.replacements), {"UPLOADCMD"})
             with patch("provision_ota.main", return_value=0) as provision:
@@ -186,7 +198,7 @@ class BuildTests(unittest.TestCase):
                     self.assertEqual(script.COMMAND_LINE_TARGETS, ["mcuboot-image", "ota_init"])
                     task = env.tasks["ota_init"]
                     self.assertEqual(task["title"], "Initialize board over USB")
-                    self.assertEqual(task["dependencies"], ["$BUILD_DIR/${PROGNAME}.mcuboot.bin"])
+                    self.assertEqual(task["dependencies"], env.Alias("mcuboot-image"))
                     self.assertTrue(task["always_build"])
                     self.assertEqual(len(env.post), 1)
                     with patch("provision_ota.main", return_value=0) as provision, patch("lead_update.main") as campaign:
@@ -202,6 +214,94 @@ class BuildTests(unittest.TestCase):
                     self.assertNotIn("--expected-count", args)
                     self.assertNotIn("--expected-id", args)
                     self.assertNotIn("--receiver-absent", args)
+
+    def test_real_scons_resolves_final_image_and_validates_before_usb_actions(self):
+        # Exercise the actual Alias/AddPostAction semantics without invoking
+        # PlatformIO, a compiler or USB. PIO starts pre-scripts with "program";
+        # its platform builder subsequently chooses the final PROGNAME.
+        pio_home = Path(os.environ.get("PLATFORMIO_CORE_DIR", str(Path.home() / ".platformio")))
+        scons = pio_home / "packages" / "tool-scons" / "scons.py"
+        if not scons.is_file():
+            self.skipTest("PlatformIO's SCons package is not installed")
+        for filename, action_name, corrupt in (
+                ("pre_target_ota.py", "ota_init", False),
+                ("pre_target_usb_lead.py", "ota_init", False),
+                ("pre_target_usb_lead.py", "lead_update", False),
+                ("pre_target_ota.py", "upload", False),
+                ("pre_target_ota.py", "ota_init", True),
+                ("pre_target_usb_lead.py", "lead_update", True),
+                ("pre_target_ota.py", "upload", True)):
+            with self.subTest(hook=filename, action=action_name, corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                payload = bytearray(artifact())
+                if corrupt:
+                    payload[200000] = 0
+                (project / "input.bin").write_bytes(payload)
+                construction = '''from pathlib import Path
+import json
+import runpy
+import sys
+from types import SimpleNamespace
+from SCons.Script import DefaultEnvironment, AlwaysBuild, Action, COMMAND_LINE_TARGETS
+root = Path(ROOT)
+sys.path.insert(0, str(root / "owntech/scripts"))
+sys.path.insert(0, str(root / "owntech/tools"))
+project = Path.cwd()
+env = DefaultEnvironment(tools=[], PROJECT_DIR=str(project), BUILD_DIR=str(project / "build"),
+                  PIOENV="USB_LEAD", PROGNAME="program", OWNTECH_OTA_VERSION="1.2.3+4",
+                  OWNTECH_OTA_BUILD_ID="build-test")
+env.AddMethod(lambda self, key, default=None: default, "GetProjectOption")
+env.AddMethod(lambda self: {}, "BoardConfig")
+env.AddMethod(lambda self: SimpleNamespace(get_package_dir=lambda package: str(project)), "PioPlatform")
+env.AddMethod(lambda self, action, message: Action(action, message), "VerboseAction")
+def add_custom(self, **kwargs):
+    result = self.Alias(kwargs["name"], kwargs["dependencies"], kwargs["actions"])
+    if kwargs.get("always_build"):
+        AlwaysBuild(result)
+    return result
+env.AddMethod(add_custom, "AddCustomTarget")
+def usb_stub(args):
+    image = Path(args[args.index("--image") + 1])
+    assert image.name == "release-payload.mcuboot.bin", image
+    assert image.read_bytes() == (project / "input.bin").read_bytes()
+    manifest = json.loads(image.with_suffix(".json").read_text())
+    assert manifest["build_id"] == "build-test"
+    assert (project / ".pio/ota-artifacts/USB_LEAD" / image.name).read_bytes() == image.read_bytes()
+    with (project / "order.txt").open("a") as output:
+        output.write("verified USB action\\n")
+    return 0
+import provision_ota
+import lead_update
+provision_ota.main = usb_stub
+lead_update.main = usb_stub
+runpy.run_path(str(root / "owntech/scripts" / HOOK), init_globals={"env": env, "Import": lambda name: None})
+assert "mcuboot-image" in COMMAND_LINE_TARGETS
+env.Replace(PROGNAME="release-payload")
+def sign(source, target, env):
+    image = Path(str(target[0]))
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(Path(str(source[0])).read_bytes())
+    (project / "order.txt").write_text("signed\\n")
+signed = env.Command("$BUILD_DIR/${PROGNAME}.mcuboot.bin", "input.bin", sign)
+AlwaysBuild(env.Alias("mcuboot-image", signed))
+if REQUESTED == "upload":
+    AlwaysBuild(env.Alias("upload", signed, env["UPLOADCMD"]))
+'''
+                # Literal Python values, never shell interpolation.
+                settings = "ROOT = %r\nHOOK = %r\nREQUESTED = %r\n" % (str(ROOT), filename, action_name)
+                (project / "SConstruct").write_text(settings + construction, encoding="utf-8")
+                result = subprocess.run([sys.executable, str(scons), "-Q", "-j", "2", action_name],
+                                        cwd=project, text=True, capture_output=True, timeout=30)
+                diagnostic = result.stdout + result.stderr
+                if corrupt:
+                    self.assertNotEqual(result.returncode, 0, diagnostic)
+                    self.assertIn("OTA artifact rejected", diagnostic)
+                    self.assertEqual((project / "order.txt").read_text(), "signed\n")
+                else:
+                    self.assertEqual(result.returncode, 0, diagnostic)
+                    self.assertIn("OTA artifact checked", diagnostic)
+                    self.assertEqual((project / "order.txt").read_text(), "signed\nverified USB action\n")
+                self.assertFalse((project / "build/program.mcuboot.bin").exists())
 
     def test_ota_identity_hook_is_required_instead_of_silent_manual_fallback(self):
         from ota_pio import artifact_options

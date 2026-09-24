@@ -15,6 +15,12 @@
 #include <stm32_ll_hrtim.h>
 #include <string.h>
 
+#ifndef OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY
+#define OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY 0
+#endif
+static_assert(OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY==0 || OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY==1,
+              "explicit recovery mode must be 0 or 1");
+
 extern uint8_t dt_leg_count;
 extern uint16_t dt_pin_driver[],dt_pin_capacitor[];
 
@@ -23,7 +29,8 @@ static const uint8_t allowed_euis[][8]=OWNTECH_OTA_RECOVERY_TARGET_EUIS;
 static const uint8_t original_hashes[][32]=OWNTECH_OTA_RECOVERY_ORIGINAL_HASHES;
 static OtaRecoveryConfig config={OWNTECH_OTA_RECOVERY_CAMPAIGN_ID,
     OWNTECH_OTA_RECOVERY_LEAD_EUI_BYTES,OWNTECH_OTA_RECOVERY_IMAGE_HASH_BYTES,
-    OWNTECH_OTA_RECOVERY_IMAGE_SIZE,OWNTECH_OTA_RECOVERY_TARGET_COUNT,{}};
+    OWNTECH_OTA_RECOVERY_IMAGE_SIZE,OWNTECH_OTA_RECOVERY_TARGET_COUNT,{},
+    OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY!=0};
 static_assert(sizeof(allowed_euis)/8==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"EUI count");
 static_assert(sizeof(original_hashes)/32==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"hash count");
 static_assert(OWNTECH_OTA_RECOVERY_TARGET_COUNT>0 && OWNTECH_OTA_RECOVERY_TARGET_COUNT<=16,"bounded targets");

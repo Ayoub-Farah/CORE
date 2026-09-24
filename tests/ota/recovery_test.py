@@ -25,7 +25,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
         declarations = []
         for section, name, size, crc_offset in (("local", "ARM_JOURNAL", 240, 232),
-                                                ("fleet", "ARM_FLEET", 824, 820)):
+                                                ("fleet", "ARM_FLEET", 824, 820),
+                                                ("compact", "ARM_COMPACT_FLEET", 304, 300)):
             binary = Path(temporary) / (section + ".bin")
             copied = subprocess.run([objcopy, "-O", "binary", "--only-section=.fixture_" + section,
                                      str(target), str(binary)], capture_output=True, text=True, timeout=30)

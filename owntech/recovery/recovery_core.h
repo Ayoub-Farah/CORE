@@ -13,6 +13,8 @@ struct OtaRecoveryConfig {
     uint32_t image_size;
     size_t board_count;
     OtaRecoveryBoard boards[16];
+    /* Explicit host-proven, pre-COMMIT USB staging failure; Lead only. */
+    bool staged_lead_only;
 };
 struct OtaRecoveryIO {
     void *context;

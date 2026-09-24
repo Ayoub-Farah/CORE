@@ -4,7 +4,7 @@
 
 namespace {
 constexpr uint16_t MAINTENANCE = 0x0501, JOURNAL = 0x0502, FLEET = 0x0503, MARKER = 0x0504;
-constexpr uint32_t OTA1 = 0x3141544f, REC1 = 0x3152434f;
+constexpr uint32_t OTA1 = 0x3141544f, OTA2 = 0x3241544f, REC1 = 0x3152434f;
 constexpr int MISSING = -2;
 uint32_t le32(const uint8_t *p)
 { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
@@ -18,14 +18,39 @@ bool journal_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 {
     /* Legacy OTA1 Cortex-M ABI uses -fshort-enums: state is one byte.
      * local_record=240, journal at8, CRC at232; padding is CRC-covered. */
-    return n==240 && le32(p)==OTA1 && crc(p,232) && le64(p+8)==c.campaign &&
-        le32(p+16)==0 && le32(p+20)==c.image_size && p[24]==6 &&
-        !memcmp(p+25,c.lead_eui,8) && !memcmp(p+65,c.image_hash,32);
+    if(n!=240 || le32(p)!=OTA1 || !crc(p,232) || le64(p+8)!=c.campaign ||
+       le32(p+16)!=0 || le32(p+20)!=c.image_size ||
+       memcmp(p+25,c.lead_eui,8) || memcmp(p+65,c.image_hash,32)) return false;
+    if(!c.staged_lead_only) return p[24]==6;
+    /* Stage validation is saved before VERIFY_END; ABORT may save it again.
+     * Both permitted masks prove USB stage/flush/verify without CAN or reboot. */
+    const uint32_t events=le32(p+164);
+    return (p[24]==6 || p[24]==10) && (events==207 || events==463);
 }
 bool maintenance_ok(const uint8_t *p, int n)
 { return n==12 && le32(p)==OTA1 && le32(p+4)==1 && crc(p,8); }
 bool fleet_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 {
+    if(c.staged_lead_only) {
+        /* OTA2 is fixed-width: encoded manifest at8, EUI array at165. A
+         * coordinator commit token is allocated at START, before COMMIT. */
+        uint32_t token=uint32_t(c.campaign);if(!token) token=1;
+        if(n!=304 || le32(p)!=OTA2 || le32(p+4)!=304 || !crc(p,300) ||
+           le64(p+8)!=c.campaign || le32(p+16)!=c.image_size ||
+           memcmp(p+69,c.image_hash,32) || p[293]!=c.board_count ||
+           p[294]>=c.board_count || (p[295]!=1 && p[295]!=9) ||
+           le32(p+296)!=token || memcmp(p+165+size_t(p[294])*8,c.lead_eui,8)) return false;
+        uint32_t seen=0;
+        for(size_t i=0;i<c.board_count;i++) {
+            bool found=false;
+            for(size_t j=0;j<c.board_count;j++) if(!memcmp(p+165+i*8,c.boards[j].eui,8)) {
+                if(seen&(1U<<j)) return false;
+                seen|=1U<<j;found=true;break;
+            }
+            if(!found) return false;
+        }
+        return true;
+    }
     /* Legacy fixed16-target fleet_record, ARM ABI: 824 bytes. */
     if(n!=824 || le32(p)!=OTA1 || le32(p+4)!=824 || !crc(p,820) ||
        le64(p+8)!=c.campaign || le32(p+16)!=c.image_size ||
@@ -46,7 +71,7 @@ bool fleet_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 }
 void make_marker(uint8_t p[64],const OtaRecoveryConfig &c,const uint8_t eui[8])
 {
-    memset(p,0,64);put32(p,REC1);put32(p+4,1);put64(p+8,c.campaign);
+    memset(p,0,64);put32(p,REC1);put32(p+4,c.staged_lead_only?2:1);put64(p+8,c.campaign);
     memcpy(p+16,eui,8);memcpy(p+24,c.image_hash,32);put32(p+56,c.image_size);
     put32(p+60,ota_recovery_crc32(p,60));
 }
@@ -79,6 +104,7 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
     if(lead_count!=1) return OTA_RECOVERY_CONFIG;
     uint8_t eui[8],backup[32];
     if(io.identity(io.context,eui)) return OTA_RECOVERY_IDENTITY;
+    if(c.staged_lead_only && memcmp(eui,c.lead_eui,8)) return OTA_RECOVERY_IDENTITY;
     const OtaRecoveryBoard *board=nullptr;
     for(size_t i=0;i<c.board_count;i++) if(!memcmp(c.boards[i].eui,eui,8)) board=&c.boards[i];
     if(!board) return OTA_RECOVERY_IDENTITY;
@@ -98,7 +124,8 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
      * to be absent. Any remaining record must still pass every original guard. */
     if(!(resume && jr==MISSING) && !journal_ok(journal,jr,c)) return OTA_RECOVERY_JOURNAL;
     if(!(resume && ar==MISSING) && !maintenance_ok(maintenance,ar)) return OTA_RECOVERY_MAINTENANCE;
-    if(fr!=MISSING && !fleet_ok(fleet,fr,c)) return OTA_RECOVERY_FLEET;
+    if((c.staged_lead_only && !resume && fr==MISSING) ||
+       (fr!=MISSING && !fleet_ok(fleet,fr,c))) return OTA_RECOVERY_FLEET;
     if(io.health(io.context)) return OTA_RECOVERY_HEALTH;
 
     if(!resume) {

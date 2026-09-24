@@ -326,6 +326,11 @@ class Campaign:
                 or type(order[index]) is not int or not 1 <= order[index] <= count for index in present)
                 or len({order[index] for index in present}) != len(present)):
             raise CampaignError("invalid device event order/timestamps")
+        if campaign != self.journal.campaign:
+            # A fresh inventory can still carry the previous successful
+            # campaign's trace. Validate it, retain it in STATE/STATUS, and
+            # never relabel or re-emit it into the new campaign's event stream.
+            return
         for index in sorted(present, key=lambda index: order[index]):
             key = campaign, target, index
             if key not in self.journal.device_events_seen:

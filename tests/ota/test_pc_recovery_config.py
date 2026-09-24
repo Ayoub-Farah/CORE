@@ -59,6 +59,26 @@ def staged_records():
     return events[:4] + [staged, events[4], dict(events[-1], error="invalid device event history")]
 
 
+def records_with_previous_success():
+    events = records()
+    inventory = events[2]["inventory"]
+    for row in inventory:
+        row.update(campaign=CAMPAIGN - 1, state="SUCCESS", version="0.9.0+0", build_id="old-image",
+                   offset=DEFAULT_PROFILE["slot_size"], image_size=DEFAULT_PROFILE["slot_size"],
+                   validated=True, flash_complete=True, error=0, **{"pass": 0},
+                   event_mask=(1 << 10) | (1 << 11), event_ms=[0] * 10 + [1000, 5],
+                   event_order=[0] * 10 + [1, 2])
+    snapshots = [{"campaign": CAMPAIGN, "event": "STATE", "identity": row["identity"],
+                  "status": copy.deepcopy(row)} for row in inventory]
+    snapshots.append({"campaign": CAMPAIGN, "event": "STATUS", "status": {
+        "campaign": CAMPAIGN - 1, "phase": "SUCCESS", "target_count": 2, "targets": copy.deepcopy(inventory)}})
+    current_lead = dict(events[5]["status"]["targets"][0], state="USB_STAGING", validated=False,
+                        flash_complete=False, event_mask=7)
+    during_staging = {"campaign": CAMPAIGN, "event": "STATUS", "status": {
+        "campaign": CAMPAIGN, "phase": "USB_STAGE", "targets": [current_lead, copy.deepcopy(inventory[1])]}}
+    return events[:3] + snapshots + [events[3], during_staging] + events[4:]
+
+
 class RecoveryConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -96,6 +116,73 @@ class RecoveryConfigTests(unittest.TestCase):
         historical = recovery_config(self.journal)
         self.assertEqual(render_header(historical), header)
         self.assertEqual(recovery_config(self.journal, staged_lead_only=False), historical)
+
+    def test_exact_previous_success_snapshots_do_not_block_current_recovery(self):
+        self.write(records_with_previous_success())
+        before = self.journal.read_bytes()
+        config = recovery_config(self.journal)
+        self.assertEqual(config["campaign_id"], CAMPAIGN)
+        self.assertEqual(config["targets"][0]["original_active_hash"], "cc" * 32)
+        self.assertEqual(self.journal.read_bytes(), before)
+
+    def test_previous_snapshot_must_match_frozen_identity_campaign_hash_and_trace(self):
+        for field, value in (
+            ("identity", "9999999999999999"), ("campaign", CAMPAIGN), ("campaign", CAMPAIGN - 2),
+            ("mcuboot_image_hash", "ee" * 32), ("state", "COMMITTED"), ("confirmed", False),
+            ("healthy", False), ("healthy", 1), ("offset", float(DEFAULT_PROFILE["slot_size"])),
+            ("available", False), ("error", -9), ("build_id", "different"),
+            ("event_mask", 1 << 10), ("event_ms", [0] * 10 + [1001, 5]),
+            ("event_order", [0] * 10 + [2, 1]),
+        ):
+            events = records_with_previous_success()
+            events[3]["status"][field] = value
+            self.write(events)
+            with self.subTest(field=field, value=value), self.assertRaises(RecoveryConfigError):
+                recovery_config(self.journal)
+
+    def test_current_activation_and_rejected_snapshots_still_forbid_recovery(self):
+        for extra in (
+            {"event": "STATUS", "status": {"phase": "SUCCESS", "campaign": CAMPAIGN, "targets": []}},
+            {"event": "STATE", "status": {"identity": IDS[0], "campaign": CAMPAIGN, "event_mask": 1 << 10}},
+            {"event": "STATUS_REJECTED", "rejected_row": {
+                "identity": IDS[1], "campaign": CAMPAIGN, "event_mask": 1 << 11}},
+        ):
+            events = records_with_previous_success()
+            events.insert(-1, {"campaign": CAMPAIGN, **extra})
+            self.write(events)
+            with self.subTest(extra=extra), self.assertRaises(RecoveryConfigError):
+                recovery_config(self.journal)
+
+    def test_previous_success_row_cannot_hide_an_explicit_activation_phase(self):
+        for event in ("STATUS", "STATUS_REJECTED"):
+            for aggregate in (False, True):
+                events = records_with_previous_success()
+                old = copy.deepcopy(events[2]["inventory"][0])
+                status = dict(old, phase="REBOOTING")
+                if aggregate:
+                    status["targets"] = [old]
+                extra = {"campaign": CAMPAIGN, "event": event,
+                         "response" if event == "STATUS_REJECTED" else "status": status}
+                events.insert(3, extra)
+                self.write(events)
+                with self.subTest(event=event, aggregate=aggregate), self.assertRaisesRegex(
+                        RecoveryConfigError, "activation progress"):
+                    recovery_config(self.journal)
+
+    def test_old_mixed_event_journals_and_malformed_prior_traces_remain_refused(self):
+        events = records_with_previous_success()
+        events.insert(3, {"campaign": CAMPAIGN - 1, "event": "REBOOTING", "identity": IDS[0], "device_event": 10})
+        self.write(events)
+        with self.assertRaisesRegex(RecoveryConfigError, "mixed campaign"):
+            recovery_config(self.journal)
+        events = records_with_previous_success()
+        # Even when repeated identically in the frozen inventory, a malformed
+        # trace cannot be used to explain away reboot evidence.
+        events[2]["inventory"][0]["event_order"][11] = 1
+        events[3]["status"]["event_order"][11] = 1
+        self.write(events)
+        with self.assertRaises(RecoveryConfigError):
+            recovery_config(self.journal)
 
     def test_staged_mode_keeps_frozen_roster_but_authorizes_only_lead(self):
         self.write(staged_records())

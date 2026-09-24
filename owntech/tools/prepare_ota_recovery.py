@@ -121,6 +121,33 @@ def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_o
     require(len(set(addresses)) == len(addresses) and all(address < 254 for address in addresses),
             "duplicate or reserved original CAN address")
 
+    def previous_success(row):
+        """Only the exact successful baseline frozen by DISCOVER is history."""
+        original = by_id.get(row.get("identity"))
+        if not original or type(row.get("campaign")) is not int:
+            return False
+        if not 0 < row["campaign"] < 1 << 64 or row["campaign"] == campaign:
+            return False
+        fields = ("campaign", "state", "mcuboot_image_hash", "version", "build_id", "role",
+                  "confirmed", "healthy", "available", "compatible", "offset", "image_size",
+                  "validated", "flash_complete", "pass", "error", "event_mask", "event_ms", "event_order")
+        if (row.get("state") != "SUCCESS" or row.get("error") != 0
+                or any(field not in row or field not in original
+                       or type(row[field]) is not type(original[field]) or row[field] != original[field]
+                       for field in fields)):
+            return False
+        mask, times, order = row["event_mask"], row["event_ms"], row["event_order"]
+        if (type(mask) is not int or not 0 <= mask < 1 << 12 or not isinstance(times, list)
+                or not isinstance(order, list) or len(times) != 12 or len(order) != 12):
+            return False
+        present = [index for index in range(12) if mask & (1 << index)]
+        if (any(type(value) is not int or not 0 <= value <= 0xFFFFFFFF for value in times)
+                or any(type(value) is not int for value in order)
+                or sorted(order[index] for index in present) != list(range(1, len(present) + 1))
+                or any(times[index] or order[index] for index in range(12) if index not in present)):
+            return False
+        return True
+
     validated = False
     lead_staged = False
     committed = False
@@ -157,16 +184,25 @@ def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_o
             statuses.extend(page["response"] for page in pages if isinstance(page, dict)
                             and isinstance(page.get("response"), dict))
         for status in statuses:
+            status_rows = status.get("targets", [status] if "identity" in status else [])
+            require(isinstance(status_rows, list), "invalid status target list")
+            require(all(isinstance(row, dict) for row in status_rows), "invalid status target")
+            historical = [previous_success(row) for row in status_rows]
+            if ("identity" in status and "targets" not in status and historical == [True]
+                    and status.get("phase", "SUCCESS") == "SUCCESS"):
+                continue
             phase = status.get("phase", status.get("state"))
+            if (not stages and phase == "SUCCESS" and status_rows and all(historical)
+                    and all(status.get("campaign") == row["campaign"] for row in status_rows)):
+                continue
             require(phase not in ("SUCCESS", "SUCCEEDED", "REBOOTING", "COMMITTED", "COMMITTING", "POSTBOOT_CHECK", "RECOVERY_REQUIRED"),
                     "journal records activation progress; this recovery is forbidden")
             if early_failure:
                 require(phase not in ("BEGIN_PASS", "CAN_TRANSFER", "END_PASS", "ALL_VALIDATED"),
                         mode_name + " forbids CAN transfer or fleet validation progress")
-            status_rows = status.get("targets", [status] if "identity" in status else [])
-            require(isinstance(status_rows, list), "invalid status target list")
-            for row in status_rows:
-                require(isinstance(row, dict), "invalid status target")
+            for row, prior in zip(status_rows, historical):
+                if prior:
+                    continue
                 mask = _uint(row.get("event_mask", 0), 32, "device event mask")
                 require(not mask & ((1 << 10) | (1 << 11))
                         and row.get("state") not in ("COMMITTED", "REBOOTING", "RECOVERY_REQUIRED", "SUCCESS", "SUCCEEDED"),

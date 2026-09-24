@@ -348,7 +348,31 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(len(self.journal.path.read_text().splitlines()), 4)
         row["campaign"] = 43
         client._device_events(IDS[0], row)
-        self.assertEqual(len(self.journal.path.read_text().splitlines()), 8)
+        self.assertEqual(len(self.journal.path.read_text().splitlines()), 4)
+        row["event_order"][1] = 1
+        with self.assertRaisesRegex(CampaignError, "invalid device event order"):
+            client._device_events(IDS[0], row)
+
+    def test_previous_campaign_trace_stays_in_snapshot_without_event_reemission(self):
+        row = self.transport.rows(IDS[:1])[0]
+        row.update(campaign=41, state="SUCCESS", event_mask=(1 << 10) | (1 << 11),
+                   event_ms=[0] * 10 + [1000, 5], event_order=[0] * 10 + [1, 2])
+        self.transport.request = Mock(return_value={"phase": "IDLE", "target_count": 1, "targets": [row]})
+        client = self.client()
+        client._collect("discover", {"campaign": 42})
+        records = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual([record["event"] for record in records], ["STATE"])
+        self.assertEqual(records[0]["campaign"], 42)
+        self.assertEqual(records[0]["status"]["campaign"], 41)
+        self.assertEqual(records[0]["status"]["event_order"], row["event_order"])
+        self.assertFalse(self.journal.device_events_seen)
+        # The same event indices from this campaign still emit exactly once.
+        row["campaign"] = 42
+        client._device_events(IDS[0], row)
+        client._device_events(IDS[0], row)
+        records = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual([record["event"] for record in records], ["STATE", "REBOOTING", "POSTBOOT_CHECK"])
+        self.assertTrue(all(record["campaign"] == 42 for record in records))
 
     def test_zero_campaign_event_history_is_journaled_before_campaign_aborts(self):
         # Observed just after START: the staged Lead's seven valid USB events

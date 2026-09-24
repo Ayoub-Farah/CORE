@@ -41,6 +41,44 @@ primary slot.
 References: [OwnTech v1.1.0 bootloader](https://github.com/owntech-foundation/bootloader/tree/v1.1.0)
 and the [OwnTech bootloader guide](https://docs.owntech.org/latest/bootloader/docs/getting_started/).
 
+## Current hardware stop: no recognized images
+
+The first board (`3232500B002B002D`, EUI `1ccd6d8a80f3af97`) entered its USB
+bootloader on 2026-09-24. At 16:35 UTC, the read-only recovery inspection returned
+`{"images": [], "splitStatus": 0}`. A second fresh read on the same USB serial
+returned the same state. Inspection stopped before any erase, upload or reset;
+the recovery utility has not been installed. Additional read-only OS parameters,
+OS information and image-slot-information requests returned unsupported (`rc=8`).
+Local logs:
+`.pio/ota-recovery-61c6c4384740260e-1ccd6d8a80f3af97.jsonl` and
+`.pio/ota-first-board-empty-images-diagnostics.log`.
+
+An empty list does **not** establish that flash is erased or the board is
+irreparably damaged. In the audited Zephyr image-management implementation,
+`img_mgmt_state_encode_slot()` omits a slot whenever `img_mgmt_read_info()` fails,
+including flash-read, header or TLV errors. The overall request can still
+succeed. This response neither identifies the installed bootloader version nor
+reports an RSA-signature validation result. See the
+[state encoder](https://github.com/zephyrproject-rtos/zephyr/blob/v3.5.0/subsys/mgmt/mcumgr/grp/img_mgmt/src/img_mgmt_state.c)
+and [image reader](https://github.com/zephyrproject-rtos/zephyr/blob/v3.5.0/subsys/mgmt/mcumgr/grp/img_mgmt/src/img_mgmt.c).
+
+The required original and staged hashes therefore cannot be checked. Do not
+bypass the recovery guards, upload blindly, force confirmation or request a
+normal reset. Keep the first board in this state and avoid resetting the second
+board, which still has the uncommitted staged image. The audited USB service has
+no raw flash-read operation with which to resolve the missing image identities.
+The next diagnostic path is a read-only flash/option-byte inspection through
+SWD, or assistance from OwnTech with the installed bootloader. No SWD programmer
+was available at the bench, so hardware recovery remains blocked.
+
+For a future SWD inspection, save flash before any erase or programming. Inspect
+the headers at `0x08010000` and `0x08047800`, both complete slots and their
+trailers, and the 4096-byte NVS area at `0x0807f000`. Check flash size and bank
+configuration against the installed bootloader's partition map. The application's
+generated map and STM32G474 driver place NVS after slot 1; their source audit
+found no overlapping erase range. This does not establish the actual flash
+contents or the partition map of the bootloader installed on this board.
+
 ## Prepare a repair image
 
 Keep the original `ota-journals/campaign-*.jsonl` and the current board status.

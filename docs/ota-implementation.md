@@ -306,6 +306,14 @@ its final ELF contains the recovery entry point and excludes automatic image
 confirmation and the ordinary user main. Neither the recovery image nor these
 corrected normal images has yet been installed on the affected boards.
 
+The subsequent read-only recovery inspection of the first board's bootloader
+returned `{"images": [], "splitStatus": 0}` twice. No image identity could be
+verified, so recovery stopped before erase, upload or reset. An empty list does
+not prove erased flash: the audited image service also omits unreadable or
+unrecognized images. USB remains responsive, but hardware recovery is blocked
+pending a way to inspect the flash and installed bootloader. The second board
+has not been reset. See [the recorded stop and diagnostic limits](ota-recovery.md#current-hardware-stop-no-recognized-images).
+
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
 CMake configuration. The edit changed both the embedded build ID and MCUboot

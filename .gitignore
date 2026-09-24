@@ -10,3 +10,6 @@ src/Data_records/*
 __pycache__/
 *.py[cod]
 ota-journals/
+
+# Board-specific flash/calibration backups; retain independently of build cleanup.
+recovery-backups/

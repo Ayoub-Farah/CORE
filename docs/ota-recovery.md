@@ -1,4 +1,4 @@
-# Recovering an uncommitted campaign through USB
+# Recovering an uncommitted OTA campaign
 
 This procedure applies only to an explicitly identified campaign that reached
 `ALL_VALIDATED` but failed before any participant committed or rebooted. It is
@@ -13,16 +13,21 @@ Lead then reported `OTA_ERR_JOURNAL` (`-9`) before participant COMMIT or REBOOT.
 Both applications still responded, with their original active images confirmed.
 
 The original 824-byte fleet record could be written once but its replacement
-could exhaust NVS: garbage collection preserves the previous value until the
-new value is durable. A host regression reproduces this failure with other
+exhausted NVS: garbage collection preserves the previous value until the
+new value is durable. The first board's flash dump proves the capacity problem:
+the compacted active sector had 640 bytes available, while the replacement
+required 824 data bytes plus an 8-byte allocation-table entry (ATE), or 832
+bytes. It was short by **192 bytes**. The preceding `VALID` journal remained
+intact, with a valid CRC. A host regression reproduces this failure with other
 metadata present. The corrected record is 304 bytes; admission also reserves
 replacement space, GC overhead, and the implicit storage-version entry before
 erasing an image slot. Existing OTA1 fleet records remain readable. These
 semantics follow [Zephyr NVS](https://docs.zephyrproject.org/4.0.0/services/storage/nvs/nvs.html).
 
-The existing application API cannot resume this failed COMMIT. Its abort
+The affected application's API cannot resume this failed COMMIT. Its abort
 operation neither removes the padded activation trailer nor clears maintenance.
-Do not reset normally while that staged image remains pending.
+For a board still in that state, do not reset normally while the staged image
+remains pending.
 
 ## Why physical bootloader entry is required
 
@@ -34,20 +39,22 @@ after `boot_go()`, so a 1200-baud reset is unsuitable for this procedure.
 
 The bootloader configuration enables `CONFIG_MCUMGR_GRP_IMG_ALLOW_ERASE_PENDING`.
 The repair client still checks the actual USB receiver and image slots before
-performing any erase. If the installed bootloader differs or any check fails,
+performing any erase. If the installed bootloader differs or any USB check fails,
 stop and preserve the diagnostic log; do not force a confirmation or erase the
-primary slot.
+primary slot through this USB procedure.
 
 References: [OwnTech v1.1.0 bootloader](https://github.com/owntech-foundation/bootloader/tree/v1.1.0)
 and the [OwnTech bootloader guide](https://docs.owntech.org/latest/bootloader/docs/getting_started/).
 
-## Current hardware stop: no recognized images
+<a id="current-hardware-stop-no-recognized-images"></a>
+
+## Historical USB stop: no recognized images
 
 The first board (`3232500B002B002D`, EUI `1ccd6d8a80f3af97`) entered its USB
 bootloader on 2026-09-24. At 16:35 UTC, the read-only recovery inspection returned
 `{"images": [], "splitStatus": 0}`. A second fresh read on the same USB serial
-returned the same state. Inspection stopped before any erase, upload or reset;
-the recovery utility has not been installed. Additional read-only OS parameters,
+returned the same state. That inspection stopped before any erase, upload or
+reset; the recovery utility had not then been installed. Additional read-only OS parameters,
 OS information and image-slot-information requests returned unsupported (`rc=8`).
 Local logs:
 `.pio/ota-recovery-61c6c4384740260e-1ccd6d8a80f3af97.jsonl` and
@@ -62,22 +69,118 @@ reports an RSA-signature validation result. See the
 [state encoder](https://github.com/zephyrproject-rtos/zephyr/blob/v3.5.0/subsys/mgmt/mcumgr/grp/img_mgmt/src/img_mgmt_state.c)
 and [image reader](https://github.com/zephyrproject-rtos/zephyr/blob/v3.5.0/subsys/mgmt/mcumgr/grp/img_mgmt/src/img_mgmt.c).
 
-The required original and staged hashes therefore cannot be checked. Do not
-bypass the recovery guards, upload blindly, force confirmation or request a
-normal reset. Keep the first board in this state and avoid resetting the second
-board, which still has the uncommitted staged image. The audited USB service has
-no raw flash-read operation with which to resolve the missing image identities.
-The next diagnostic path is a read-only flash/option-byte inspection through
-SWD, or assistance from OwnTech with the installed bootloader. No SWD programmer
-was available at the bench, so hardware recovery remains blocked.
+Those responses prevented the USB recovery preflight from checking the required
+image hashes. No guard was bypassed. After an ST-Link became available, halted
+SWD reads established the actual contents. A later physical BOOT + RESET entry
+returned both images through USB. The earlier empty-list response was not
+reproduced and its cause remains unknown; neither the NVS capacity failure nor
+the later debugger read failures establish its cause.
 
-For a future SWD inspection, save flash before any erase or programming. Inspect
-the headers at `0x08010000` and `0x08047800`, both complete slots and their
-trailers, and the 4096-byte NVS area at `0x0807f000`. Check flash size and bank
-configuration against the installed bootloader's partition map. The application's
-generated map and STM32G474 driver place NVS after slot 1; their source audit
-found no overlapping erase range. This does not establish the actual flash
-contents or the partition map of the bootloader installed on this board.
+## First-board SWD diagnosis and successful repair
+
+Before any programming, two complete 512 KiB flash reads were compared and
+found identical. Their SHA-256 is
+`2a14ba31d9ecfaabed86a2b22e0c79f90d227f18af9182f0dc1332b84f139f73`.
+The permanent evidence directory is
+[`recovery-backups/2026-09-24-3232500B002B002D/`](../recovery-backups/2026-09-24-3232500B002B002D/):
+`flash-before-repair.bin`, `flash-after-repair.bin`, `before-analysis.json`,
+`after-analysis.json`, and `options-and-uid.log`. These are local board backups;
+retain them outside disposable build directories.
+
+STM32CubeProgrammer hot-plug reads while the core was asleep produced invalid
+zero/stale values. They were rejected as evidence. Halt the core and compare
+two full reads before interpreting flash or option bytes. The validated reads
+showed 512 KiB flash, `OPTR=0xFFEFF8AA` (`DBANK=1`, `BFB2=0`, RDP level 0),
+`MEMRMP=0`, and UID words `002B002D 3232500B 2037304B`. The derived ThingSet EUI
+matched `1ccd6d8a80f3af97`.
+
+The installed bootloader matched the OwnTech v1.1.0 release byte for byte:
+65344 release bytes followed by 192 erased bytes. Both application images had
+valid headers/TLVs and matching recomputed image hashes. At this snapshot,
+slot 0 held the unconfirmed trial image (`78abe6d3...`), with a completed TEST
+swap trailer; slot 1 retained the original image (`de4c2d2a...`). The NVS local
+journal remained `VALID`, commit ID zero, and the frozen fleet remained `VALID`.
+The flash contents therefore supported a scoped repair without replacing the
+bootloader or losing the retained original image.
+
+The verified partition ranges are half-open:
+
+| Region | Address range |
+|---|---|
+| Bootloader | `[0x08000000, 0x08010000)` |
+| Primary slot 0 | `[0x08010000, 0x08047800)` |
+| Backup slot 1 | `[0x08047800, 0x0807f000)` |
+| NVS, two 2048-byte pages | `[0x0807f000, 0x08080000)` |
+
+### Sparse primary programming and flash ECC
+
+This was a repair of the identified first board with its verified campaign-bound
+helper, not the normal USB provisioning procedure below. All flash and option
+data were backed up first. The helper's EUI, campaign, original-backup hash,
+staged hash and journal guards remained enabled. Only primary slot 0 was erased
+and programmed; slot 1, NVS, the bootloader and option bytes were excluded.
+
+An initial STM32CubeProgrammer write attempt failed in flash-loader
+initialization. A subsequent full read proved that it had changed no flash
+bytes. OpenOCD with an explicit reset followed by halt successfully erased,
+programmed and verified the primary slot. Reset/halt before the programming
+sequence was necessary for the reliable bench procedure; attaching to the
+sleeping application was not sufficient.
+
+Programming the complete padded helper file first caused its own confirmation
+to fail with `CONFIRM_FAILED rc=-19`. The helper kept outputs inhibited and
+retained its recovery marker. The observed failure and successful sparse retry
+are consistent with programming `FF` padding consuming the hidden ECC bits of
+the MCUboot `image_ok` doubleword. A readback of `FF` alone cannot establish
+that this doubleword is still physically erased. STM32G4 programming covers
+64 data bits plus 8 ECC bits; an already programmed doubleword cannot generally
+be programmed again. See [ST RM0440, flash main-memory programming sequences](https://www2.st.com/resource/en/reference_manual/dm00355726-stm32g4-series-advanced-armbased-32bit-mcus-stmicroelectronics.pdf).
+
+The successful retry reset and halted the core, erased **all of slot 0**, then
+programmed only these two ranges from the verified helper artifact:
+
+| Content | Address | Bytes |
+|---|---|---:|
+| Header, image and TLVs, padded to an 8-byte boundary | `0x08010000` | 105928 |
+| MCUboot magic | `0x080477f0` | 16 |
+
+The useful content was 105924 bytes; the first write included four alignment
+bytes. The `image_ok` doubleword at `[0x080477e8, 0x080477f0)` was left physically
+erased, as was all other padding. Do not program the full padded file through
+SWD for this procedure. These lengths belong only to this exact helper artifact
+(SHA-256 `6e094cf259a2f7589540e17d3c8012f539f37df97d7e75b6db6c532879f34c8b`);
+another image requires fresh header/TLV, layout and guard verification.
+
+Before reset, full readback still matched every byte of the padded artifact,
+and the bootloader, backup slot and NVS including the existing recovery marker
+were unchanged. The helper resumed through that marker, performed its normal
+safety and identity checks, confirmed itself, then removed only OTA keys.
+No external forced-confirmation command or confirmation bypass was used.
+
+### Verified result
+
+The console reported `OTA_RECOVERY RECOVERED rc=0`, the expected EUI and
+`confirmed=1`, with outputs inhibited. The post-repair dump proves:
+
+- Bootloader and complete slot 1 are unchanged byte for byte.
+- Slot 0 equals the verified helper artifact except for the intentional
+  `image_ok` byte at `0x080477e8`, changed from `FF` to `01`. Its recomputed
+  MCUboot image hash is
+  `b31ad7a0211127ef0fec521f1200cc4550611a526caf13ff1189b5e940dbc524`, matching its TLV.
+- All eight non-OTA NVS values are unchanged byte for byte: storage version
+  `0100`, six calibrations (`0211`, `0212`, `0219`, `0226`, `0227`, `0228`) and
+  persisted Lead role `0500`.
+- Keys `0501` through `0504` are absent from the resolved live NVS view. Their
+  latest ATEs are zero-length tombstones; historical data remains in flash.
+  Raw NVS changes are limited to the recovery marker and five appended ATEs.
+
+The post-repair dump SHA-256 is
+`f9ea7578f34dd5cccd5747000ec1a2b0b2c095df03fdf6c2939b3b5eca37b1ed`.
+The detailed comparison is preserved in the permanent `after-analysis.json`.
+Local execution logs are under `.pio/swd-recovery-20260924/`, including
+`openocd-sparse-recovery-reset-halt.log` and `sparse-recovery-console.log`.
+This establishes successful guarded recovery of the first board. It does not
+establish recovery of the second board or a complete subsequent fleet update.
 
 ## Prepare a repair image
 
@@ -131,10 +234,10 @@ through the bootloader.
 
 The repair program checks the board identity, retained original image and
 matching local journal (`VALID`, commit ID zero) before modifying OTA metadata.
-It retains a verified recovery marker while removing the failed campaign's
-keys, allowing an interrupted repair to resume. Role, calibration and other
-application metadata are preserved. It explicitly confirms its own image only
-after the repair preconditions and local safety checks pass.
+It persists and verifies a recovery marker, rechecks local safety, then confirms
+its own image before removing the failed campaign's keys. It removes the marker
+last, allowing an interrupted repair to resume. Role, calibration and other
+application metadata are preserved.
 
 After an explicit repair-success report, install the corrected normal `OTA`
 artifact through the bootloader, entered again with physical BOOT + RESET.
@@ -150,6 +253,8 @@ The CAN transfer and original failure above were observed on hardware. All 130
 host/native tests pass, including the NVS replacement regression, corrected
 repeated writes, guard refusals, interrupted repair transactions, and an ARM
 fixture compiled with the installed image's short-enum layout.
-The USB repair procedure must additionally pass the actual bootloader slot
-checks and report repair success on each board; building the utility alone does
-not establish hardware recovery.
+The first board's scoped SWD repair above passed on hardware, including normal
+helper confirmation and a complete before/after flash comparison. The USB repair
+procedure must still pass its own actual bootloader slot checks on each board.
+A complete corrected CAN campaign through reboot, reconciliation and maintenance
+release has not yet been validated on hardware.

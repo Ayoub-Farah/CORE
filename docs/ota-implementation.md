@@ -42,8 +42,10 @@ signature key produce `firmware.mcuboot.bin`. No bootloader is built, installed,
 downloaded or modified by `lead_update`; no key is generated. The manifest
 records the resolved signing key path and the image's public key digest, without
 copying private key material. The currently resolved fallback is MCUboot's
-published example RSA key, as in the original chain. Signature acceptance and
-the identity of bootloaders actually installed on cards remain unqualified.
+published example RSA key, as in the original chain. The first board's installed
+bootloader was subsequently matched byte for byte to OwnTech v1.1.0 during SWD
+recovery. This does not qualify every board's bootloader or the complete fleet
+signature/swap workflow.
 
 The full padded file must fit `0x37800` bytes. Useful content (header, program,
 protected/unprotected TLVs) is checked separately against `0x36000`. This is the
@@ -287,7 +289,9 @@ activation trailers. This exposed a missing NVS replacement-space reservation.
 The corrected fleet record is 304 bytes instead of 824, and admission reserves
 space for a replacement before image erase. Host tests reproduce the original
 failure and exercise repeated replacements with garbage collection and existing
-calibration. See [the scoped USB recovery procedure](ota-recovery.md). A complete
+calibration. A later full flash dump proved the original replacement was short
+by 192 bytes: 640 free versus 832 required for data and its NVS allocation entry.
+See [the recovery evidence and procedures](ota-recovery.md). A complete
 hardware update through postboot reconciliation has not yet passed.
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
@@ -303,16 +307,45 @@ environments compile to `ota-0dcaaff159634ec78f2ca713`, MCUboot hash
 Logs: `.pio/ota-nvs-recovery-tests.log`, `.pio/ota-nvs-fixed-build.log`,
 `.pio/usb-lead-nvs-fixed-build.log`. The separate recovery build also passes;
 its final ELF contains the recovery entry point and excludes automatic image
-confirmation and the ordinary user main. Neither the recovery image nor these
-corrected normal images has yet been installed on the affected boards.
+confirmation and the ordinary user main. These build checks preceded the first
+board's successful hardware recovery described below; they do not establish a
+successful campaign using the corrected normal images.
 
 The subsequent read-only recovery inspection of the first board's bootloader
 returned `{"images": [], "splitStatus": 0}` twice. No image identity could be
 verified, so recovery stopped before erase, upload or reset. An empty list does
 not prove erased flash: the audited image service also omits unreadable or
-unrecognized images. USB remains responsive, but hardware recovery is blocked
-pending a way to inspect the flash and installed bootloader. The second board
-has not been reset. See [the recorded stop and diagnostic limits](ota-recovery.md#current-hardware-stop-no-recognized-images).
+unrecognized images. This was a historical stop. Later halted SWD reads found
+both images intact, with matching recomputed header/TLV hashes, and the installed
+bootloader exactly matched the OwnTech v1.1.0 release. A later physical bootloader
+entry listed both images. The earlier empty response was not reproduced and its
+cause remains unknown. See [the recorded stop and diagnostic limits](ota-recovery.md#historical-usb-stop-no-recognized-images).
+
+The first board (`3232500B002B002D`, EUI `1ccd6d8a80f3af97`) was subsequently
+repaired with its guarded `OTA_RECOVERY` image, programmed into primary slot 0
+through SWD after full backups. An initial CubeProgrammer loader failure changed
+no flash bytes, as verified by complete readback. Hot-plug reads while the core
+was asleep had produced invalid zero/stale data; halted, repeated reads were
+used as evidence. OpenOCD with reset/halt provided verified programming.
+
+Writing the complete padded helper first prevented its normal confirmation
+(`-19`). Erasing the complete primary slot and programming only its 105928-byte
+aligned useful prefix plus the 16-byte magic left the `image_ok` doubleword
+physically erased. That sparse retry succeeded: `RECOVERED rc=0 confirmed=1`.
+The failure/retry is consistent with STM32G4's hidden flash ECC making programmed
+`FF` padding unsuitable for a later confirmation write; the helper's safety and
+identity guards were retained. See [the exact sparse ranges and ECC rationale](ota-recovery.md#sparse-primary-programming-and-flash-ecc).
+
+The complete post-repair dump confirms that the bootloader and backup slot are
+unchanged. All eight non-OTA NVS values (six calibrations, storage version and
+Lead role) are byte-for-byte preserved; OTA keys `0501` through `0504` are removed
+from the live NVS view by tombstones. The primary helper's recomputed hash matches
+its TLV and `image_ok=1`. Permanent before/after dumps, analysis and option/UID
+data are stored in
+[`recovery-backups/2026-09-24-3232500B002B002D/`](../recovery-backups/2026-09-24-3232500B002B002D/).
+This validates first-board recovery. Normal USB initialization and a complete
+corrected fleet cycle remain separate hardware checks; no completed corrected
+CAN update through postboot reconciliation is claimed here.
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached

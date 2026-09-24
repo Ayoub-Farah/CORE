@@ -70,7 +70,7 @@ def _slots(state):
     return result
 
 
-def verify_slots(state, original_hash, secondary_hash=None, primary=None):
+def verify_slots(state, original_hash, secondary_hash=None, primary=None, *, secondary_pending=True):
     slots = _slots(state)
     require(set(slots) == ({0, 1} if secondary_hash else {0}), "unexpected occupied or absent secondary slot")
     active = slots[0]
@@ -81,16 +81,17 @@ def verify_slots(state, original_hash, secondary_hash=None, primary=None):
         require(active == primary, "primary image state changed during recovery")
     if secondary_hash:
         secondary = slots[1]
-        require(secondary["hash"].hex() == secondary_hash and secondary["pending"] is True
+        require(secondary["hash"].hex() == secondary_hash and secondary["pending"] is secondary_pending
                 and secondary["active"] is False and secondary["confirmed"] is False,
-                "secondary image is not the exact pending nonactive image")
+                "secondary image is not the exact %s nonactive image" % ("pending" if secondary_pending else "nonpending"))
     return active
 
 
 def recover(config_path, image_path, manifest_path, serial_number, target_identity, *, port=None,
-            apply=False, mcumgr=None, log_path=None, timeout=10, enumerate_ports=None,
+            apply=False, after_revert=False, mcumgr=None, log_path=None, timeout=10, enumerate_ports=None,
             transport_factory=None, uploader=None):
     require(isinstance(serial_number, str) and serial_number, "an explicit stable USB serial is required")
+    require(type(after_revert) is bool, "after-revert must be an explicit boolean mode")
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
             and math.isfinite(timeout) and 0 < timeout <= 60, "SMP timeout must be within 0..60 seconds")
     config, target, image, data, config_hash = verify_inputs(config_path, image_path, manifest_path, target_identity)
@@ -115,7 +116,8 @@ def recover(config_path, image_path, manifest_path, serial_number, target_identi
     journal = Journal(log_path, config["campaign_id"])
     transport = None
     try:
-        journal.emit("RECOVERY_INPUT", target_identity, apply=apply, usb_serial=serial_number, port=device,
+        journal.emit("RECOVERY_INPUT", target_identity, apply=apply, after_revert=after_revert,
+                     usb_serial=serial_number, port=device,
                      config_sha256=config_hash, source_journal_sha256=config["journal_sha256"],
                      original_active_hash=target["original_active_hash"],
                      campaign_image_hash=config["manifest"]["mcuboot_image_hash"], recovery_image=image)
@@ -138,7 +140,7 @@ def recover(config_path, image_path, manifest_path, serial_number, target_identi
 
         open_bootloader()
         primary = verify_slots(state("RECOVERY_INSPECT"), target["original_active_hash"],
-                               config["manifest"]["mcuboot_image_hash"])
+                               config["manifest"]["mcuboot_image_hash"], secondary_pending=not after_revert)
         if not apply:
             journal.emit("RECOVERY_INSPECTION_PASSED", target_identity)
             return {"result": "INSPECTED", "identity": target_identity, "usb_serial": serial_number,
@@ -195,13 +197,16 @@ def main(argv=None):
     parser.add_argument("--mcumgr", type=Path)
     parser.add_argument("--log", type=Path)
     parser.add_argument("--timeout", type=float, default=10)
+    parser.add_argument("--after-revert", action="store_true",
+                        help="inspect a completed revert: require the exact initial secondary to be nonpending; never initiate a revert")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--inspect", action="store_true", help="read-only slot inspection (default)")
     mode.add_argument("--apply", action="store_true", help="erase only the proven secondary, upload recovery and reset once")
     args = parser.parse_args(argv)
     try:
         result = recover(args.config, args.image, args.manifest, args.serial, args.identity,
-                         port=args.port, apply=args.apply, mcumgr=args.mcumgr, log_path=args.log, timeout=args.timeout)
+                         port=args.port, apply=args.apply, after_revert=args.after_revert,
+                         mcumgr=args.mcumgr, log_path=args.log, timeout=args.timeout)
     except (OSError, ValueError, CampaignError, UploadError) as error:
         print("Recovery stopped: %s" % error, file=sys.stderr)
         return 1

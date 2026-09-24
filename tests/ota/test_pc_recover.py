@@ -176,6 +176,52 @@ class RecoveryUploadTests(unittest.TestCase):
         self.assertEqual(self.device.calls[-3:], [("image_state",), (2, 0, 5, {}), ("close",)])
         self.assertTrue(all(call.args == ("COM7",) and call.kwargs == {"timeout": 10} for call in self.factory.call_args_list))
 
+    def test_after_revert_requires_explicit_matching_initial_pending_flag(self):
+        for pending, after_revert in ((False, False), (True, True)):
+            self.device.calls.clear()
+            self.device.images[1]["pending"] = pending
+            with self.subTest(pending=pending, after_revert=after_revert), self.assertRaisesRegex(ValueError, "exact .*nonactive image"):
+                self.run_recovery(apply=True, after_revert=after_revert)
+            self.assertEqual(self.mutations(), [])
+            self.assertEqual(self.device.calls[-1], ("close",))
+        self.upload.assert_not_called()
+
+    def test_after_revert_keeps_exact_hash_and_confirmed_primary_guards(self):
+        valid = copy.deepcopy(self.device.images)
+        valid[1]["pending"] = False
+        for index, field, value in ((0, "confirmed", False), (0, "hash", b"x" * 32),
+                                    (1, "hash", b"x" * 32), (1, "active", True), (1, "bootable", False)):
+            self.device.images = copy.deepcopy(valid)
+            self.device.images[index][field] = value
+            with self.subTest(index=index, field=field), self.assertRaises(ValueError):
+                self.run_recovery(apply=True, after_revert=True)
+            self.assertEqual(self.mutations(), [])
+        self.upload.assert_not_called()
+
+    def test_after_revert_apply_requires_pending_recovery_image_before_single_reset(self):
+        self.device.images[1]["pending"] = False
+        self.assertEqual(self.run_recovery(apply=True, after_revert=True)["result"], "RESET_REQUESTED")
+        self.assertEqual(self.mutations(), [(2, 1, 5, {"slot": 1}), (2, 0, 5, {})])
+        self.upload.assert_called_once()
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertIs(events[0]["after_revert"], True)
+        self.assertIs(events[1]["image_state"]["images"][1]["pending"], False)
+        after = next(event for event in events if event["event"] == "RECOVERY_AFTER_UPLOAD")
+        self.assertIs(after["image_state"]["images"][1]["pending"], True)
+
+    def test_after_revert_nonpending_uploaded_recovery_never_resets(self):
+        self.device.images[1]["pending"] = False
+
+        def upload(base, snapshot):
+            self.upload_image(base, snapshot)
+            self.device.images[1]["pending"] = False
+
+        self.upload.side_effect = upload
+        with self.assertRaisesRegex(ValueError, "exact pending nonactive image"):
+            self.run_recovery(apply=True, after_revert=True)
+        self.assertEqual(self.mutations(), [(2, 1, 5, {"slot": 1})])
+        self.assertEqual(json.loads(self.log.read_text().splitlines()[-1])["event"], "RECOVERY_STOPPED")
+
     def test_live_ota_silence_and_other_errors_never_erase_upload_or_reset(self):
         for mode in ("app", "silent", "wrong_rc"):
             self.device.calls.clear()
@@ -280,6 +326,11 @@ class RecoveryUploadTests(unittest.TestCase):
         with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
             self.assertEqual(main(args), 0)
         self.assertIs(run.call_args.kwargs["apply"], False)
+        self.assertIs(run.call_args.kwargs["after_revert"], False)
+        with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args + ["--after-revert"]), 0)
+        self.assertIs(run.call_args.kwargs["apply"], False)
+        self.assertIs(run.call_args.kwargs["after_revert"], True)
 
 
 if __name__ == "__main__":

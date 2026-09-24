@@ -400,6 +400,39 @@ class Campaign:
             row.get("validated") is True and row.get("flash_complete") is True
             and row.get("offset") == self.manifest["artifact_size"] for row in current.values())
 
+    def _wait_commit_reboot(self):
+        """COMMIT accepts work asynchronously; observe its result before recovery."""
+        deadline = self.clock() + self.timeout
+        while self.clock() < deadline:
+            try:
+                result = self._collect()
+                self._table(result)
+                phase = str(result.get("phase", result.get("state", ""))).upper()
+                if phase in ("FAILED", "ABORTED", "PARTIAL") or any(
+                        row.get("error") not in (None, 0, "", "NONE") for row in result["targets"]):
+                    # Keep the firmware's original error and participant state.
+                    # Reconciliation while this campaign is busy only yields
+                    # OTA_ERR_STATE and hides e.g. a failed journal commit.
+                    raise CampaignError("commit/reboot failed: %s" % result)
+                if phase in ("RECOVERY_REQUIRED", "POSTBOOT_CHECK", "SUCCESS"):
+                    return
+            except TransportError:
+                # A lost COMMIT ACK or disappearing USB port does not establish
+                # whether activation occurred. Follow only the selected Lead,
+                # then observe its boot state without issuing another command.
+                if not self.reconnect:
+                    break
+                try:
+                    self.transport = self.reconnect()
+                    info = self.request("info")
+                    if identity(info.get("identity")) != self.lead:
+                        raise CampaignError("different Lead after reconnect")
+                except TransportError:
+                    pass
+            self.sleep(self.poll_interval)
+        raise CampaignError("PARTIAL: bounded timeout waiting for commit/reboot; "
+                            "activation remains uncertain, preserve the campaign journal")
+
     def reconcile(self):
         deadline = self.clock() + self.timeout
         expected_hash = self.manifest["mcuboot_image_hash"]
@@ -468,12 +501,7 @@ class Campaign:
                 self.request("commit", {"campaign": self.journal.campaign})
             except TransportError:
                 pass
-            if self.reconnect:
-                self.sleep(2)
-                try:
-                    self.transport = self.reconnect()
-                except TransportError:
-                    pass
+            self._wait_commit_reboot()
             return self.reconcile()
         except Exception as error:
             if not self.committed:

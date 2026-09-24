@@ -6,7 +6,7 @@ import json
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "owntech" / "tools"))
 from lead_update import (Campaign, CampaignError, Journal, USBConnection, journal_campaign,
@@ -40,6 +40,7 @@ class Transport:
         self.paged = False
         self.release_complete = True
         self.barrier_complete = True
+        self.committed = False
 
     def rows(self, values):
         return [{"identity": value, "address": index + 1, "role": "lead" if index == 0 else "follower",
@@ -59,15 +60,39 @@ class Transport:
             rows = self.rows(self.postboot if command == "reconcile" else self.discovered)
             phase = ("SUCCESS" if self.release_complete else "POSTBOOT_CHECK") if command == "reconcile" else (
                 "ALL_VALIDATED" if self.barrier_complete else "VERIFYING")
+            if command == "status" and self.committed:
+                phase = "RECOVERY_REQUIRED"
             return {"phase": phase, "target_count": len(rows),
                     "targets": rows[payload.get("index", 0):payload.get("index", 0) + 1] if self.paged else rows}
         if command == "stage_begin":
+            self.committed = False
             return {"state": "STAGING"}
         if command == "stage_data":
             return {"offset": payload["offset"] + len(payload["data"])}
         if command == "stage_end":
             return {"state": "STAGED"}
+        if command == "commit":
+            self.committed = True
         return {"rc": 0}
+
+
+class CommitTransport(Transport):
+    """Device transitions after an asynchronously accepted COMMIT."""
+    def __init__(self, events, lost_ack=False):
+        super().__init__()
+        self.events = list(events)
+        self.lost_ack = lost_ack
+
+    def request(self, command, payload):
+        response = super().request(command, payload)
+        if command == "commit" and self.lost_ack:
+            raise TransportError("COMMIT response lost")
+        if command == "status" and self.committed and self.events:
+            event = self.events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            response.update(event if isinstance(event, dict) else {"phase": event})
+        return response
 
 
 class CampaignTests(unittest.TestCase):
@@ -98,6 +123,89 @@ class CampaignTests(unittest.TestCase):
     def test_paged_inventory_and_status(self):
         self.transport.paged = True
         self.assertEqual(self.client().run(), "SUCCESS")
+
+    def test_failed_commit_keeps_validated_state_and_journal_error_without_reconnect(self):
+        # Real two-board failure: all bytes validated, then the collective NVS
+        # journal write fails before any participant COMMIT or reboot.
+        self.transport = CommitTransport([])
+        rows = self.transport.rows(IDS[:2])
+        for row in rows:
+            row.update(state="VALID", error=-9 if row["identity"] == IDS[0] else 0)
+        self.transport.events = [{"phase": "FAILED", "targets": rows, "target_count": 2}]
+        client = self.client()
+        client.reconnect = Mock()
+        with self.assertRaisesRegex(CampaignError, r"commit/reboot failed:.*FAILED.*VALID.*-9"):
+            client.run()
+        self.assertTrue(client.committed)
+        client.reconnect.assert_not_called()
+        commands = [command for command, _ in self.transport.calls]
+        self.assertEqual(commands.count("commit"), 1)
+        self.assertNotIn("reconcile", commands)
+        self.assertNotIn("abort", commands)
+        self.assertNotIn("reset", commands)
+        events = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual(events[-1]["event"], "STATUS")
+        self.assertEqual(events[-1]["status"]["targets"][0]["error"], -9)
+
+    def test_commit_waits_past_two_seconds_and_reconnects_only_after_usb_disappears(self):
+        self.transport = CommitTransport(["COMMITTING"] * 6 + ["REBOOTING",
+            TransportError("USB disappeared during reboot"), "BOOT", "RECOVERY_REQUIRED"])
+        client = self.client()
+        client.timeout = 10
+
+        def reconnect():
+            self.assertEqual(len(self.transport.events), 2)
+            self.assertGreater(self.clock.now, 2)
+            return self.transport
+
+        client.reconnect = Mock(side_effect=reconnect)
+        self.assertEqual(client.run(), "SUCCESS")
+        client.reconnect.assert_called_once()
+        self.assertFalse(self.transport.events)
+        commands = [command for command, _ in self.transport.calls]
+        self.assertEqual(commands.count("commit"), 1)
+        self.assertGreater(commands.index("reconcile"), commands.index("commit") + 9)
+        self.assertNotIn("abort", commands)
+        self.assertNotIn("reset", commands)
+
+    def test_lost_commit_ack_observes_old_state_then_reboot_without_resending_commit(self):
+        self.transport = CommitTransport(["ALL_VALIDATED", "COMMITTING", "REBOOTING",
+                                          "RECOVERY_REQUIRED"], lost_ack=True)
+        client = self.client()
+        client.timeout = 5
+        client.reconnect = Mock()
+        self.assertEqual(client.run(), "SUCCESS")
+        self.assertTrue(client.committed)
+        client.reconnect.assert_not_called()
+        commands = [command for command, _ in self.transport.calls]
+        self.assertEqual(commands.count("commit"), 1)
+        self.assertNotIn("abort", commands)
+
+    def test_commit_connection_loss_retries_are_bounded_and_never_abort(self):
+        self.transport = CommitTransport([TransportError("disconnected")] * 10, lost_ack=True)
+        client = self.client()
+        client.reconnect = Mock(side_effect=TransportError("same serial still absent"))
+        with self.assertRaisesRegex(CampaignError, "PARTIAL: bounded timeout waiting for commit/reboot"):
+            client.run()
+        self.assertTrue(client.committed)
+        self.assertLessEqual(client.reconnect.call_count, 3)
+        commands = [command for command, _ in self.transport.calls]
+        self.assertNotIn("reconcile", commands)
+        self.assertNotIn("abort", commands)
+        self.assertNotIn("reset", commands)
+
+    def test_commit_reconnect_rejects_different_lead_without_reconcile(self):
+        self.transport = CommitTransport([TransportError("reboot disconnected USB")])
+        client = self.client()
+        wrong = Mock()
+        wrong.request.return_value = {"identity": IDS[1]}
+        client.reconnect = Mock(return_value=wrong)
+        with self.assertRaisesRegex(CampaignError, "different Lead after reconnect"):
+            client.run()
+        self.assertTrue(client.committed)
+        wrong.request.assert_called_once_with("info", {})
+        self.assertNotIn("reconcile", [command for command, _ in self.transport.calls])
+        self.assertNotIn("abort", [command for command, _ in self.transport.calls])
 
     def test_standalone_initialization_does_not_authorize_fleet_update(self):
         request = self.transport.request

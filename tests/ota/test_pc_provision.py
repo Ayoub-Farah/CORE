@@ -265,6 +265,41 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(self.receiver.request.call_count, 2)
         self.connection.bootstrap.assert_not_called()
 
+    def test_failed_startup_with_unpublished_hash_reports_health_without_reset(self):
+        for diagnostics in ({}, {"error": -17, "healthy": False, "can_ready": False}):
+            with self.subTest(diagnostics=diagnostics):
+                self.receiver.calls.clear()
+                self.info.update(phase="FAILED", role="lead", available=False,
+                                 active_confirmed=False, slot_available=False,
+                                 mcuboot_image_hash=bytes(32))
+                self.info.update(diagnostics)
+                with self.assertRaisesRegex(CampaignError, "startup health failed") as failure, \
+                     patch("lead_update.upload_image") as upload, patch("lead_update.subprocess.run") as reset:
+                    self.run_provision()
+                message = str(failure.exception)
+                self.assertIn("FAILED", message)
+                self.assertIn("active_confirmed=False", message)
+                self.assertIn("before any reset", message)
+                self.assertNotIn("different OTA application", message)
+                if diagnostics:
+                    self.assertIn("error=-17", message)
+                    self.assertIn("healthy=False", message)
+                    self.assertIn("can_ready=False", message)
+                    self.assertIn("check CAN wiring, termination and an active ACK-capable peer", message)
+                self.assertEqual(self.receiver.calls, [("info", {})])
+                self.connection.bootstrap.assert_not_called()
+                upload.assert_not_called()
+                reset.assert_not_called()
+
+    def test_failed_startup_does_not_attribute_other_errors_to_can(self):
+        self.info.update(phase="FAILED", error=-18, healthy=False, mcuboot_image_hash=bytes(32))
+        with self.assertRaisesRegex(CampaignError, "startup health failed") as failure:
+            self.run_provision()
+        self.assertIn("error=-18", str(failure.exception))
+        self.assertNotIn("check CAN", str(failure.exception))
+        self.connection.bootstrap.assert_not_called()
+        self.assertEqual(self.receiver.calls, [("info", {})])
+
     def test_unique_physical_serial_autoselect_and_explicit_selection_never_falls_back(self):
         one = SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1")
         console = SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM2")

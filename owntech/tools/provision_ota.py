@@ -68,13 +68,26 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
                 raise CampaignError("receiver initialization did not finish; inspect --status before any reset")
             sleep(0.25)
             continue
+        if info.get("phase") != "IDLE":
+            message = "receiver is not idle (%s)" % info.get("phase")
+            if info.get("phase") == "FAILED":
+                # A failed startup can leave the active hash unpublished. Report
+                # the failure before interpreting that hash as another image.
+                message += "; startup health failed"
+                details = ["%s=%s" % (field, info[field]) for field in
+                           ("error", "healthy", "can_ready", "active_confirmed", "slot_available")
+                           if field in info]
+                if details:
+                    message += " (" + ", ".join(details) + ")"
+                if info.get("error") == -17:
+                    message += "; check CAN wiring, termination and an active ACK-capable peer"
+            raise CampaignError(message + "; stop and inspect --status before any reset "
+                                "(an unconfirmed image can roll back)")
         _verify_image(info, manifest)
         actual_identity = identity(info["identity"])
         if expected_identity is not None and actual_identity != expected_identity:
             raise CampaignError("board identity changed during initialization")
         expected_identity = actual_identity
-        if info.get("phase") != "IDLE":
-            raise CampaignError("receiver is not idle (%s); stop and inspect --status before any reset" % info.get("phase"))
         if info.get("available") and info.get("active_confirmed") and info.get("slot_available"):
             break
         if clock() >= deadline:

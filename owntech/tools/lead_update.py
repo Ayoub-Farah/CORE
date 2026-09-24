@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from ota_artifact import inspect_image, load_profile
 from smp_transport import SerialSMP, TransportError, ReceiverProbeTimeout, ProtocolError, CommandError
+from bootloader_upload import upload_image, UploadError
 
 
 class CampaignError(RuntimeError):
@@ -105,12 +106,61 @@ class USBConnection:
         while time.monotonic() < deadline:
             try:
                 return self.connect()
-            except (CampaignError, TransportError) as error:
+            except (CampaignError, TransportError, CommandError) as error:
                 last = error
                 time.sleep(0.5)
         raise TransportError("same USB serial did not return: %s (%s)" % (self.serial_number, last))
 
-    def bootstrap(self, image, mcumgr):
+    def _wait_image_service(self):
+        """Require a readable legacy image service on the same physical board."""
+        deadline = time.monotonic() + self.timeout
+        last = "no USB interface for the selected serial"
+        while time.monotonic() < deadline:
+            ports = [port for port in self.enumerate()
+                     if port.vid == 0x2FE3 and port.serial_number == self.serial_number]
+            if len(ports) > 4:
+                raise CampaignError("selected board has too many USB interfaces")
+            ready = []
+            unresolved = False
+            for port in ports:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    unresolved = True
+                    break
+                candidate = None
+                replied = False
+                try:
+                    candidate = SerialSMP(port.device, timeout=min(1.0, remaining))
+                    try:
+                        candidate.request("info")
+                    except CommandError as error:
+                        if not error.unsupported:
+                            raise
+                        replied = True
+                    else:
+                        raise CampaignError("application service replied on %s; refusing bootloader upload. "
+                                            "Rerun OTA to check it or use USB_LEAD for a live OTA application" % port.device)
+                    candidate.image_state()
+                    ready.append(port.device)
+                except ReceiverProbeTimeout as error:
+                    unresolved |= replied
+                    last = "%s: %s" % (port.device, error)
+                except TransportError as error:
+                    unresolved = True
+                    last = "%s: %s" % (port.device, error)
+                finally:
+                    if candidate:
+                        candidate.close()
+            if len(ready) > 1:
+                raise CampaignError("multiple image services on the selected USB board; no upload sent")
+            if ready and not unresolved:
+                return ready[0]
+            time.sleep(0.25)
+        raise CampaignError("image service did not become ready for USB serial %s (%s). "
+                            "No firmware upload or post-upload reset sent; check the board's bootloader mode and close the serial monitor"
+                            % (self.serial_number, last))
+
+    def bootstrap(self, image, mcumgr, *, enter_bootloader=True):
         """Explicit receiver-absent provisioning only, before any campaign exists."""
         import serial
         if self.transport:
@@ -118,25 +168,24 @@ class USBConnection:
             self.transport = None
         if not Path(mcumgr).is_file():
             raise CampaignError("bootstrap needs the existing OwnTech mcumgr executable")
-        if not self.bootstrap_port:
-            raise CampaignError("multiple USB interfaces without a receiver: select the console with --port/custom_ota_port before bootstrap")
-        with serial.Serial(self.bootstrap_port, baudrate=1200, timeout=0.2):
-            pass
-        time.sleep(2)
-        deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                self.device = select_port(self.enumerate(), self.serial_number).device
-                break
-            except CampaignError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.5)
+        if enter_bootloader:
+            if not self.bootstrap_port:
+                raise CampaignError("multiple USB interfaces without a receiver: select the console with --port/custom_ota_port before bootstrap")
+            select_port(self.enumerate(), self.serial_number, self.bootstrap_port)
+            print("Entering bootloader on %s (USB serial %s)" % (self.bootstrap_port, self.serial_number), flush=True)
+            # Match PlatformIO's TouchSerialPort, including the DTR transition.
+            with serial.Serial(self.bootstrap_port, baudrate=1200, timeout=0.2) as console:
+                console.setDTR(False)
+            time.sleep(0.4)
+        print("Waiting for the image service on USB serial %s..." % self.serial_number, flush=True)
+        self.device = self._wait_image_service()
+        print("Image service ready on %s; uploading %s" % (self.device, image), flush=True)
         connection = "dev=%s,baud=115200,mtu=128" % self.device
-        base = [str(mcumgr), "--conntype", "serial", "--connstring", connection]
+        base = [str(mcumgr), "--conntype", "serial", "--connstring", connection,
+                "--timeout", "10", "--tries", "1"]
         # Neither command writes/replaces the bootloader. A padded image can be
         # pending already; only this initial provisioning path sends reset.
-        subprocess.run(base + ["image", "upload", str(image)], check=True, timeout=240)
+        upload_image(base, image)
         subprocess.run(base + ["reset"], check=True, timeout=15)
         time.sleep(2)
         return self.reconnect()
@@ -576,7 +625,7 @@ def main(argv=None):
         result = campaign.run()
         print(result + "; journal: " + str(journal.path))
         return 0
-    except (OSError, ValueError, CampaignError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
         if journal:
             journal.emit("PARTIAL" if str(error).startswith("PARTIAL") else "FAILED", error=str(error))
         print("Lead update failed: %s" % error, file=sys.stderr)

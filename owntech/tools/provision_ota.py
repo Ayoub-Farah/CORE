@@ -8,8 +8,9 @@ import sys
 import time
 
 from lead_update import CampaignError, USBConnection, identity, json_value, prepare_manifest
+from bootloader_upload import UploadError
 from ota_artifact import load_profile
-from smp_transport import ReceiverProbeTimeout, ProtocolError
+from smp_transport import ReceiverProbeTimeout, ProtocolError, CommandError
 
 
 def _verify_image(info, manifest):
@@ -46,9 +47,14 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
         output("No application receiver on USB serial %s; initializing through the existing bootloader" % connection.serial_number)
         transport = connection.bootstrap(image, mcumgr)
         bootstrapped = True
+    except CommandError as error:
+        if not error.unsupported:
+            raise CampaignError("USB command rejected; no reset/upload was sent: %s" % error) from error
+        output("OTA service unsupported on USB serial %s; checking the existing image service" % connection.serial_number)
+        transport = connection.bootstrap(image, mcumgr, enter_bootloader=False)
+        bootstrapped = True
     except ProtocolError as error:
-        raise CampaignError("USB replied but is not an accepted application receiver; no reset/upload was sent. "
-                            "If it is already in MCUboot, use the established explicit recovery procedure: %s" % error) from error
+        raise CampaignError("USB replied but the response is invalid; no reset/upload was sent: %s" % error) from error
     deadline = clock() + timeout
     expected_identity = None
     while True:
@@ -111,7 +117,7 @@ def main(argv=None):
         connection = USBConnection(args.serial, args.port, timeout=args.timeout)
         provision(connection, args.image, manifest, args.mcumgr, timeout=args.timeout)
         return 0
-    except (OSError, ValueError, CampaignError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
         print("OTA initialization failed: %s" % error, file=sys.stderr)
         return 1
     finally:

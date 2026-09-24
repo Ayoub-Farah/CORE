@@ -24,7 +24,16 @@ class ReceiverProbeTimeout(TransportError):
 
 
 class CommandError(ProtocolError):
-    pass
+    def __init__(self, message, *, response=None):
+        super().__init__(message)
+        self.response = response
+
+    @property
+    def unsupported(self):
+        # SMP v1's ENOTSUP is distinct from an invalid/busy/malformed reply.
+        return (isinstance(self.response, dict)
+                and type(self.response.get("rc")) is int
+                and self.response["rc"] == 8 and not self.response.get("err"))
 
 
 def _head(major, value):
@@ -181,13 +190,28 @@ class SerialSMP:
         raise ReceiverProbeTimeout("SMP response timeout; no framed response received")
 
     def request(self, command, payload=None):
-        command_id = COMMANDS[command]
+        return self._request(2, GROUP, COMMANDS[command], command, payload)
+
+    def image_state(self):
+        """Read the standard image service; never upload, confirm or reset."""
+        result = self._request(0, 1, 0, "image list", {})
+        images = result.get("images")
+        if not isinstance(images, list) or len(images) > 16:
+            raise ProtocolError("invalid image list response")
+        for image in images:
+            if (not isinstance(image, dict) or type(image.get("slot")) is not int
+                    or image["slot"] < 0 or not isinstance(image.get("version"), str)
+                    or ("hash" in image and (not isinstance(image["hash"], bytes) or len(image["hash"]) != 32))):
+                raise ProtocolError("invalid image state entry")
+        return result
+
+    def _request(self, operation, group_id, command_id, command, payload):
         body = cbor_encode(payload or {})
         if len(body) + 8 > MAX_PACKET:
             raise ProtocolError("SMP request too large")
         sequence = self.sequence
         self.sequence = (self.sequence + 1) & 0xFF
-        packet = struct.pack(">BBHHBB", 2, 0, len(body), GROUP, sequence, command_id) + body
+        packet = struct.pack(">BBHHBB", operation, 0, len(body), group_id, sequence, command_id) + body
         received_response = False
         try:
             for frame in uart_frames(packet):
@@ -202,13 +226,13 @@ class SerialSMP:
                 op, flags, length, group, seq, cmd = struct.unpack_from(">BBHHBB", response)
                 if seq != sequence:
                     continue  # late response to a previous bounded transaction
-                if op != 3 or flags != 0 or group != GROUP or cmd != command_id or length != len(response) - 8:
+                if op != operation + 1 or flags != 0 or group != group_id or cmd != command_id or length != len(response) - 8:
                     raise ProtocolError("mismatched SMP response header")
                 result = cbor_decode(response[8:])
                 if not isinstance(result, dict):
                     raise ProtocolError("SMP response is not a map")
                 if result.get("rc", 0) != 0 or result.get("err"):
-                    raise CommandError("%s rejected: %s" % (command, result))
+                    raise CommandError("%s rejected: %s" % (command, result), response=result)
                 return result
         except ReceiverProbeTimeout as error:
             # A late framed reply still proves that a receiver is present.

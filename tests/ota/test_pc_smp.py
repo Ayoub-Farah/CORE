@@ -29,12 +29,38 @@ class Serial:
         pass
 
 
-def response(payload, sequence=0, command=0, group=64):
+def response(payload, sequence=0, command=0, group=64, operation=3):
     data = cbor_encode(payload)
-    return uart_frames(struct.pack(">BBHHBB", 3, 0, len(data), group, sequence, command) + data)
+    return uart_frames(struct.pack(">BBHHBB", operation, 0, len(data), group, sequence, command) + data)
 
 
 class SMPTests(unittest.TestCase):
+    def test_bootloader_detection_uses_typed_unsupported_and_read_only_image_list(self):
+        client = SerialSMP("fake", serial_factory=Serial)
+        state = {"images": [{"slot": 0, "version": "1.0.0", "hash": b"h" * 32}]}
+        client.serial.lines = response({"rc": 8}) + response(state, sequence=1, group=1, operation=1)
+        with self.assertRaises(CommandError) as unsupported:
+            client.request("info")
+        self.assertTrue(unsupported.exception.unsupported)
+        self.assertEqual(client.image_state(), state)
+        expected = struct.pack(">BBHHBB", 0, 0, 1, 1, 1, 0) + cbor_encode({})
+        self.assertEqual(client.serial.written[-1:], uart_frames(expected))
+        for result in ({"rc": 5}, {"rc": "8"}, {"rc": 8, "err": {"group": 1, "rc": 8}}):
+            self.assertFalse(CommandError("rejected", response=result).unsupported)
+
+    def test_image_list_requires_valid_state_not_just_success_rc(self):
+        no_hash = {"images": [{"slot": 0, "version": "0.9.0"}]}
+        for state in ({"rc": 0}, {"images": {}}, {"images": [{}]},
+                      {"images": [{"slot": 0, "version": "0.9.0", "hash": b"bad"}]},
+                      {"images": []}, no_hash):
+            client = SerialSMP("fake", serial_factory=Serial)
+            client.serial.lines = response(state, group=1, operation=1)
+            if state in ({"images": []}, no_hash):
+                self.assertEqual(client.image_state(), state)
+            else:
+                with self.subTest(state=state), self.assertRaises(ProtocolError):
+                    client.image_state()
+
     def test_cbor_types_indefinite_and_rejection(self):
         value = {"a": [True, False, None, -17, 2**63, b"abc", "é"]}
         self.assertEqual(cbor_decode(cbor_encode(value)), value)

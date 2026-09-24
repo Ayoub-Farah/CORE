@@ -39,7 +39,12 @@ entry (`upload_port` is also accepted). Provide the existing MCUmgr executable
 with `custom_ota_mcumgr` if it is not in `owntech/third_party/`.
 
 When the receiver is absent, the task enters the board's existing USB bootloader,
-uploads the application and requests one initial reset. When the same application
+waits for its standard image service to answer on the same USB serial, uploads
+the application and requests one initial reset. A board already answering
+`info` with SMP `rc: 8` (unsupported command) is checked for that image service
+without another 1200-baud reset. The rejection alone never authorizes an upload:
+a valid read-only image list is required, and a live OTA application still blocks
+this installation path. When the same application
 is already healthy, confirmed and idle, it verifies that state and selects the
 follower role without reinstalling. An existing different application with a live
 OTA service must be updated through the campaign workflow; an occupied port,
@@ -47,6 +52,14 @@ malformed response or ambiguous device does not trigger an upload. This task doe
 not discover a fleet or select the board as Lead. Perform initial installation
 before staging a fleet update. The application's maintenance and health callbacks must be
 appropriate for its power and control behavior; see [application integration](ota-implementation.md#application-integration).
+
+The task prints the selected USB serial and the port that answers the image
+probe. If the image service does not answer before `custom_ota_timeout` (30 seconds
+by default), it stops before starting the upload. During upload, repeated `0 %`
+lines are not progress: 20 seconds without an advance stops MCUmgr and reports
+its last output. No post-upload reset is sent after an error, stall or interrupted
+transfer. Close the serial monitor before retrying **OTA -> Upload**; this command
+also handles a board left in the standard image service by an earlier attempt.
 
 Prepare the shared CAN bus and its wiring, termination and power arrangement
 before the receiver's first boot. Startup health requires CAN to become ready

@@ -276,26 +276,37 @@ class Campaign:
 
     def _collect(self, command="status", payload=None):
         result = self.request(command, payload)
-        rows = list(result.get("targets", []))
-        count = result.get("target_count", len(rows))
-        if type(count) is not int or not 0 <= count <= 16:
-            raise CampaignError("invalid bounded target count")
-        if len(rows) < count:
-            rows = []
-            for index in range(count):
-                page = self.request(command, {**(payload or {}), "index": index})
-                rows.extend(page.get("targets", []))
-        found = set()
-        for row in rows:
-            target = identity(row.get("identity"))
-            if target in found:
-                raise CampaignError("duplicate identity in target status")
-            found.add(target)
-            old = self.rows.get(target, {})
-            self._device_events(target, row)
-            if old.get("state") != row.get("state"):
-                self.journal.emit("STATE", target, status=row)
-            self.rows[target] = row
+        pages = []
+        target = row = None
+        try:
+            rows = list(result.get("targets", []))
+            count = result.get("target_count", len(rows))
+            if type(count) is not int or not 0 <= count <= 16:
+                raise CampaignError("invalid bounded target count")
+            if len(rows) < count:
+                rows = []
+                for index in range(count):
+                    page = self.request(command, {**(payload or {}), "index": index})
+                    pages.append({"index": index, "response": page})
+                    rows.extend(page.get("targets", []))
+            found = set()
+            for row in rows:
+                target = None
+                target = identity(row.get("identity"))
+                if target in found:
+                    raise CampaignError("duplicate identity in target status")
+                found.add(target)
+                old = self.rows.get(target, {})
+                self._device_events(target, row)
+                if old.get("state") != row.get("state"):
+                    self.journal.emit("STATE", target, status=row)
+                self.rows[target] = row
+        except CampaignError as error:
+            # Preserve the wire evidence before run() aborts an uncommitted
+            # campaign. Invalid rows must never become accepted device events.
+            self.journal.emit("STATUS_REJECTED", target, command=command, reason=str(error),
+                              response=result, page_responses=pages, rejected_row=row)
+            raise
         result["targets"] = rows
         return result
 

@@ -315,6 +315,50 @@ class CampaignTests(unittest.TestCase):
         client._device_events(IDS[0], row)
         self.assertEqual(len(self.journal.path.read_text().splitlines()), 8)
 
+    def test_zero_campaign_event_history_is_journaled_before_campaign_aborts(self):
+        # Observed just after START: the staged Lead's seven valid USB events
+        # survived, but participant status exposed campaign=0 before adoption.
+        original_request = self.transport.request
+        invalid_response = {}
+
+        def request(command, payload):
+            result = original_request(command, payload)
+            if command == "status" and any(name == "start" for name, _ in self.transport.calls):
+                row = result["targets"][0]
+                row.update(campaign=0, image_size=0, state="IDLE", validated=False,
+                           event_mask=463, event_ms=[204512, 206995, 206995, 213254, 0, 0,
+                                                   213254, 213254, 213371, 0, 0, 0],
+                           event_order=[1, 2, 3, 4, 0, 0, 5, 6, 7, 0, 0, 0])
+                result.update(campaign=42, phase="PREPARING")
+                invalid_response.update(result)
+            return result
+
+        self.transport.request = request
+        client = self.client()
+        with self.assertRaisesRegex(CampaignError, "invalid device event history"):
+            client.run()
+        records = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        rejected = [record for record in records if record["event"] == "STATUS_REJECTED"]
+        self.assertEqual(len(rejected), 1)
+        record = rejected[0]
+        self.assertEqual(record["command"], "status")
+        self.assertEqual(record["identity"], IDS[0])
+        self.assertEqual(record["reason"], "invalid device event history")
+        # Journal encodes the public hash bytes as hex, as for normal STATUS.
+        expected = json.loads(json.dumps(invalid_response, default=lambda value: value.hex()))
+        self.assertEqual(record["response"], expected)
+        self.assertEqual(record["rejected_row"], expected["targets"][0])
+        self.assertEqual(record["page_responses"], [])
+        self.assertLess(records.index(record), next(index for index, item in enumerate(records)
+                                                  if item["event"] == "FAILED"))
+        self.assertFalse(any("device_event" in item for item in records))
+        self.assertNotIn("event_mask", client.rows[IDS[0]])
+        self.assertFalse(client.committed)
+        commands = [name for name, _ in self.transport.calls]
+        self.assertEqual(commands[-2:], ["status", "abort"])
+        self.assertNotIn("commit", commands)
+        self.assertNotIn("reconcile", commands)
+
     def test_multiple_cdc_selects_unique_receiver_and_never_bootstraps_busy_port(self):
         connection = USBConnection.__new__(USBConnection)
         ports = [SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM1"),

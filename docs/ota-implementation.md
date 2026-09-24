@@ -369,9 +369,40 @@ applies to the revert, not a complete post-helper comparison.
 The explicit `--after-revert` mode does not trigger a rollback and cannot bypass
 empty/partial image lists or unconfirmed primaries. Its client suite has 17
 passing tests. See [the second-board evidence and mode safeguards](ota-recovery.md#second-board-interrupted-revert-and-usb-repair).
-Normal USB initialization and a complete corrected fleet cycle remain separate
-hardware checks; no completed corrected CAN update through postboot
-reconciliation is claimed here.
+Both boards subsequently passed individual normal USB initialization with
+ST-Link disconnected. These checks establish initialization after the earlier
+recovery work; they do not erase the distinction between the first board's SWD
+repair and the second board's USB repair.
+
+- Board `3232500B002B002D` (`1ccd6d8a80f3af97`) was initialized through the
+  provision CLI with `--legacy-console`. It returned `PROVISIONED` for build
+  `ota-0dcaaff159634ec78f2ca713`, MCUboot hash
+  `ef76db03b2465e703c6441cfb028cb5bb4449fc55ca03a29b0ba97551fcd9c82`.
+  Repeating the ordinary provision command without `--legacy-console` returned
+  `ALREADY_INITIALIZED` without another upload or reset. Logs:
+  `.pio/swd-recovery-20260924/standalone-usb-init-retest.log` and
+  `.pio/swd-recovery-20260924/standalone-usb-init-idempotent.log`.
+- Board `3232500B00290043` (`1ccd6d8ab16b213e`) passed the actual PlatformIO
+  target `pio run -e USB_LEAD -t ota_init` in 46.818 seconds. It returned
+  `PROVISIONED` for build `ota-d91a70a053916c82d4b7cf5c`, MCUboot hash
+  `25336f5e339f0be51b3a87276a0aca8f5f3430dd215f3a9ad161c925da5c087e`.
+  Log: `.pio/swd-board2-20260924/usb-lead-init-retest.log`.
+
+In both cases the isolated board reported `WAITING_CAN`, `local_healthy: true`,
+`active_confirmed: true`, `slot_available: true` and `error: 0`. The
+`WAITING_FOR_PEER` result with `can_ready: false` and `available: false` is
+expected before connecting a CAN peer. The `ota_init` target initializes a
+follower even when invoked from `USB_LEAD`; it does not start a fleet campaign.
+
+The PlatformIO task correction attaches `ota_init`, `lead_update` and artifact
+validation to the actual `env.Alias("mcuboot-image")` node. This avoids treating
+the alias name as a file dependency and lets the framework resolve the final
+signed image name before validation and USB access. The host regression uses
+real SCons with parallel jobs and a changed final `PROGNAME`: valid artifacts
+must be signed and validated before the USB action, and corrupt artifacts must
+stop that action. The successful hardware `ota_init` invocation above also
+exercises the real PlatformIO task graph. A complete corrected CAN update
+through postboot reconciliation is not yet established by these checks.
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached

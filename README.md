@@ -10,7 +10,8 @@ pio run -e OTA -t upload                 # Install the application on one board
 pio run -e USB_LEAD -t lead_update       # Build and update the selected CAN fleet
 ```
 
-Install OTA support on each board once, then use `USB_LEAD` for subsequent
+Install OTA support on each board once, alone over USB if needed, then connect
+the CAN bus and use `USB_LEAD` for subsequent
 application updates. The same compatible firmware runs on the Lead and its
 participants; the Lead role is selected at runtime. Build identity is generated
 automatically from source and configuration changes. The ordinary `USB` and

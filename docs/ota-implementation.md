@@ -134,6 +134,22 @@ path; the separate SMP CDC retains interrupt-driven reception. `console_getchar(
 still works, but a caller waiting for keyboard input now polls with 1 ms sleeps.
 The supplied LED application does not call it, so this adds no idle polling task.
 
+### Initializing a board without a CAN peer
+
+On a boot with no campaign journal or pending maintenance, local storage, active
+image hashing, CAN controller startup and the application health hook suffice to
+confirm MCUboot. CAN address negotiation may still be waiting for a peer's ACK:
+the USB phase is then `WAITING_CAN`, local health is true, and fleet availability
+is false. Discovery, staging and PREPARE remain gated on full CAN readiness.
+The SDK notifies the existing OTA queue when startup state changes; completion
+of CAN setup promotes the service to `IDLE` without a periodic polling task.
+
+Boots carrying a campaign journal retain the CAN deadline, expected hash/version/
+build checks, conditional confirmation and persistent maintenance barrier.
+Standalone initialization does not provide a recovery shortcut for a pending
+campaign. USB `info` and `status` expose local health, CAN readiness, full service
+health and runtime error independently so a real startup failure is diagnosable.
+
 ### Coexistence with real-time control outside a campaign
 
 The supplied OTA profile keeps CAN available for requests, but does not enable
@@ -217,8 +233,7 @@ Lead preference does not prevent a board from participating in another Lead's
 campaign.
 
 The generic application workflow passed all 60 host tests and the three firmware
-builds on 2026-09-24 (PlatformIO 6.2.0, Zephyr 4.0.0, GNU Arm 12.3.1). Measurements
-below come from the linker reports and inspected signed artifacts:
+builds on 2026-09-24 (PlatformIO 6.2.0, Zephyr 4.0.0, GNU Arm 12.3.1).
 
 Subsequent USB provisioning fixes passed 69 PC tests. A hardware check uploaded
 all 227328 bytes with MCUmgr, rebooted into the corrected dual-CDC application,
@@ -230,11 +245,30 @@ or CAN/postboot qualification. The corrected OTA build log is
 `.pio/ota-usb-console-build.log`; its upload log is
 `.pio/ota-usb-console-upload.log`.
 
+Standalone initialization subsequently passed all 103 host/native tests and
+both OTA builds. The tests include local confirmation without an ACK peer,
+delayed controller startup, late CAN readiness with a full queue, indefinite
+idle waits, coherent USB snapshots, and strict campaign postboot failures.
+The new builds share `ota-e3c380391b56790f0217bde8` and MCUboot image hash
+`78abe6d331679e0ae36fbd999103575c35d44e70fe3b1fd6e51b3aa492cc3216`.
+The full signed file hashes differ because signing can produce different
+signature bytes; each build's adjacent manifest remains authoritative.
+Logs: `.pio/ota-standalone-tests.log`, `.pio/ota-standalone-build.log` and
+`.pio/usb-lead-standalone-build.log`. Current linker/artifact measurements:
+
+The first hardware attempt to install this standalone build was rejected before
+accepting data: the bootloader's standard image service returned `rc=6`
+(`EBADSTATE`) at offset zero. A diagnostic retry with one outstanding chunk
+returned the same rejection. The old `ota-b24bcb19601a8ab5256acf65` application
+remains unconfirmed and in `FAILED`; the new standalone build has not yet been
+validated on that physical board. No forced image confirmation was sent.
+Logs: `.pio/ota-standalone-upload.log` and `.pio/ota-standalone-window1.log`.
+
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
 | USB | 96872 | 31616 | 97208 | 227328 |
-| OTA | 216112 | 97572 | 216448 | 227328 |
-| USB_LEAD | 216112 | 97572 | 216448 | 227328 |
+| OTA | 217748 | 97572 | 218084 | 227328 |
+| USB_LEAD | 217748 | 97572 | 218084 | 227328 |
 
 An actual build check changed the LED delay in `src/main.cpp` from 1000 to
 750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
@@ -251,7 +285,7 @@ configuration-cache invalidation and identity restoration with real CMake after
 build-directory removal.
 
 The useful image must remain below the provisional 221184-byte capacity. The
-current OTA application has 4736 bytes left within that bound; application code
+current OTA application has 3100 bytes left within that bound; application code
 and enabled libraries share that budget with the service.
 Linker RAM allocations are not measured stack high-water marks. Generated
 binaries and build/test logs are local artifacts, not committed source.

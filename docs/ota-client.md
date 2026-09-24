@@ -45,7 +45,7 @@ the application and requests one initial reset. A board already answering
 without another 1200-baud reset. The rejection alone never authorizes an upload:
 a valid read-only image list is required, and a live OTA application still blocks
 this installation path. When the same application
-is already healthy, confirmed and idle, it verifies that state and selects the
+is already locally healthy and confirmed (`IDLE` or `WAITING_CAN`), it verifies that state and selects the
 follower role without reinstalling. An existing different application with a live
 OTA service must be updated through the campaign workflow; an occupied port,
 malformed response or ambiguous device does not trigger an upload. This task does
@@ -65,17 +65,37 @@ If a legacy application remains enumerated but produces USB write timeouts and
 does not enter the bootloader at 1200 baud, use the board's BOOT and RESET buttons
 to enter recovery, then retry OTA upload. See the
 [OwnTech recovery procedure](https://docs.owntech.org/latest/bootloader/docs/getting_started/#recovery-mode).
+The [v1.1.0 release notes](https://github.com/owntech-foundation/bootloader/releases/tag/v1.1.0)
+change that button path to the standard MCUmgr service; the MCUboot serial
+recovery console remains for the no-valid-image case. Therefore BOOT + RESET
+does not guarantee a direct primary-slot upload on that release. If an old
+application is still unconfirmed, this service can reject upload with SMP
+`rc=6` (`EBADSTATE`), which the bundled MCUmgr may display as repeated `0 %`.
+Do not keep repeating the upload or treat it as a CAN error. Read the image
+state and resolve that trial image through an explicit recovery procedure;
+the initialization task never confirms the old image to bypass this guard.
 On older firmware, probing an unconsumed console can block its shared USB
 workqueue. The OTA profile avoids that console overflow path; the PC client
 also checks the other CDC interfaces when one console is inaccessible.
 
-Prepare the shared CAN bus and its wiring, termination and power arrangement
-before the receiver's first boot. Startup health requires CAN to become ready
-within its configured deadline (15 seconds in the supplied profile). An active
-ACK-capable CAN peer, such as another CAN application or a bench adapter, may be
-needed for address setup. Boards still running USB-only firmware are not CAN
-peers. If startup health fails or the image remains unconfirmed, inspect the
-status and correct the setup before starting a campaign.
+Each board can be initialized alone by USB. With no campaign journal, first boot
+checks storage, the active image hash, CAN controller startup and application
+health before confirming the image. It does not require another CAN node to
+acknowledge frames. `WAITING_CAN` with `local_healthy: true`,
+`active_confirmed: true` and `can_status: WAITING_FOR_PEER` in the installation
+result means USB initialization succeeded; `available: false` means fleet
+updates are not ready yet. A controller or application health failure still
+blocks confirmation.
+
+Once the boards have been initialized, connect and power the shared CAN bus
+with its appropriate termination. FDCAN2 uses PB5 RX and PB6 TX at 500 kbit/s.
+An active ACK-capable peer lets address setup finish; USB-only firmware is not
+a CAN peer. The OTA service then moves to `IDLE` automatically, without another
+upload or reset. Before a campaign, require `can_ready: true`, `healthy: true`
+and `available: true` and verify the complete expected inventory. After a fleet
+update, the strict CAN startup deadline (15 seconds in the supplied profile)
+and campaign reconciliation still apply; standalone initialization cannot
+bypass those checks or release pending maintenance.
 
 After installation, check each board and retain its EUI-64:
 
@@ -219,6 +239,8 @@ python owntech/tools/lead_update.py --abort-journal ota-journals/campaign-ID.jso
 ```
 
 `--status` is a read-only snapshot: it calls only `info` and paginated `status`.
+Both expose `local_healthy`, `healthy` (local health and CAN service readiness),
+`can_ready` and the runtime `error` separately from the SMP command's `rc`.
 It requires neither an image nor an expected fleet and performs no discovery,
 role selection, bootstrap, upload or reset. Run it while the campaign client is
 closed because each USB port has one reader.

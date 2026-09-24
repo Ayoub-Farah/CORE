@@ -2,7 +2,7 @@ import copy
 import hashlib
 import io
 import json
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import struct
 import sys
@@ -103,8 +103,8 @@ class RecoveryUploadTests(unittest.TestCase):
         self.assertEqual(self.device.calls[-1], ("close",))
         self.device.images.append(slot(1, self.manifest_value["mcuboot_image_hash"], pending=True, version="0.0.1"))
 
-    def run_recovery(self, **kwargs):
-        return recover(self.config, self.image, self.manifest, "selected", IDS[0],
+    def run_recovery(self, target_identity=IDS[0], **kwargs):
+        return recover(self.config, self.image, self.manifest, "selected", target_identity,
                        mcumgr=self.mcumgr, log_path=self.log, enumerate_ports=self.enumerate,
                        transport_factory=self.factory, uploader=self.upload, **kwargs)
 
@@ -365,6 +365,80 @@ class RecoveryUploadTests(unittest.TestCase):
             self.run_recovery(staged_lead_only=True, apply=True)
         self.enumerate.assert_not_called()
 
+    def prepared_config(self):
+        self.staged_config()
+        config = generate(self.journal, self.config.parent, prepared_follower_only=True)
+        self.manifest_value = inspect_image(self.image.read_bytes(), version="0.0.1+0",
+                                           build_id="recovery-" + config["header_sha256"][:20])
+        self.manifest.write_text(json.dumps(self.manifest_value))
+        self.device.images = [slot(0, "bb" * 32, active=True, confirmed=True)]
+
+    def test_prepared_follower_inspection_is_readonly_with_absent_secondary(self):
+        self.prepared_config()
+        result = self.run_recovery(IDS[1], prepared_follower_only=True)
+        self.assertEqual(result["result"], "INSPECTED")
+        self.assertEqual(result["identity"], IDS[1])
+        self.assertEqual(self.device.calls, [("info",), ("image_state",), ("close",)])
+        self.upload.assert_not_called()
+        self.assertEqual(self.mutations(), [])
+
+    def test_prepared_follower_apply_uploads_without_erase_and_resets_only_after_proof(self):
+        self.prepared_config()
+        result = self.run_recovery(IDS[1], prepared_follower_only=True, apply=True)
+        self.assertEqual(result["result"], "RESET_REQUESTED")
+        self.assertEqual(self.mutations(), [(2, 0, 5, {})])
+        self.upload.assert_called_once()
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertTrue(events[0]["prepared_follower_only"])
+        self.assertEqual(events[0]["identity"], IDS[1])
+        names = [event["event"] for event in events]
+        self.assertNotIn("RECOVERY_ERASE_SECONDARY_REQUEST", names)
+        self.assertLess(names.index("RECOVERY_AFTER_UPLOAD"), names.index("RECOVERY_RESET_REQUEST"))
+
+    def test_prepared_mode_refuses_lead_wrong_mode_and_after_revert_before_usb(self):
+        self.prepared_config()
+        for target, options in (
+            (IDS[0], {"prepared_follower_only": True}),
+            (IDS[1], {}),
+            (IDS[1], {"prepared_follower_only": True, "after_revert": True}),
+            (IDS[1], {"prepared_follower_only": True, "staged_lead_only": True}),
+        ):
+            with self.subTest(target=target, options=options), self.assertRaises(ValueError):
+                self.run_recovery(target, apply=True, **options)
+        self.enumerate.assert_not_called()
+        self.factory.assert_not_called()
+        self.upload.assert_not_called()
+
+    def test_prepared_mode_refuses_any_secondary_or_wrong_primary_without_mutation(self):
+        self.prepared_config()
+        for images in (
+            [slot(0, "bb" * 32, active=True, confirmed=True), slot(1, "bb" * 32)],
+            [slot(0, "bb" * 32, active=True, confirmed=True), slot(1, "ee" * 32, pending=True)],
+            [slot(0, "bb" * 32, active=True, confirmed=False)],
+            [slot(0, "ee" * 32, active=True, confirmed=True)],
+        ):
+            self.device.images = images
+            self.device.calls.clear()
+            with self.subTest(images=images), self.assertRaises(ValueError):
+                self.run_recovery(IDS[1], prepared_follower_only=True, apply=True)
+            self.assertEqual(self.device.calls, [("info",), ("image_state",), ("close",)])
+            self.assertEqual(self.mutations(), [])
+        self.upload.assert_not_called()
+
+    def test_prepared_nonpending_helper_after_upload_never_resets(self):
+        self.prepared_config()
+
+        def upload_without_pending(base, snapshot):
+            self.upload_image(base, snapshot)
+            self.device.images[1]["pending"] = False
+
+        self.upload.side_effect = upload_without_pending
+        with self.assertRaisesRegex(ValueError, "exact pending"):
+            self.run_recovery(IDS[1], prepared_follower_only=True, apply=True)
+        self.upload.assert_called_once()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.device.calls[-1], ("close",))
+
     def test_cli_defaults_to_inspect_and_requires_explicit_identity_and_serial(self):
         args = ["--config", str(self.config), "--image", str(self.image), "--manifest", str(self.manifest),
                 "--serial", "selected", "--identity", IDS[0]]
@@ -373,10 +447,18 @@ class RecoveryUploadTests(unittest.TestCase):
         self.assertIs(run.call_args.kwargs["apply"], False)
         self.assertIs(run.call_args.kwargs["after_revert"], False)
         self.assertIs(run.call_args.kwargs["staged_lead_only"], False)
+        self.assertIs(run.call_args.kwargs["prepared_follower_only"], False)
         with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
             self.assertEqual(main(args + ["--after-revert"]), 0)
         self.assertIs(run.call_args.kwargs["apply"], False)
         self.assertIs(run.call_args.kwargs["after_revert"], True)
+        with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args + ["--prepared-follower-only"]), 0)
+        self.assertIs(run.call_args.kwargs["prepared_follower_only"], True)
+        self.assertIs(run.call_args.kwargs["staged_lead_only"], False)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            main(args + ["--prepared-follower-only", "--staged-lead-only"])
+        self.assertEqual(error.exception.code, 2)
         with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
             self.assertEqual(main(args + ["--staged-lead-only", "--after-revert"]), 0)
         self.assertIs(run.call_args.kwargs["staged_lead_only"], True)

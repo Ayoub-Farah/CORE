@@ -194,6 +194,51 @@ class RecoveryConfigTests(unittest.TestCase):
             self.assertEqual(main(args + ["--staged-lead-only"]), 0)
         self.assertTrue(json.loads((self.output / "owntech_ota_recovery_config.json").read_text())["staged_lead_only"])
 
+    def test_prepared_mode_preserves_roster_and_authorizes_only_followers(self):
+        self.write(staged_records())
+        config = generate(self.journal, self.output, prepared_follower_only=True)
+        self.assertIs(config["prepared_follower_only"], True)
+        self.assertNotIn("staged_lead_only", config)
+        self.assertEqual(config["repair_targets"], [IDS[1]])
+        self.assertEqual([target["identity"] for target in config["targets"]], IDS)
+        self.assertEqual(config["guards"]["local_journal_state_values"], [1, 2])
+        self.assertEqual(config["guards"]["local_event_mask_allowed"], [1, 3])
+        self.assertTrue(config["guards"]["fleet_journal_absent"])
+        self.assertTrue(config["guards"]["host_initial_secondary_absent"])
+        header = (self.output / "owntech_ota_recovery_config.h").read_bytes()
+        self.assertIn(b"#define OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY 1\n", header)
+        self.assertNotIn(b"STAGED_LEAD_ONLY", header)
+        with self.assertRaisesRegex(RecoveryConfigError, "mutually exclusive"):
+            recovery_config(self.journal, staged_lead_only=True, prepared_follower_only=True)
+
+    def test_prepared_mode_requires_same_staged_start_failure_and_no_can_progress(self):
+        for mutate in (
+            lambda events: events.pop(4),
+            lambda events: events.pop(5),
+            lambda events: events.pop(),
+            lambda events: events[4]["status"]["targets"][0].update(offset=0),
+            lambda events: events.insert(-1, {"campaign": CAMPAIGN, "event": "COMMIT_REQUEST", "targets": IDS}),
+            lambda events: events.insert(-1, {"campaign": CAMPAIGN, "event": "CAN_TRANSFER_BEGIN"}),
+            lambda events: events.insert(-1, {"campaign": CAMPAIGN, "event": "STATUS_REJECTED", "response": {
+                "targets": [{"identity": IDS[1], "event_mask": 1 << 4}]}}),
+        ):
+            events = staged_records()
+            mutate(events)
+            self.write(events)
+            with self.subTest(events=events), self.assertRaises(RecoveryConfigError):
+                recovery_config(self.journal, prepared_follower_only=True)
+
+    def test_prepared_cli_requires_explicit_exclusive_flag(self):
+        self.write(staged_records())
+        args = ["--journal", str(self.journal), "--output-dir", str(self.output)]
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args + ["--prepared-follower-only"]), 0)
+        config = json.loads((self.output / "owntech_ota_recovery_config.json").read_text())
+        self.assertTrue(config["prepared_follower_only"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            main(args + ["--prepared-follower-only", "--staged-lead-only"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_roster_must_be_exact_at_discovery_validation_and_commit(self):
         for mutate in (
             lambda events: events[2]["targets"].append(IDS[0]),

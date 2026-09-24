@@ -78,9 +78,13 @@ def _manifest(value):
     return value
 
 
-def recovery_config(journal_path, *, staged_lead_only=False):
+def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_only=False):
     """Extract immutable guards, requiring positive pre-COMMIT validation proof."""
     require(type(staged_lead_only) is bool, "staged-lead-only must be an explicit boolean mode")
+    require(type(prepared_follower_only) is bool, "prepared-follower-only must be an explicit boolean mode")
+    require(not (staged_lead_only and prepared_follower_only), "recovery modes are mutually exclusive")
+    early_failure = staged_lead_only or prepared_follower_only
+    mode_name = "staged-lead-only" if staged_lead_only else "prepared-follower-only"
     path = Path(journal_path).resolve()
     raw = path.read_bytes()
     require(raw and raw.endswith(b"\n"), "journal is empty or has an incomplete final record")
@@ -125,10 +129,10 @@ def recovery_config(journal_path, *, staged_lead_only=False):
         event = record.get("event")
         require(event not in ("SUCCESS", "REBOOTING", "POSTBOOT_CHECK") and record.get("device_event") not in (10, 11),
                 "journal already records reboot/postboot/success; this recovery is forbidden")
-        if staged_lead_only:
+        if early_failure:
             require(event not in ("CAN_TRANSFER_BEGIN", "CAN_TRANSFER_END", "ALL_VALIDATED")
                     and record.get("device_event") not in (4, 5, 9),
-                    "staged-lead-only forbids CAN transfer or fleet validation progress")
+                    mode_name + " forbids CAN transfer or fleet validation progress")
         if "manifest" in record:
             require(record["manifest"] == manifest, "campaign manifest changed within journal")
         if event in ("START_REQUEST", "COMMIT_REQUEST"):
@@ -139,7 +143,7 @@ def recovery_config(journal_path, *, staged_lead_only=False):
             stages += 1
         if event == "START_REQUEST":
             require(stages == 1 and not starts and not committed, "unexpected or repeated campaign start")
-            if staged_lead_only:
+            if early_failure:
                 require(lead_staged, "START lacks a preceding complete Lead STAGED proof")
             starts += 1
         statuses = [record["status"]] if isinstance(record.get("status"), dict) else []
@@ -156,9 +160,9 @@ def recovery_config(journal_path, *, staged_lead_only=False):
             phase = status.get("phase", status.get("state"))
             require(phase not in ("SUCCESS", "SUCCEEDED", "REBOOTING", "COMMITTED", "COMMITTING", "POSTBOOT_CHECK", "RECOVERY_REQUIRED"),
                     "journal records activation progress; this recovery is forbidden")
-            if staged_lead_only:
+            if early_failure:
                 require(phase not in ("BEGIN_PASS", "CAN_TRANSFER", "END_PASS", "ALL_VALIDATED"),
-                        "staged-lead-only forbids CAN transfer or fleet validation progress")
+                        mode_name + " forbids CAN transfer or fleet validation progress")
             status_rows = status.get("targets", [status] if "identity" in status else [])
             require(isinstance(status_rows, list), "invalid status target list")
             for row in status_rows:
@@ -167,11 +171,11 @@ def recovery_config(journal_path, *, staged_lead_only=False):
                 require(not mask & ((1 << 10) | (1 << 11))
                         and row.get("state") not in ("COMMITTED", "REBOOTING", "RECOVERY_REQUIRED", "SUCCESS", "SUCCEEDED"),
                         "a target already committed or rebooted; this recovery is forbidden")
-                if staged_lead_only:
+                if early_failure:
                     require(not mask & ((1 << 4) | (1 << 5) | (1 << 9))
                             and row.get("state") not in ("PASS_OPEN", "PASS_CLOSED", "ALL_VALIDATED"),
-                            "staged-lead-only forbids CAN transfer or fleet validation progress")
-            if staged_lead_only and event == "STATUS" and phase == "STAGED":
+                            mode_name + " forbids CAN transfer or fleet validation progress")
+            if early_failure and event == "STATUS" and phase == "STAGED":
                 require(stages == 1 and not starts and not committed,
                         "Lead STAGED proof must follow its stage request and precede START")
                 require(status.get("campaign") == campaign and status.get("target_count") == len(targets)
@@ -202,12 +206,12 @@ def recovery_config(journal_path, *, staged_lead_only=False):
                             for row in status_rows), "not every frozen target durably validated the complete image")
                 validated = True
         if event == "COMMIT_REQUEST":
-            require(not staged_lead_only, "staged-lead-only forbids any COMMIT request")
+            require(not early_failure, mode_name + " forbids any COMMIT request")
             require(validated and not committed, "COMMIT lacks a preceding complete validation barrier or was repeated")
             committed = True
-    if staged_lead_only:
+    if early_failure:
         require(stages == starts == 1 and lead_staged and not committed and records[-1].get("event") == "FAILED",
-                "staged-lead-only requires one stage, one START, a complete Lead STAGED proof and final FAILED")
+                mode_name + " requires one stage, one START, a complete Lead STAGED proof and final FAILED")
     else:
         require(stages == starts == 1 and validated and committed, "journal lacks the validated campaign and COMMIT request")
     config = {"schema_version": 1, "journal_path": str(path), "journal_sha256": hashlib.sha256(raw).hexdigest(),
@@ -218,17 +222,25 @@ def recovery_config(journal_path, *, staged_lead_only=False):
                        "match_campaign_image_hash": True, "match_image_size": True,
                        "match_device_eui": True, "match_original_secondary_image_hash": True,
                        "host_all_validated_before_commit": True, "host_no_reboot_or_success": True}}
-    if staged_lead_only:
-        config.update(staged_lead_only=True, repair_targets=[lead])
+    if early_failure:
+        repairs = [lead] if staged_lead_only else [target for target in targets if target != lead]
+        require(bool(repairs), "prepared-follower-only requires a frozen follower")
+        config.update(repair_targets=repairs)
+        config["staged_lead_only" if staged_lead_only else "prepared_follower_only"] = True
         guards = config["guards"]
         for field in ("local_journal_state", "local_journal_state_value", "host_all_validated_before_commit"):
             del guards[field]
-        guards.update(local_journal_states=["VALID", "ABORTED"], local_journal_state_values=[6, 10],
-                      local_event_mask_allowed=[207, 463], fleet_journal_required=True,
-                      fleet_journal_magic="OTA2", fleet_journal_states=["PREPARING", "FAILED"],
-                      fleet_journal_state_values=[1, 9], fleet_commit_id=(campaign & 0xFFFFFFFF) or 1,
-                      match_frozen_fleet_roster=True, host_staged_lead_before_start=True,
-                      host_no_commit_request=True, host_final_failed=True)
+        guards.update(host_staged_lead_before_start=True, host_no_commit_request=True, host_final_failed=True)
+        if staged_lead_only:
+            guards.update(local_journal_states=["VALID", "ABORTED"], local_journal_state_values=[6, 10],
+                          local_event_mask_allowed=[207, 463], fleet_journal_required=True,
+                          fleet_journal_magic="OTA2", fleet_journal_states=["PREPARING", "FAILED"],
+                          fleet_journal_state_values=[1, 9], fleet_commit_id=(campaign & 0xFFFFFFFF) or 1,
+                          match_frozen_fleet_roster=True)
+        else:
+            guards.update(local_journal_states=["PREPARING", "READY"], local_journal_state_values=[1, 2],
+                          local_event_mask_allowed=[1, 3], fleet_journal_absent=True,
+                          host_initial_secondary_absent=True, match_nonlead_device_eui=True)
     return config
 
 
@@ -250,6 +262,8 @@ def render_header(config):
     }
     if config.get("staged_lead_only") is True:
         fields["STAGED_LEAD_ONLY"] = "1"
+    if config.get("prepared_follower_only") is True:
+        fields["PREPARED_FOLLOWER_ONLY"] = "1"
     return ("/* Generated from a validated campaign journal; do not edit. */\n"
             "#ifndef OWNTECH_OTA_RECOVERY_CONFIG_H\n#define OWNTECH_OTA_RECOVERY_CONFIG_H\n"
             "#include <stdint.h>\n" + "".join("#define OWNTECH_OTA_RECOVERY_%s %s\n" % item for item in fields.items())
@@ -266,8 +280,9 @@ def _replace(path, content):
         temporary.unlink(missing_ok=True)
 
 
-def generate(journal_path, output_dir, *, staged_lead_only=False):
-    config = recovery_config(journal_path, staged_lead_only=staged_lead_only)
+def generate(journal_path, output_dir, *, staged_lead_only=False, prepared_follower_only=False):
+    config = recovery_config(journal_path, staged_lead_only=staged_lead_only,
+                             prepared_follower_only=prepared_follower_only)
     header = render_header(config)
     config["header_sha256"] = hashlib.sha256(header).hexdigest()
     output = Path(output_dir)
@@ -281,13 +296,17 @@ def generate(journal_path, output_dir, *, staged_lead_only=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journal", type=Path, required=True)
-    parser.add_argument("--staged-lead-only", action="store_true",
-                        help="repair only a fully staged Lead after a failed START without any COMMIT")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--staged-lead-only", action="store_true",
+                      help="repair only a fully staged Lead after a failed START without any COMMIT")
+    mode.add_argument("--prepared-follower-only", action="store_true",
+                      help="repair only a prepared follower before CAN transfer; its secondary must be absent")
     parser.add_argument("--output-dir", type=Path,
                         default=Path(__file__).resolve().parents[2] / ".pio" / "ota-recovery-config")
     args = parser.parse_args(argv)
     try:
-        config = generate(args.journal, args.output_dir, staged_lead_only=args.staged_lead_only)
+        config = generate(args.journal, args.output_dir, staged_lead_only=args.staged_lead_only,
+                          prepared_follower_only=args.prepared_follower_only)
     except (OSError, ValueError, CampaignError) as error:
         print("Recovery configuration refused: %s" % error, file=sys.stderr)
         return 1

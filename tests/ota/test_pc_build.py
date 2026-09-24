@@ -24,6 +24,7 @@ class Environment:
         self.build = build
         self.project = project or build.parent
         self.post = []
+        self.tasks = {}
 
     def subst(self, value):
         return value.replace("$PROJECT_DIR", str(self.project)).replace("$BUILD_DIR", str(self.build)).replace("${PROGNAME}", "firmware").replace("$PIOENV", "USB_LEAD")
@@ -45,6 +46,7 @@ class Environment:
 
     def AddCustomTarget(self, **kwargs):
         self.task = kwargs
+        self.tasks[kwargs["name"]] = kwargs
 
     def VerboseAction(self, action, message):
         return action
@@ -163,7 +165,43 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(args[args.index("--mcumgr") + 1], "existing-mcumgr")
             self.assertEqual(args[args.index("--timeout") + 1], "42")
             self.assertNotIn("--receiver-absent", args)
-            self.assertFalse(hasattr(env, "task"))
+            self.assertNotIn("--legacy-console", args)
+            self.assertEqual(set(env.tasks), {"ota_init"})
+
+    def test_explicit_usb_init_target_builds_signed_image_for_both_ota_environments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in ("pre_target_ota.py", "pre_target_usb_lead.py"):
+                with self.subTest(filename=filename):
+                    env = Environment(Path(directory) / filename)
+                    env.GetProjectOption = lambda key, default=None: {
+                        "custom_ota_serial": "selected-serial", "custom_ota_port": "COM17",
+                        "custom_ota_mcumgr": "existing-mcumgr", "custom_ota_timeout": "42",
+                        "custom_ota_expected_count": "3",
+                    }.get(key, default)
+                    script = ModuleType("SCons.Script")
+                    script.COMMAND_LINE_TARGETS = ["ota_init"]
+                    with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
+                        runpy.run_path(str(ROOT / "owntech/scripts" / filename),
+                                       init_globals={"env": env, "Import": lambda name: None})
+                    self.assertEqual(script.COMMAND_LINE_TARGETS, ["mcuboot-image", "ota_init"])
+                    task = env.tasks["ota_init"]
+                    self.assertEqual(task["title"], "Initialize board over USB")
+                    self.assertEqual(task["dependencies"], ["$BUILD_DIR/${PROGNAME}.mcuboot.bin"])
+                    self.assertTrue(task["always_build"])
+                    self.assertEqual(len(env.post), 1)
+                    with patch("provision_ota.main", return_value=0) as provision, patch("lead_update.main") as campaign:
+                        self.assertEqual(task["actions"][0]([], [], env), 0)
+                    campaign.assert_not_called()
+                    args = provision.call_args.args[0]
+                    self.assertIn("--legacy-console", args)
+                    for flag, value in (("--serial", "selected-serial"), ("--port", "COM17"),
+                                        ("--mcumgr", "existing-mcumgr"), ("--timeout", "42"),
+                                        ("--version", "1.2.3+4"), ("--build-id", "build-test"),
+                                        ("--image", str(env.build) + "/firmware.mcuboot.bin")):
+                        self.assertEqual(args[args.index(flag) + 1], value)
+                    self.assertNotIn("--expected-count", args)
+                    self.assertNotIn("--expected-id", args)
+                    self.assertNotIn("--receiver-absent", args)
 
     def test_ota_identity_hook_is_required_instead_of_silent_manual_fallback(self):
         from ota_pio import artifact_options

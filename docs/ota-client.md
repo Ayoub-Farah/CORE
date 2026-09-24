@@ -32,6 +32,42 @@ its CAN EUI-64:
 ; custom_ota_port = COM9
 ```
 
+For the first installation from a legacy USB application, select the
+**Initialize board over USB** Project Task (`ota_init`). Close the serial
+monitor and connect the selected board by USB. No CAN peer or ST-Link is needed.
+Use the same task on the future Lead, either under `OTA` or under `USB_LEAD`:
+
+```sh
+pio run -e OTA -t ota_init
+pio run -e USB_LEAD -t ota_init
+```
+
+These are alternative environments for initializing a board, not two commands
+to run on each board. Both compile the current application with the same OTA
+service. Initialization leaves it as a participant; the fleet-update command
+selects the Lead role later, once the CAN inventory is ready.
+
+The initialization task explicitly enters at 1200 baud before sending any SMP
+probe. A legacy console's default 16-byte receive buffer cannot hold the
+23-byte OTA probe; sending that probe first can block the shared USB workqueue
+and its reboot callback. The initial-entry task requires exactly one CDC
+interface for the selected USB serial and refuses a double-CDC OTA receiver
+before reset. An empty bootloader image list also stops before upload.
+
+On Windows, setting 1200 baud can disconnect the port before its configuration
+call finishes. The client handles the specific device-disappearance errors by
+waiting for a valid image service on the same USB serial, without repeating
+the reset. Busy ports, access errors, malformed replies and unexpected devices
+still stop the operation. Command-line equivalent using an existing artifact:
+
+```sh
+python owntech/tools/provision_ota.py --legacy-console --image firmware.mcuboot.bin --serial EXACT_BOARD_USB_SERIAL --mcumgr owntech/third_party/mcumgr.exe
+```
+
+If the board already runs this OTA application, use **OTA -> Upload** to verify
+it without reinstallation. This ordinary command also accepts a board already
+placed in its bootloader with BOOT + RESET:
+
 ```sh
 pio run -e OTA -t upload
 ```
@@ -42,12 +78,12 @@ another board. An ambiguous selection is rejected without a reset or upload.
 entry (`upload_port` is also accepted). Provide the existing MCUmgr executable
 with `custom_ota_mcumgr` if it is not in `owntech/third_party/`.
 
-When the receiver is absent, the task enters the board's existing USB bootloader,
+When the receiver is absent, ordinary upload enters the board's existing USB bootloader,
 waits for its standard image service to answer on the same USB serial, uploads
 the application and requests one initial reset. A board already answering
 `info` with SMP `rc: 8` (unsupported command) is checked for that image service
 without another 1200-baud reset. The rejection alone never authorizes an upload:
-a valid read-only image list is required, and a live OTA application still blocks
+a valid nonempty read-only image list is required, and a live OTA application still blocks
 this installation path. When the same application
 is already locally healthy and confirmed (`IDLE` or `WAITING_CAN`), it verifies that state and selects the
 follower role without reinstalling. An existing different application with a live
@@ -163,7 +199,9 @@ compatible SMP service must reply. Reconnection retains the USB serial and
 checks the firmware's EUI-64. An occupied port, ambiguous selection or incompatible
 reply causes a bounded failure.
 
-The task can also initialize a Lead whose receiver absence has been established
+Prefer the standalone **Initialize board over USB** task for a new Lead, then
+connect CAN and run the fleet update. This keeps initialization usable when
+the Lead has no CAN peer. The campaign task can also initialize a Lead whose receiver absence has been established
 explicitly: set `custom_ota_receiver_absent = true` and provide the existing
 MCUmgr executable with `custom_ota_mcumgr` if it is not in
 `owntech/third_party/`. Only an unanswered probe together with that assertion

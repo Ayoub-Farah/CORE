@@ -13,7 +13,9 @@ if "lead_update" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE
     COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
 
 
-from ota_pio import artifact_options, artifact_post_action, connection_options, mcumgr_path
+from ota_pio import artifact_options, artifact_post_action, connection_options, mcumgr_path, register_usb_init
+
+register_usb_init(env)
 
 
 def lead_update_action(source, target, env):

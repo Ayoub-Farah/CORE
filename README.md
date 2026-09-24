@@ -6,7 +6,8 @@ The experimental OTA environments build your current `src/main.cpp` with the
 USB/CAN update service:
 
 ```sh
-pio run -e OTA -t upload                 # Install the application on one board
+pio run -e OTA -t ota_init               # First USB initialization of a legacy board
+pio run -e USB_LEAD -t ota_init          # First USB initialization of the future Lead
 pio run -e USB_LEAD -t lead_update       # Build and update the selected CAN fleet
 ```
 
@@ -16,6 +17,11 @@ application updates. The same compatible firmware runs on the Lead and its
 participants; the Lead role is selected at runtime. Build identity is generated
 automatically from source and configuration changes. The ordinary `USB` and
 `STLink` workflows remain available.
+
+The **Initialize board over USB** task enters the existing bootloader before
+probing an older application's console. It initializes one board without a CAN
+peer or ST-Link. On an already initialized board, `OTA -> Upload` checks the
+current image; subsequent firmware changes use **Update Lead and CAN fleet**.
 
 Select the USB board and expected fleet, and adapt the application's maintenance
 and health callbacks before using power-control code. See the

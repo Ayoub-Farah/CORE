@@ -86,3 +86,38 @@ def mcumgr_path(env):
         "mcumgr-mac" if platform.system() == "Darwin" else (
             "mcumgr-rpi" if platform.machine() in ("armv7l", "aarch64") else "mcumgr"))
     return str(env.GetProjectOption("custom_ota_mcumgr", str(project / "owntech" / "third_party" / executable)))
+
+
+def provision_action(source, target, env, legacy_console=False):
+    project = Path(env.subst("$PROJECT_DIR"))
+    sys.path.insert(0, str(project / "owntech" / "tools"))
+    from provision_ota import main
+    _, profile_path, version, build_id = artifact_options(env)
+    args = ["--image", env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin"),
+            "--profile", str(profile_path), "--version", version, "--build-id", build_id,
+            "--mcumgr", mcumgr_path(env)] + connection_options(env)
+    timeout = env.GetProjectOption("custom_ota_timeout", "")
+    if timeout:
+        args.extend(["--timeout", str(timeout)])
+    if legacy_console:
+        args.append("--legacy-console")
+    return main(args)
+
+
+def usb_init_action(source, target, env):
+    return provision_action(source, target, env, legacy_console=True)
+
+
+def register_usb_init(env):
+    """The explicit target authorizes legacy entry; ordinary upload stays unchanged."""
+    from SCons.Script import COMMAND_LINE_TARGETS
+    if "ota_init" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE_TARGETS:
+        COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
+    env.AddCustomTarget(
+        name="ota_init",
+        dependencies=["$BUILD_DIR/${PROGNAME}.mcuboot.bin"],
+        actions=[env.VerboseAction(usb_init_action, "Initializing the selected board over USB")],
+        title="Initialize board over USB",
+        description="Build/sign and initialize one legacy single-CDC board without a CAN campaign",
+        always_build=True,
+    )

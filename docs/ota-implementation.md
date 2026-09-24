@@ -11,11 +11,23 @@ first receive this application individually with its existing bootloader kept.
 
 ## Build and artifact contract
 
-`USB` remains the ordinary application environment. `CAN_BASELINE` enables
-ThingSet alone. `OTA_BLINK_A` builds version `1.0.0+0`, build `ota-blink-A`, LED
-1 Hz. `USB_LEAD` and `OTA_BLINK_B` build `1.0.1+0`, `ota-blink-B`, LED 2 Hz.
-Both variants retain the complete update service. Public LED calls are routed
-through the service's sole LED writer, including for ordinary applications.
+`OTA` and `USB_LEAD` compile the user's current `src/main.cpp` with the same
+CAN/ThingSet/OTA service and hardware profile. `pio run -e OTA -t upload`
+provisions one board through its existing USB bootloader. `pio run -e USB_LEAD
+-t lead_update` builds the current application and distributes the complete
+firmware to the explicit fleet, including the selected Lead. Subsequent images
+retain the service, so later updates do not require a separate Lead application.
+Ordinary `USB` and `STLink` environments retain their existing workflows.
+
+`pre_ota_identity.py` generates a deterministic `ota-<24 hex digits>` build ID
+from the effective build settings and application/framework integration sources.
+It excludes deployment choices such as USB serial, expected fleet size and the
+environment name: equivalent `OTA` and `USB_LEAD` builds share an identity.
+Source or build-configuration changes produce a new identity automatically.
+`board_build.zephyr.bootloader.app_version` defaults to `1.0.0` and appears as
+`1.0.0+0` in runtime metadata. Projects may override it consistently in both OTA
+environments; no manual build-ID change is needed. Identity is recorded in the
+compiled firmware and generated manifest, and verified again after reboot.
 
 The existing PlatformIO `mcuboot-image` builder and its existing resolved
 signature key produce `firmware.mcuboot.bin`. No bootloader is built, installed,
@@ -35,8 +47,8 @@ with its manifest when qualifying another hardware/layout/bootloader tuple.
 The post-sign check preserves an exact image/manifest copy in
 `.pio/ota-artifacts/<environment>/`. Default PC journals live in `ota-journals/`.
 Both are outside `.pio/build`: PlatformIO can remove that directory when its
-configuration or downloaded library structure changes. Use the preserved A
-artifact for initial provisioning while building B.
+configuration or downloaded library structure changes. Retain these snapshots
+when an initial installation or recovery must use a particular application build.
 
 `artifact_sha256` covers every byte of the transferred file, including padding
 and trailer. `mcuboot_image_hash` covers the MCUboot image's own hash domain and
@@ -85,12 +97,26 @@ Direct PWM and protected GPIO APIs also consult the gate; capacitor control
 uses its actual active-low polarity. Critical tasks keep their safety
 supervision. A queued 1200-baud request rechecks the gate before any reset.
 
-For the power-off blink example, default maintenance and local-health hooks are
-provided. Other applications must implement `owntech_ota_enter_maintenance()`
-and `owntech_ota_check_health()` for their electrical/control behavior; their
-defaults fail closed. These hooks must return within the configured health
-deadline and must not stop necessary protection. Application-specific electrical
-safety, zero-latency interrupt behavior and flash timing require bench tests.
+## Application integration
+
+The OTA environments add the service to `src/main.cpp`; they do not substitute
+another entry point. The repository's LED application declares its maintenance
+and health callbacks explicitly in that file. Their success is appropriate to
+that application, which does not start power conversion. It is not a general
+assertion that another application or connected power stage is safe.
+
+Applications must implement `owntech_ota_enter_maintenance()` and
+`owntech_ota_check_health()` for their own electrical and control behavior. The
+service's weak defaults fail closed. The maintenance callback must put the
+application in a safe state and prevent application-specific restart paths;
+required protection and supervision must remain active. The health callback
+must verify the application's initialization before image confirmation. Both
+callbacks must finish promptly within the configured startup/health budget.
+
+Direct PWM and protected GPIO APIs remain subject to the service's maintenance
+gate. Application-specific electrical safety, interrupt behavior and flash timing
+need bench tests. Public LED calls use the service's LED owner so OTA state
+indications can temporarily take priority over the application's normal pattern.
 
 NVS keys are reserved in category `0x0500`: role, maintenance, local campaign
 journal and frozen fleet journal. They share the existing NVS mount and mutex.
@@ -118,7 +144,7 @@ Run the host suites with:
 
 ```sh
 python -m unittest discover -s tests/ota -p '*test*.py' -v
-pio run -e USB -e CAN_BASELINE -e USB_LEAD -e OTA_BLINK_A -e OTA_BLINK_B
+pio run -e USB -e OTA -e USB_LEAD
 pio run -e USB_LEAD --list-targets
 ```
 
@@ -131,32 +157,40 @@ job runs it after installing the framework. These are software tests, not a
 replacement for CAN arbitration, USB enumeration, flash latency or MCUboot tests
 on real cards.
 
-The CI builds ordinary USB, CAN baseline and all three OTA environments and
-archives firmware, manifests, generated configuration, devicetree and map files.
-Local validation on 2026-09-24 used PlatformIO 6.2.0, ststm32 19.0.0, Zephyr
-4.0.0 and GCC ARM 12.3.1. All five environments built and signed successfully;
-35 host tests passed, with no skips. The OTA environments were rebuilt after
-the final runtime corrections. The installed-framework native USB test measured
-528 bytes for a complete status response with all twelve events, below the
-1536-byte SMP buffer.
+The CI builds `USB`, `OTA` and `USB_LEAD` and archives firmware, manifests,
+generated configuration, devicetree and map files. Host tests also exercise the
+actual runtime's admission queue, persisted target list, postboot reconciliation,
+maintenance release and a subsequent campaign. They verify that a persisted
+Lead preference does not prevent a board from participating in another Lead's
+campaign.
+
+The generic application workflow passed all 56 host tests and the three firmware
+builds on 2026-09-24 (PlatformIO 6.2.0, Zephyr 4.0.0, GNU Arm 12.3.1). Measurements
+below come from the linker reports and inspected signed artifacts:
 
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
-| USB | 96,872 | 31,616 | 97,208 | 227,328 |
-| CAN_BASELINE | 168,956 | 54,272 | — | 227,328 |
-| USB_LEAD | 215,836 | 93,348 | 216,172 | 227,328 |
-| OTA_BLINK_A | 215,836 | 93,348 | 216,172 | 227,328 |
-| OTA_BLINK_B | 215,836 | 93,348 | 216,172 | 227,328 |
+| USB | 96872 | 31616 | 97208 | 227328 |
+| OTA | 216432 | 97572 | 216768 | 227328 |
+| USB_LEAD | 216432 | 97572 | 216768 | 227328 |
 
-The OTA image leaves 5,012 bytes below the provisional useful-content limit.
-The CAN baseline's useful byte count was not separately recorded. These are
-linker allocations, not measured stack high-water marks. Builds retain the
-original toolchain's linker RWX warning. Build logs are local
-under `.pio/ota-final-build.log` and `.pio/ota-release-build.log`; the final host
-run is `.pio/ota-host-tests.log`. Generated binaries and logs are not committed.
+An actual build check changed the LED delay in `src/main.cpp` from 1000 to
+750 ms, rebuilt, then restored 1000 ms and rebuilt incrementally with cached
+CMake configuration. The edit changed both the embedded build ID and MCUboot
+image hash; restoration reproduced their original values. The final `OTA` and
+`USB_LEAD` artifacts have the same build ID and MCUboot image hash. The delay
+change was only a build check; the committed application retains 1000 ms.
+
+The useful image must remain below the provisional 221184-byte capacity. The
+current OTA application has 4416 bytes left within that bound; application code
+and enabled libraries share that budget with the service.
+Linker RAM allocations are not measured stack high-water marks. Generated
+binaries and build/test logs are local artifacts, not committed source.
 
 Still to qualify on a physical Lead plus two followers: wiring/termination,
-installed bootloader/signature/swap behavior, blink A→B on every identity,
-real packet loss and bus load, power inhibition during flash, stack high-water
-marks, measured throughput/duration, rollback and partial recovery. CAN FD/BRS
-is disabled in prototype profiles; its codec tests are not bus qualification.
+installed bootloader/signature/swap behavior, a visible application change on
+every identity, real packet loss and bus load, power inhibition during flash,
+stack high-water marks, measured throughput/duration, rollback and partial
+recovery. Repeat the campaign after another application edit to establish that
+the deployed image retains its receiver. CAN FD/BRS is disabled in prototype
+profiles; its codec tests are not bus qualification.

@@ -1,153 +1,154 @@
-# USB Lead campaign client
+# Update your application over USB and CAN
 
-`USB_LEAD` / `lead_update` builds the existing PlatformIO `mcuboot-image` target,
-inspects its **unchanged** `firmware.mcuboot.bin`, stages every byte on the USB
-Lead, distributes it through the application CAN service, and checks every
-frozen identity after reboot. It does not install or replace a bootloader.
+Both OTA environments build the application's current `src/main.cpp`. `OTA`
+installs that application on one board; `USB_LEAD` sends the complete firmware
+to the selected CAN fleet, including the USB-connected Lead. There is no special
+Lead `main.cpp`. The same compatible firmware contains the participant,
+coordinator and USB service, and keeps them available for later updates.
 
-The same application must already provide the OTA receiver on every follower.
-The prototype assumes no unexpected reset or power interruption between staging
-and the final campaign reboot. The existing padded artifact contains activation
-magic: aborting a campaign does **not** disarm it. The installed bootloader's
-signature acceptance, rollback behavior and useful capacity still need hardware
-qualification.
+The ordinary `USB` and `STLink` environments remain available for their existing
+workflows. Use an OTA environment for images that must receive future campaigns.
+Neither OTA workflow installs or replaces the existing bootloader or generates
+a new signing key.
 
-## One PlatformIO task
+## Install OTA support on each board
 
-Configure an exact inventory, including the Lead, in the selected environment or
-`src/app.ini`. A total expected count may be used instead of identities on a
-controlled bench; discovered identities are then frozen before any erase.
+Build and upload the current application individually to every board that does
+not yet run a compatible OTA service. With exactly one physical OwnTech USB
+board connected, its stable USB serial is detected automatically; several CDC
+interfaces belonging to that board still count as one board. To select a board
+explicitly, set its USB serial in `src/app.ini`. This serial is distinct from
+its CAN EUI-64:
+
+```ini
+[env:OTA]
+; Optional with one board; select explicitly when several boards are connected:
+; custom_ota_serial = EXACT_BOARD_USB_SERIAL
+; Optional, when the old application has several CDC interfaces:
+; custom_ota_port = COM9
+```
+
+```sh
+pio run -e OTA -t upload
+```
+
+An explicit `custom_ota_serial` (or existing `board_id`) never falls back to
+another board. An ambiguous selection is rejected without a reset or upload.
+`custom_ota_port` can select the known console interface for initial bootloader
+entry (`upload_port` is also accepted). Provide the existing MCUmgr executable
+with `custom_ota_mcumgr` if it is not in `owntech/third_party/`.
+
+When the receiver is absent, the task enters the board's existing USB bootloader,
+uploads the application and requests one initial reset. When the same application
+is already healthy, confirmed and idle, it verifies that state and selects the
+follower role without reinstalling. An existing different application with a live
+OTA service must be updated through the campaign workflow; an occupied port,
+malformed response or ambiguous device does not trigger an upload. This task does
+not discover a fleet or select the board as Lead. Perform initial installation
+before staging a fleet update. The application's maintenance and health callbacks must be
+appropriate for its power and control behavior; see [application integration](ota-implementation.md#application-integration).
+
+Prepare the shared CAN bus and its wiring, termination and power arrangement
+before the receiver's first boot. Startup health requires CAN to become ready
+within its configured deadline (15 seconds in the supplied profile). An active
+ACK-capable CAN peer, such as another CAN application or a bench adapter, may be
+needed for address setup. Boards still running USB-only firmware are not CAN
+peers. If startup health fails or the image remains unconfirmed, inspect the
+status and correct the setup before starting a campaign.
+
+After installation, check each board and retain its EUI-64:
+
+```sh
+python owntech/tools/lead_update.py --status --serial EXACT_BOARD_USB_SERIAL
+```
+
+A healthy, confirmed active image and an available secondary slot are required
+for a new campaign. A board with a previous pending/test/revert image requires
+reconciliation before another erase.
+
+## Distribute the current application
+
+Edit your application in `src/main.cpp` and its normal project configuration.
+Select the Lead USB serial and exact expected inventory, including the Lead, in
+`src/app.ini` or the environment's project options:
 
 ```ini
 [env:USB_LEAD]
 custom_ota_serial = YOUR_USB_SERIAL_NUMBER
 custom_ota_expected_ids = 0102030405060708, 1112131415161718, 2122232425262728
-; Alternatively: custom_ota_expected_count = 3
+; Alternatively on a controlled bench: custom_ota_expected_count = 3
 custom_ota_timeout = 180
 ```
+
+Then run the **Update Lead and CAN fleet** Project Task:
 
 ```sh
 pio run -e USB_LEAD -t lead_update
 ```
 
-The Project Task is named **Update Lead and CAN fleet**. Select it in PlatformIO,
-or use the command above. `OTA_BLINK_A` and `OTA_BLINK_B` can use the same task
-for the versioned LED example. Keep the target image's service enabled for the
-next campaign. Close the serial monitor first: the client is the only reader
-of the SMP CDC port.
+The task builds and signs the current application, identifies the USB board,
+persists its Lead role, checks the expected inventory, stages every byte of
+`firmware.mcuboot.bin`, and distributes it over CAN. It validates every selected
+board before requesting the collective reset, then verifies each board's actual
+image, build identity and health. The next update uses the same command after
+editing the application again. A compatible receiver is reused; it is not
+reinstalled on each campaign.
 
-An explicit `custom_ota_serial` (or existing `board_id`) never falls back to a
-different board. Without it, exactly one OwnTech USB board with a stable serial
-number must be present. Its CDC interfaces are probed read-only; exactly one
-compatible SMP service must reply. Reconnection uses the same serial number and verifies
-the firmware's EUI-64 again. An occupied port, ambiguous device or incompatible
-response causes a bounded failure.
+Build identity is derived automatically from the application sources and build
+configuration. Editing `src/main.cpp` changes the identity without requiring a
+manual build-ID increment. Equivalent `OTA` and `USB_LEAD` source/configuration
+builds share that identity; USB serial and fleet selection do not change it. The
+common default firmware version is `1.0.0`. Set
+`board_build.zephyr.bootloader.app_version` consistently in both OTA environments
+when a project needs semantic release versions. Version alone is not the proof of an update: the
+manifest and postboot checks also use the generated build ID and image hash.
 
-If an operator has established that the selected Lead lacks the application
-receiver, set `custom_ota_receiver_absent = true` for its initial provisioning.
-This is an explicit assertion, not a conclusion inferred from a timeout. The
-existing `owntech/third_party/mcumgr` executable must be installed (or set
-`custom_ota_mcumgr` to its path). Only after an unanswered probe with that
-assertion does the task touch 1200 baud, upload the application using the existing
-MCUmgr tool, send its initial reset, and reconnect. A compatible receiver skips
-this path even when its version differs. Remove the assertion after provisioning.
-No bootloader download, installation target or new signing key is involved.
-By default the initial application is the campaign image. To observe a complete
-A → B transition on the Lead too, build `OTA_BLINK_A` first and set
-`custom_ota_bootstrap_image = .pio/ota-artifacts/OTA_BLINK_A/firmware.mcuboot.bin` while
-running the B task. The standalone equivalent is `--bootstrap-image PATH`.
-The initial image is independently inspected with the same compatibility/size
-profile; its version can differ from the campaign target. It must provide the
-compatible OTA service. After its initial reboot, the task still stages the
-entire B artifact before CAN distribution.
-When an old application exposes multiple CDC interfaces and none replies to SMP,
-also set `custom_ota_port` (or `--port`) to its console port for the initial 1200
-baud touch; the client will not choose an arbitrary interface for bootstrap.
+Close the serial monitor first: the campaign client is the only reader of its
+SMP CDC port. An explicit `custom_ota_serial` (or existing `board_id`) never falls
+back to another board. Without one, exactly one OwnTech USB board with a stable
+serial must be present. Its interfaces are probed read-only; exactly one
+compatible SMP service must reply. Reconnection retains the USB serial and
+checks the firmware's EUI-64. An occupied port, ambiguous selection or incompatible
+reply causes a bounded failure.
 
-## Initial A image on the followers
+The task can also initialize a Lead whose receiver absence has been established
+explicitly: set `custom_ota_receiver_absent = true` and provide the existing
+MCUmgr executable with `custom_ota_mcumgr` if it is not in
+`owntech/third_party/`. Only an unanswered probe together with that assertion
+authorizes the initial 1200-baud bootloader entry, application upload and reset.
+A compatible service skips this path even when its version differs. Remove the
+assertion afterward. For an old application with several CDC ports, specify
+`custom_ota_port` as its known console port; the task does not guess which port
+to touch. `custom_ota_bootstrap_image` may select a separately built compatible
+application for this initial installation; the campaign still stages and sends
+the current target artifact in full afterward.
 
-Prepare the shared CAN bus with the intended Lead and two followers before the
-receiver's first health initialization. Use the qualified wiring, termination
-and power arrangement for the bench. Build A once:
-
-```sh
-pio run -e OTA_BLINK_A
-```
-
-Provision each follower individually over USB, selecting its exact USB serial.
-Do not run `lead_update` on a follower for initial provisioning: that task selects
-the USB board's persisted role as Lead. A fresh application's default role is
-follower. The following Python example uses the existing application's 1200-baud
-bootloader entry, the existing MCUmgr application upload, and one initial reset.
-It never writes or replaces the bootloader. Use it only after establishing that
-this particular board lacks the OTA receiver.
-
-```python
-from pathlib import Path
-import sys
-sys.path.insert(0, "owntech/tools")
-from lead_update import USBConnection
-from smp_transport import ReceiverProbeTimeout
-from ota_artifact import inspect_image
-
-image = Path(".pio/ota-artifacts/OTA_BLINK_A/firmware.mcuboot.bin")
-inspect_image(image.read_bytes(), version="1.0.0")
-link = USBConnection(serial_number="EXACT_FOLLOWER_USB_SERIAL")
-# For an old application with multiple CDC ports, also pass device="COM9"
-# (its identified console port). A single-interface board needs no port hint.
-try:
-    try:
-        smp = link.connect()  # bounded probe of this physical board only
-    except ReceiverProbeTimeout:
-        # Receiver absence was established by the operator before this script.
-        smp = link.bootstrap(image, Path("owntech/third_party/mcumgr.exe"))
-    info = smp.request("info")
-    if info["version"] not in ("1.0.0", "1.0.0+0"):
-        raise RuntimeError("An existing compatible receiver is running another version; no blind reinstall")
-    if info["role"] != "follower":
-        smp.request("set_role", {"role": "follower"})
-    print(smp.request("info"))  # record EUI-64, version A, and follower role
-finally:
-    if link.transport:
-        link.transport.close()
-```
-
-On Linux/macOS, use the corresponding existing `mcumgr` / `mcumgr-mac` executable
-path. An occupied port or incompatible framed reply fails without bootstrap.
-Repeat for the second follower and retain both EUI-64s. To start the Lead on A
-too, use the same initial application provisioning procedure on its exact USB
-serial; leaving it in the default follower role is intentional. Then run the B
-`lead_update` task with USB connected to that Lead and all three expected EUI-64s.
-The task persists the Lead role, verifies the complete inventory, stages B and
-updates all three boards. Initial application resets occur before this campaign.
-
-CAN startup health has a 15-second bound. Before the first A receiver boots,
-the bus must have an active ACK-capable CAN peer: an existing CAN/OTA application
-or a bench adapter. Connected boards running old USB-only applications are not
-sufficient. If health fails or the image remains unconfirmed, stop and correct
-the bench/provisioning setup; inspect status before any reset, because an
-unconfirmed image may roll back and require existing-bootloader recovery.
-Verify each board with
-`python owntech/tools/lead_update.py --status --serial EXACT_BOARD_USB_SERIAL`:
-the application must report available with its active image confirmed; checking
-only the A version and role is insufficient. Do not reset any board once USB
-staging or the campaign has begun.
+The prototype assumes no unexpected reset or power interruption between staging
+and the final campaign reboot. The padded artifact already contains activation
+magic. Aborting retains maintenance and stops automatic progression, but does
+not disarm that trailer or cancel a reset already scheduled. Do not reset a board
+once staging has started. Installed bootloader signature acceptance, rollback
+behavior and useful capacity still require hardware qualification.
 
 ## Artifact and limits
 
-The inspector uses the Python standard library:
-
-Ordinary builds also run this check immediately after the existing signer and
+The inspector uses the Python standard library. `OTA` and `USB_LEAD` builds
+run this check immediately after the existing signer and
 write the adjacent `.json` manifest. Invalid padding/structure or useful content
 over the separate capacity limit fails the build before upload.
 The same verified binary and manifest are also saved in
-`.pio/ota-artifacts/<environment>/`. Use this stable snapshot for initial A
-provisioning: a first build of another environment can cause PlatformIO to remove
+`.pio/ota-artifacts/<environment>/`. Use this stable snapshot when retaining a
+firmware build: a first build of another environment can cause PlatformIO to remove
 `.pio/build`, while the snapshot directory remains intact.
 
+For standalone structural inspection:
+
 ```sh
-python owntech/scripts/ota_artifact.py inspect .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin --output firmware.mcuboot.json
+python owntech/scripts/ota_artifact.py inspect .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin
 ```
+
+Retain the build-generated adjacent manifest for deployment. Structural inspection
+alone cannot reconstruct the application's compiled source fingerprint.
 
 It validates MCUboot header, TLV bounds, SHA256 TLV, signature/key TLV structure,
 the erased padding and the exact terminal activation magic produced by the
@@ -183,7 +184,7 @@ The standalone client requires Python 3 and `pyserial`; PlatformIO's Python
 already supplies it. CBOR and SMP framing need no extra packages.
 
 ```sh
-python owntech/tools/lead_update.py --image .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin --build-id ota-blink-B --serial YOUR_USB_SERIAL_NUMBER --expected-count 3
+python owntech/tools/lead_update.py --image .pio/ota-artifacts/USB_LEAD/firmware.mcuboot.bin --serial YOUR_USB_SERIAL_NUMBER --expected-count 3
 python owntech/tools/lead_update.py --status --serial YOUR_USB_SERIAL_NUMBER
 python owntech/tools/lead_update.py --reconcile-journal ota-journals/campaign-ID.jsonl
 python owntech/tools/lead_update.py --abort-journal ota-journals/campaign-ID.jsonl
@@ -205,9 +206,9 @@ image writes are never resumed after a reset. An aborted or failed campaign
 keeps maintenance/diagnostics; follow the board's recovery procedure before
 attempting a new erase.
 
-For direct invocation, supply the build ID compiled into the application (the
-example uses `ota-blink-B`). When an adjacent build manifest already exists, the
-client verifies it against the image and reuses its build metadata. A mismatched
+For direct invocation, retain the adjacent manifest generated by the build.
+The client verifies it against the image and reuses its automatic build identity;
+no manual `--build-id` is needed in this normal workflow. A mismatched
 existing manifest is rejected without overwriting it; rebuild or regenerate it
 explicitly. Status and recovery do not read or rewrite the image/manifest:
 recovery uses the frozen metadata embedded in the journal and appends results.
@@ -284,4 +285,5 @@ Host tests cover artifact domains/capacities/corruption, CBOR/framing, sequencin
 inventory mismatch, pagination, writer completion before commit, partial
 postboot results and strict USB selection. They do not qualify CAN throughput,
 flash timing, installed bootloader behavior, USB re-enumeration or electrical
-safety. The one-Lead/two-follower blink A → B bench test remains necessary.
+safety. A physical test must demonstrate an application change on one Lead and
+at least two followers, then another campaign using the retained service.

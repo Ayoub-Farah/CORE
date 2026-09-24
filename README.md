@@ -2,9 +2,24 @@
 
 This is the OwnTech Power API Core repository.
 
-The experimental collective CAN updater is available through the `USB_LEAD`
-environment and the `lead_update` Project Task. See the [operator guide](docs/ota-client.md)
-and [implementation and validation notes](docs/ota-implementation.md).
+The experimental OTA environments build your current `src/main.cpp` with the
+USB/CAN update service:
+
+```sh
+pio run -e OTA -t upload                 # Install the application on one board
+pio run -e USB_LEAD -t lead_update       # Build and update the selected CAN fleet
+```
+
+Install OTA support on each board once, then use `USB_LEAD` for subsequent
+application updates. The same compatible firmware runs on the Lead and its
+participants; the Lead role is selected at runtime. Build identity is generated
+automatically from source and configuration changes. The ordinary `USB` and
+`STLink` workflows remain available.
+
+Select the USB board and expected fleet, and adapt the application's maintenance
+and health callbacks before using power-control code. See the
+[operator guide](docs/ota-client.md) and
+[implementation and validation notes](docs/ota-implementation.md).
 
 The Power API is designed to be used with VS Code and PlatformIO.
 [Installing VS Code with PlatformIO](https://platformio.org/install/ide?install=vscode).

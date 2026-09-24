@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [USB, CAN_BASELINE, USB_LEAD, OTA_BLINK_A, OTA_BLINK_B]
+        environment: [USB, OTA, USB_LEAD]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -264,6 +264,16 @@ remains unconfirmed and in `FAILED`; the new standalone build has not yet been
 validated on that physical board. No forced image confirmation was sent.
 Logs: `.pio/ota-standalone-upload.log` and `.pio/ota-standalone-window1.log`.
 
+A second board, starting from a confirmed USB application, subsequently received
+all 227328 bytes of the standalone build in 16 seconds. After reboot, the USB
+client verified the exact build/hash, `local_healthy: true`,
+`active_confirmed: true`, `slot_available: true`, `error: 0` and `WAITING_CAN`
+while that board was alone on CAN. A second invocation returned
+`ALREADY_INITIALIZED` without upload or reset. This validates standalone USB
+initialization on hardware; CAN joining and recovery of the first board remain
+separate checks. Logs: `.pio/ota-second-board-boot-upload.log` and
+`.pio/ota-second-board-recheck.log`.
+
 | Environment | Linker flash | Linker RAM | Signed useful bytes | Transmitted bytes |
 |---|---:|---:|---:|---:|
 | USB | 96872 | 31616 | 97208 | 227328 |

@@ -15,12 +15,12 @@ from smp_transport import CommandError, ProtocolError, SerialSMP, TransportError
 from bootloader_upload import upload_image, UploadError
 
 
-def verify_inputs(config_path, image_path, manifest_path, target_identity):
+def verify_inputs(config_path, image_path, manifest_path, target_identity, *, staged_lead_only=False):
     config_path = Path(config_path)
     config_bytes = config_path.read_bytes()
     config = json.loads(config_bytes, object_pairs_hook=_object)
     require(isinstance(config, dict) and isinstance(config.get("journal_path"), str), "invalid recovery configuration")
-    expected = recovery_config(config["journal_path"])
+    expected = recovery_config(config["journal_path"], staged_lead_only=staged_lead_only)
     header = render_header(expected)
     expected["header_sha256"] = hashlib.sha256(header).hexdigest()
     require(config == expected, "recovery configuration no longer matches its source journal and guards")
@@ -28,6 +28,8 @@ def verify_inputs(config_path, image_path, manifest_path, target_identity):
     target_identity = identity(target_identity)
     target = next((row for row in config["targets"] if row["identity"] == target_identity), None)
     require(target is not None, "requested identity is outside the frozen recovery roster")
+    if staged_lead_only:
+        require(target_identity in config["repair_targets"], "staged-lead-only forbids recovery of a follower")
     manifest = json.loads(Path(manifest_path).read_bytes(), object_pairs_hook=_object)
     require(isinstance(manifest, dict) and isinstance(manifest.get("profile"), dict), "invalid recovery image manifest")
     version = "0.0.1+0"
@@ -88,13 +90,14 @@ def verify_slots(state, original_hash, secondary_hash=None, primary=None, *, sec
 
 
 def recover(config_path, image_path, manifest_path, serial_number, target_identity, *, port=None,
-            apply=False, after_revert=False, mcumgr=None, log_path=None, timeout=10, enumerate_ports=None,
+            apply=False, after_revert=False, staged_lead_only=False, mcumgr=None, log_path=None, timeout=10, enumerate_ports=None,
             transport_factory=None, uploader=None):
     require(isinstance(serial_number, str) and serial_number, "an explicit stable USB serial is required")
     require(type(after_revert) is bool, "after-revert must be an explicit boolean mode")
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
             and math.isfinite(timeout) and 0 < timeout <= 60, "SMP timeout must be within 0..60 seconds")
-    config, target, image, data, config_hash = verify_inputs(config_path, image_path, manifest_path, target_identity)
+    config, target, image, data, config_hash = verify_inputs(config_path, image_path, manifest_path, target_identity,
+                                                          staged_lead_only=staged_lead_only)
     if apply:
         require(mcumgr is not None and Path(mcumgr).is_file(), "apply requires the existing mcumgr executable")
     if enumerate_ports is None:
@@ -117,6 +120,7 @@ def recover(config_path, image_path, manifest_path, serial_number, target_identi
     transport = None
     try:
         journal.emit("RECOVERY_INPUT", target_identity, apply=apply, after_revert=after_revert,
+                     staged_lead_only=staged_lead_only,
                      usb_serial=serial_number, port=device,
                      config_sha256=config_hash, source_journal_sha256=config["journal_sha256"],
                      original_active_hash=target["original_active_hash"],
@@ -199,6 +203,8 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=10)
     parser.add_argument("--after-revert", action="store_true",
                         help="inspect a completed revert: require the exact initial secondary to be nonpending; never initiate a revert")
+    parser.add_argument("--staged-lead-only", action="store_true",
+                        help="require the explicit staged-Lead configuration; followers are forbidden")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--inspect", action="store_true", help="read-only slot inspection (default)")
     mode.add_argument("--apply", action="store_true", help="erase only the proven secondary, upload recovery and reset once")
@@ -206,6 +212,7 @@ def main(argv=None):
     try:
         result = recover(args.config, args.image, args.manifest, args.serial, args.identity,
                          port=args.port, apply=args.apply, after_revert=args.after_revert,
+                         staged_lead_only=args.staged_lead_only,
                          mcumgr=args.mcumgr, log_path=args.log, timeout=args.timeout)
     except (OSError, ValueError, CampaignError, UploadError) as error:
         print("Recovery stopped: %s" % error, file=sys.stderr)

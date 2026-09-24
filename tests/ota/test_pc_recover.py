@@ -19,7 +19,7 @@ from smp_transport import CommandError, TransportError
 from bootloader_upload import UploadError
 from ota_artifact import inspect_image
 from test_pc_artifact import artifact
-from test_pc_recovery_config import records, IDS
+from test_pc_recovery_config import records, staged_records, IDS
 
 
 def slot(number, image_hash, *, active=False, confirmed=False, pending=False, version="1.0.0"):
@@ -320,6 +320,51 @@ class RecoveryUploadTests(unittest.TestCase):
             self.run_recovery(apply=True)
         self.enumerate.assert_not_called()
 
+    def staged_config(self):
+        events = staged_records()
+        events[2]["manifest"]["signature"] = {"key_sha256": "00" * 32}
+        events[3]["manifest"] = copy.deepcopy(events[2]["manifest"])
+        self.journal.write_text("".join(json.dumps(event) + "\n" for event in events))
+        config = generate(self.journal, self.config.parent, staged_lead_only=True)
+        self.manifest_value = inspect_image(self.image.read_bytes(), version="0.0.1+0",
+                                           build_id="recovery-" + config["header_sha256"][:20])
+        self.manifest.write_text(json.dumps(self.manifest_value))
+
+    def test_staged_lead_config_requires_mode_and_rejects_follower_before_usb(self):
+        self.staged_config()
+        with self.assertRaises(ValueError):
+            self.run_recovery(apply=True)
+        with self.assertRaisesRegex(ValueError, "forbids recovery of a follower"):
+            recover(self.config, self.image, self.manifest, "selected", IDS[1],
+                    staged_lead_only=True, apply=True, mcumgr=self.mcumgr,
+                    enumerate_ports=self.enumerate, transport_factory=self.factory, uploader=self.upload)
+        self.enumerate.assert_not_called()
+        self.factory.assert_not_called()
+        self.upload.assert_not_called()
+
+    def test_staged_lead_after_revert_apply_keeps_exact_slot_guards(self):
+        self.staged_config()
+        self.device.images[1]["pending"] = False
+        with self.assertRaisesRegex(ValueError, "exact pending"):
+            self.run_recovery(staged_lead_only=True, apply=True)
+        self.assertEqual(self.mutations(), [])
+        self.upload.assert_not_called()
+        self.assertEqual(self.run_recovery(staged_lead_only=True, after_revert=True, apply=True)["result"],
+                         "RESET_REQUESTED")
+        self.assertEqual(self.mutations(), [(2, 1, 5, {"slot": 1}), (2, 0, 5, {})])
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertTrue(next(event for event in reversed(events) if event["event"] == "RECOVERY_INPUT")["staged_lead_only"])
+
+    def test_staged_repair_target_and_guards_cannot_be_widened(self):
+        self.staged_config()
+        original = self.config.read_bytes()
+        config = json.loads(original)
+        config["repair_targets"].append(IDS[1])
+        self.config.write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "no longer matches"):
+            self.run_recovery(staged_lead_only=True, apply=True)
+        self.enumerate.assert_not_called()
+
     def test_cli_defaults_to_inspect_and_requires_explicit_identity_and_serial(self):
         args = ["--config", str(self.config), "--image", str(self.image), "--manifest", str(self.manifest),
                 "--serial", "selected", "--identity", IDS[0]]
@@ -327,9 +372,14 @@ class RecoveryUploadTests(unittest.TestCase):
             self.assertEqual(main(args), 0)
         self.assertIs(run.call_args.kwargs["apply"], False)
         self.assertIs(run.call_args.kwargs["after_revert"], False)
+        self.assertIs(run.call_args.kwargs["staged_lead_only"], False)
         with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
             self.assertEqual(main(args + ["--after-revert"]), 0)
         self.assertIs(run.call_args.kwargs["apply"], False)
+        self.assertIs(run.call_args.kwargs["after_revert"], True)
+        with patch("recover_ota.recover", return_value={"result": "INSPECTED"}) as run, redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args + ["--staged-lead-only", "--after-revert"]), 0)
+        self.assertIs(run.call_args.kwargs["staged_lead_only"], True)
         self.assertIs(run.call_args.kwargs["after_revert"], True)
 
 

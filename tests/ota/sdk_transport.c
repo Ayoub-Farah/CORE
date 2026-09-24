@@ -29,6 +29,8 @@ static void setup(void)
     k_sem_init(&instance.client_tx.sem,1,1);k_sem_init(&instance.server_tx.sem,1,1);
     k_sem_init(&instance.request_response.sem,1,1);k_sem_init(&instance.report_tx_sem,0,1);
     k_timer_init(&instance.request_response.timer,thingset_can_reqresp_timeout_handler,NULL);
+    k_timer_init(&thingset_can_report_expiry_timer,thingset_can_report_expiry,NULL);
+    rx_expiry_deadline=0;
     atomic_set(&instance.ready,1);host_shared.lock.count=1;
     host_now=0;host_isr=false;host_can_error=0;host_can_async_error=0;host_can_defer=false;
     host_isotp_error=0;host_isotp_defer=false;host_frame_count=0;
@@ -139,7 +141,7 @@ static void test_reports(void)
     setup();fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
     fragment(3,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
     fragment(4,0,THINGSET_CAN_MF_TYPE_SINGLE,0,8,1);assert(reports==0);
-    host_now=51;thingset_can_report_expiry(NULL);
+    host_advance_timer(&thingset_can_report_expiry_timer,51);
     assert(instance.report_rx_expired==2);
     fragment(4,0,THINGSET_CAN_MF_TYPE_SINGLE,0,8,1);assert(reports==1);
     fragment(2,0,THINGSET_CAN_MF_TYPE_LAST,1,8,1);assert(reports==1);
@@ -151,6 +153,76 @@ static void test_reports(void)
     assert(thingset_can_set_report_rx_callback_inst(&instance,report)==0);
     assert(thingset_can_set_report_rx_callback_inst(&instance,report)==0);
     assert(host_filter_count==1);
+}
+static void test_report_timer_lifecycle(void)
+{
+    struct k_timer *timer=&thingset_can_report_expiry_timer;
+    setup();assert(!timer->active);
+    host_advance_timer(timer,1000);assert(timer->fires==0&&timer->starts==0);
+    fragment(2,0,THINGSET_CAN_MF_TYPE_SINGLE,0,8,1);
+    assert(reports==1&&!timer->active&&timer->starts==0);
+
+    /* Earliest of independently arriving reports expires, then the next one.
+     * A later arrival must not postpone the earlier deadline. */
+    setup();fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    assert(timer->active&&timer->period==0&&timer->deadline==50);
+    host_advance_timer(timer,20);
+    fragment(3,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,2);
+    assert(timer->deadline==50&&timer->starts==1);
+    host_advance_timer(timer,49);assert(instance.report_rx_expired==0);
+    host_advance_timer(timer,50);
+    assert(instance.report_rx_expired==1&&timer->active&&timer->deadline==70);
+    host_advance_timer(timer,70);
+    assert(instance.report_rx_expired==2&&!timer->active&&rx_expiry_deadline==0);
+    unsigned fires=timer->fires;
+    host_advance_timer(timer,10000);assert(timer->fires==fires);
+
+    /* A continuation extends only its own timeout; the other slot becomes
+     * the earliest. Completing the last report cancels the final timeout. */
+    setup();fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    host_advance_timer(timer,10);fragment(3,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,2);
+    host_advance_timer(timer,20);fragment(2,0,THINGSET_CAN_MF_TYPE_CONSEC,1,8,1);
+    assert(timer->active&&timer->deadline==60);
+    host_advance_timer(timer,60);
+    assert(instance.report_rx_expired==1&&timer->active&&timer->deadline==70);
+    host_advance_timer(timer,69);fragment(2,0,THINGSET_CAN_MF_TYPE_LAST,2,8,1);
+    assert(reports==1&&!timer->active&&rx_expiry_deadline==0);
+    fires=timer->fires;host_advance_timer(timer,10000);assert(timer->fires==fires);
+
+    /* Reset-by-FIRST refreshes a stalled report. Out-of-order and overflow
+     * discard the last incomplete slot and must also restore idle. */
+    setup();fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    host_advance_timer(timer,40);fragment(2,1,THINGSET_CAN_MF_TYPE_FIRST,0,8,2);
+    assert(timer->deadline==90);
+    host_advance_timer(timer,50);assert(instance.report_rx_expired==0);
+    fragment(2,1,THINGSET_CAN_MF_TYPE_LAST,2,8,2);
+    assert(!timer->active&&rx_expiry_deadline==0&&instance.report_rx_dropped==1);
+    fragment(2,2,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    assert(timer->active);
+    for(unsigned i=1;i<65;i++)
+        fragment(2,2,THINGSET_CAN_MF_TYPE_CONSEC,i&15,8,1);
+    assert(instance.report_rx_overflow==1&&!timer->active&&rx_expiry_deadline==0);
+    fires=timer->fires;host_advance_timer(timer,10000);assert(timer->fires==fires);
+
+    /* RX can observe an elapsed deadline before the timer interrupt runs.
+     * Dropping that late continuation must cancel the stale pending timer. */
+    setup();fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    host_now=50;fragment(2,0,THINGSET_CAN_MF_TYPE_LAST,1,8,1);
+    assert(instance.report_rx_expired==1&&instance.report_rx_dropped==1);
+    assert(!timer->active&&rx_expiry_deadline==0);
+    host_advance_timer(timer,10000);assert(timer->fires==0);
+
+    /* Shared timer remains armed for another CAN instance's pending report. */
+    setup();struct thingset_can other={0};other.dev=&dev;other.node_addr=1;
+    fragment(2,0,THINGSET_CAN_MF_TYPE_FIRST,0,8,1);
+    host_advance_timer(timer,10);
+    struct can_frame frame={.id=THINGSET_CAN_PRIO_REPORT_LOW|THINGSET_CAN_TYPE_MF_REPORT
+        |THINGSET_CAN_MF_TYPE_FIRST|3,.dlc=8,.flags=CAN_FRAME_IDE};
+    thingset_can_report_rx_cb(&dev,&frame,&other);
+    fragment(2,0,THINGSET_CAN_MF_TYPE_LAST,1,8,1);
+    assert(timer->active&&timer->deadline==60);
+    host_advance_timer(timer,60);
+    assert(instance.report_rx_expired==0&&other.report_rx_expired==1&&!timer->active);
 }
 static void test_sender_and_discovery(void)
 {
@@ -197,7 +269,7 @@ static void test_sender_and_discovery(void)
 }
 int main(void)
 {
-    test_client();test_server_ownership();test_reports();test_sender_and_discovery();
+    test_client();test_server_ownership();test_reports();test_report_timer_lifecycle();test_sender_and_discovery();
     puts("ThingSet public transport: client lifecycle, RX, raw sender and discovery OK");
     return 0;
 }

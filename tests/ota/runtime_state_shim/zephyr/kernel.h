@@ -15,6 +15,7 @@ struct k_mutex {};
 struct k_spinlock {};
 struct k_sem {unsigned count, maximum;};
 struct k_msgq {size_t item_size,capacity,head,count;uint8_t bytes[16384];};
+void runtime_test_msgq_wait(k_msgq *,int);
 #define K_MUTEX_DEFINE(name) struct k_mutex name
 #define K_SEM_DEFINE(name, initial, maximum) struct k_sem name={initial,maximum}
 #define K_MSGQ_DEFINE(name, size, count, alignment) struct k_msgq name={size,count,0,0,{0}}
@@ -31,7 +32,8 @@ inline int k_msgq_put(k_msgq *q,const void *p,int){
     if(q->count==q->capacity)return -1;
     memcpy(q->bytes+((q->head+q->count)%q->capacity)*q->item_size,p,q->item_size);++q->count;return 0;
 }
-inline int k_msgq_get(k_msgq *q,void *p,int){
+inline int k_msgq_get(k_msgq *q,void *p,int timeout){
+    runtime_test_msgq_wait(q,timeout);
     if(!q->count)return -1;
     memcpy(p,q->bytes+q->head*q->item_size,q->item_size);q->head=(q->head+1)%q->capacity;--q->count;return 0;
 }

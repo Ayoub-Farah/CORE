@@ -1,5 +1,6 @@
 /* Real runtime worker/API with deterministic queues and fake Zephyr boundaries.
- * Worker entry is exercised through initialize_runtime/process/reconcile_step.
+ * Worker entry is exercised through initialize_runtime/worker_iteration and
+ * focused process/reconcile_step calls for the protocol race regressions.
  * Portable participant/coordinator/protocol sources are linked unchanged. */
 #include "ota_runtime.cpp"
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (0)
@@ -22,6 +23,10 @@ static ota_observation fake_peers[2];
 static bool fake_peer_present[2]={true,true};
 static uint32_t fake_offset;
 static uint8_t fake_lead[8];
+static unsigned fake_identity_reads,fake_receive_calls;
+static int fake_receive_timeout;
+static void (*fake_wait_event)();
+static int fake_event_result;
 static void pump();
 static int local_flush(void *);
 extern "C" int strncmp(const char *a,const char *b,size_t n){
@@ -30,6 +35,15 @@ extern "C" int strncmp(const char *a,const char *b,size_t n){
 
 int64_t k_uptime_get(){return (int64_t)fake_now;}
 void k_sleep(int ms){fake_now+=ms;}
+void runtime_test_msgq_wait(k_msgq *q,int timeout){
+    ++fake_receive_calls;fake_receive_timeout=timeout;
+    if(!q->count && timeout!=K_NO_WAIT){
+        /* Inject an API producer exactly between wait selection and dequeue.
+         * An empty forever wait otherwise represents a suspended worker. */
+        if(fake_wait_event){auto event=fake_wait_event;fake_wait_event=nullptr;event();}
+        else if(timeout>0)fake_now+=(unsigned)timeout;
+    }
+}
 int k_sem_take(k_sem *s,int){if(!s->count)pump();if(!s->count)return -1;--s->count;return 0;}
 thingset_can_context *thingset_can_get_inst(){return &fake_can;}
 bool boot_is_img_confirmed(){return fake_confirmed;}
@@ -66,6 +80,7 @@ void ota_storage_set_events(uint32_t mask,const uint32_t times[12],const uint8_t
     fake_journal.event_mask=mask;memcpy(fake_journal.event_ms,times,48);memcpy(fake_journal.event_order,order,12);
 }
 void ota_storage_boot_identity(ota_identity *id){
+    ++fake_identity_reads;
     id->protocol_version=1;id->usable_slot_size=768;id->usable_image_size=600;
     id->hardware_id=1;id->layout_id=2;id->bootloader_id=3;
     id->active_confirmed=fake_confirmed;id->slot_available=fake_owner==OTA_SLOT_NONE&&!fake_recovery;
@@ -144,7 +159,7 @@ static ota_manifest make_manifest(){
     memcpy(m.build_id,OWNTECH_FIRMWARE_BUILD_ID,sizeof(OWNTECH_FIRMWARE_BUILD_ID));return m;
 }
 static void reset_runtime(){
-    losses=initialized=busy=healthy=lead_role=identity_conflict=discovery_requested=stage_end_requested=usb_pending=reconcile_mode=release_pending=0;
+    losses=initialized=busy=healthy=lead_role=identity_conflict=discovery_requested=stage_end_requested=usb_pending=reconcile_mode=release_pending=refresh_pending=0;
     participant={};coordinator={};staged_manifest={};local_snapshot={};runtime_snapshot={};
     memset(inventory,0,sizeof(inventory));memset(frozen,0,sizeof(frozen));inventory_count=frozen_count=0;
     discovery_active=discovery_done=staged=staging=verifying=reconcile_active=false;
@@ -154,6 +169,7 @@ static void reset_runtime(){
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
     accepted_start={};accepted_reconcile={};accepted_prepare_campaign=next_stream_poll=stream_poll_target=0;
     ota_queue.head=ota_queue.count=0;k_sem_reset(&usb_done);fake_now=0;fake_can.ready=1;fake_can.node_addr=1;
+    fake_identity_reads=fake_receive_calls=0;fake_receive_timeout=K_NO_WAIT;fake_wait_event=nullptr;fake_event_result=0;
 }
 static void reset_all(){
     reset_runtime();fake_confirmed=true;fake_inhibited=true;fake_role=fake_recovery=fake_maintenance=false;
@@ -177,7 +193,9 @@ static const uint8_t ids[3][8]={{0,0,0,0,0,0,0,1},{0,0,0,0,0,0,0,2},{0,0,0,0,0,0
 static int nominal_test(){
     reset_all();initialize_runtime();CHECK(ota_service_healthy()&&!fake_inhibited);
     CHECK(!ota_service_set_role(true));discover_all();CHECK(discovery_done&&inventory_count==3);
-    ota_manifest m=make_manifest();CHECK(!ota_service_stage_begin(&m));pump();CHECK(staging&&stage_state==OTA_READY);
+    ota_manifest m=make_manifest();CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY);
+    unsigned idle_reads=fake_identity_reads;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads&&ota_service_busy());
     uint8_t data[256]={};for(uint32_t pos=0;pos<768;pos+=256)CHECK(!ota_service_stage_data(pos,data,256));
     CHECK(!ota_service_stage_end());pump();CHECK(staged&&fake_prepares==1&&fake_flushes==1);
     CHECK(event_order[OTA_EVENT_ERASE_BEGIN]<event_order[OTA_EVENT_ERASE_END]);
@@ -186,13 +204,14 @@ static int nominal_test(){
     CHECK(event_order[OTA_EVENT_VERIFY_BEGIN]<event_order[OTA_EVENT_VERIFY_END]);
     CHECK(!ota_service_start(42,ids,3));
     CHECK(ota_service_start(42,ids,3)>=0); /* Retry before first worker execution. */
-    pump();if(k_msgq_num_used_get(&ota_queue))pump();CHECK(!service_error);
+    worker_iteration();CHECK(!service_error);
     for(unsigned i=0;i<500&&coordinator.phase!=OTA_COORD_VALIDATE_BARRIER;i++){
-        ++fake_now;CHECK(ota_coordinator_step(&coordinator,fake_now)==OTA_AGAIN);publish();
+        worker_iteration();CHECK(fake_receive_timeout==K_MSEC(5)&&!service_error);
     }
     CHECK(coordinator.phase==OTA_COORD_VALIDATE_BARRIER&&fake_fleet_count==3&&!fake_reboots);
-    CHECK(!ota_service_commit(42));pump();
-    for(unsigned i=0;i<100&&!fake_reboots;i++){++fake_now;CHECK(ota_coordinator_step(&coordinator,fake_now)==OTA_AGAIN);publish();}
+    worker_iteration();CHECK(fake_receive_timeout==K_MSEC(5)); /* Commit barrier still has a campaign deadline. */
+    CHECK(!ota_service_commit(42));worker_iteration();
+    for(unsigned i=0;i<100&&!fake_reboots;i++){worker_iteration();CHECK(!service_error);}
     CHECK(fake_reboots==1&&fake_journal.state==OTA_REBOOTING);
     uint8_t reboot_order=fake_journal.event_order[OTA_EVENT_REBOOTING];CHECK(reboot_order>0);
     int abort_rc=ota_service_abort(42);
@@ -201,15 +220,18 @@ static int nominal_test(){
     /* Preserve journal/frozen roster, clear all application RAM as at reset. */
     reset_runtime();restore_boot_storage();initialize_runtime();
     CHECK(ota_service_healthy()&&ota_storage_recovery_required()&&fake_inhibited);
+    idle_reads=fake_identity_reads;worker_iteration();CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads);
     CHECK(event_order[OTA_EVENT_REBOOTING]==reboot_order&&event_order[OTA_EVENT_POSTBOOT_CHECK]>reboot_order);
     for(unsigned i=0;i<2;i++){fake_peers[i].status.state=OTA_RECOVERY_REQUIRED;fake_peers[i].status.error=0;}
-    CHECK(!ota_service_reconcile(42,ids,3,m.mcuboot_image_hash));pump();
-    for(unsigned i=0;i<300&&discovery_active;i++){fake_now+=5;discovery_step();publish();}
-    CHECK(frozen_count==3&&reconcile_active);reconcile_step();publish();
+    CHECK(!ota_service_reconcile(42,ids,3,m.mcuboot_image_hash));worker_iteration();
+    for(unsigned i=0;i<300&&discovery_active;i++){worker_iteration();CHECK(fake_receive_timeout==K_MSEC(5));}
+    CHECK(frozen_count==3&&reconcile_active);worker_iteration();
     CHECK(fake_release_requests==2&&ota_service_busy()); /* Acceptance is not success. */
-    reconcile_step();publish();CHECK(!ota_service_busy()&&!fake_inhibited&&participant.status.state==OTA_SUCCEEDED);
+    worker_iteration();CHECK(!ota_service_busy()&&!fake_inhibited&&participant.status.state==OTA_SUCCEEDED);
     CHECK(coordinator.phase==OTA_COORD_IDLE);
-    discover_all();++m.campaign_id;CHECK(!ota_service_stage_begin(&m));pump();CHECK(staging&&stage_state==OTA_READY&&fake_prepares==2);
+    CHECK(!strncmp(ota_service_phase(),"SUCCESS",8));idle_reads=fake_identity_reads;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==idle_reads&&fake_release_requests==2);
+    discover_all();++m.campaign_id;CHECK(!ota_service_stage_begin(&m));worker_iteration();CHECK(staging&&stage_state==OTA_READY&&fake_prepares==2);
     return 0;
 }
 static int bootstrap_test(){
@@ -272,7 +294,10 @@ static int reconcile_failure_test(){
     rc=prepare_reconcile();if(rc)return rc;
     fake_peers[1].status.error=OTA_ERR_HEALTH;reconcile_step();publish();
     CHECK(!fake_release_requests&&fake_inhibited&&ota_service_busy());
-    fake_now=reconcile_deadline+1;reconcile_step();CHECK(!reconcile_active&&service_error==OTA_ERR_TIMEOUT);
+    fake_now=reconcile_deadline+1;worker_iteration();CHECK(!reconcile_active&&service_error==OTA_ERR_TIMEOUT);
+    CHECK(fake_receive_timeout==K_MSEC(5)&&!strncmp(ota_service_phase(),"PARTIAL",8));
+    unsigned reads=fake_identity_reads;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads&&fake_inhibited);
     rc=prepare_reconcile();if(rc)return rc;
     memset(fake_peers[1].active_build_id,0,32);memcpy(fake_peers[1].active_build_id,"wrong-build",12);
     reconcile_step();CHECK(!fake_release_requests&&fake_inhibited);
@@ -315,8 +340,56 @@ static int stale_queue_after_release_test(){
     pump();CHECK(staging&&stage_state==OTA_READY&&fake_journal.campaign_id==43&&fake_prepares==1);
     CHECK(!service_error&&fake_owner==OTA_SLOT_USB&&ota_service_busy());return 0;
 }
+static int idle_worker_test(){
+    reset_all();initialize_runtime();unsigned reads=fake_identity_reads;
+    fake_now=100000;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads&&!ota_service_busy());
+    CHECK(!ota_service_set_role(true)&&ota_service_is_lead());
+    /* Discovery arrives after the worker chose an indefinite wait. */
+    fake_wait_event=[](){fake_event_result=ota_service_discover();};worker_iteration();
+    CHECK(!fake_event_result&&fake_receive_timeout==K_FOREVER&&discovery_active&&probe_address==2);
+    for(unsigned i=0;i<300&&discovery_active;i++)worker_iteration();
+    CHECK(discovery_done&&inventory_count==3&&!strncmp(ota_service_phase(),"IDLE",5));
+    reads=fake_identity_reads;worker_iteration();CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads);
+    /* A changed local claim wakes and coalesces, refreshing both local and
+     * inventory snapshots. An unchanged claim creates no periodic work. */
+    fake_can.node_addr=10;ota_runtime_claim(eui64,10);ota_runtime_claim(eui64,10);
+    CHECK(k_msgq_num_used_get(&ota_queue)==1);worker_iteration();
+    ota_observation local{};ota_service_local(&local);CHECK(local.identity.address==10);
+    bool lead=false;uint64_t last=0;CHECK(!ota_service_target(0,&local,&lead,&last)&&lead&&local.identity.address==10);
+    ota_runtime_claim(eui64,10);CHECK(!k_msgq_num_used_get(&ota_queue));
+    /* If refresh cannot fit, existing work still publishes the new address. */
+    Work refresh{};refresh.type=REFRESH;
+    for(unsigned i=0;i<CONFIG_OWNTECH_OTA_QUEUE_DEPTH;i++)CHECK(!enqueue(refresh));
+    fake_can.node_addr=11;ota_runtime_claim(eui64,11);CHECK(!atomic_get(&refresh_pending));
+    worker_iteration();ota_service_local(&local);CHECK(local.identity.address==11);
+    while(k_msgq_num_used_get(&ota_queue))worker_iteration();
+    reads=fake_identity_reads;worker_iteration();CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads);
+    return 0;
+}
+static int participant_worker_wake_test(){
+    reset_all();initialize_runtime();ota_runtime_claim(ids[1],2);
+    /* Remote PREPARE is admitted while the idle queue receive is blocked. */
+    fake_wait_event=[](){
+        ota_command cmd{};cmd.type=OTA_CMD_PREPARE;cmd.manifest=make_manifest();
+        memcpy(cmd.lead_eui,ids[1],8);cmd.lead_address=2;fake_event_result=ota_runtime_command(&cmd,2);
+    };
+    worker_iteration();CHECK(!fake_event_result&&fake_receive_timeout==K_FOREVER);
+    CHECK(ota_service_busy()&&participant.status.state==OTA_READY&&fake_prepares==1);
+    unsigned reads=fake_identity_reads;worker_iteration();CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads);
+    fake_wait_event=[](){
+        ota_command cmd{};cmd.type=OTA_CMD_BEGIN_PASS;cmd.manifest=make_manifest();cmd.pass_id=1;
+        memcpy(cmd.lead_eui,ids[1],8);cmd.lead_address=2;fake_event_result=ota_runtime_command(&cmd,2);
+    };
+    worker_iteration();CHECK(!fake_event_result&&participant.status.state==OTA_PASS_OPEN);
+    CHECK(fake_receive_timeout==K_FOREVER);reads=fake_identity_reads;worker_iteration();
+    CHECK(fake_receive_timeout==K_FOREVER&&fake_identity_reads==reads);
+    return 0;
+}
 extern "C" int ota_runtime_state_test_run(){
-    int rc=bootstrap_test();if(rc)return rc;
+    int rc=idle_worker_test();if(rc)return rc;
+    rc=participant_worker_wake_test();if(rc)return rc;
+    rc=bootstrap_test();if(rc)return rc;
     rc=nominal_test();if(rc)return rc;rc=reconcile_roster_test();if(rc)return rc;
     rc=queued_prepare_test();if(rc)return rc;rc=persisted_lead_participant_test();if(rc)return rc;
     rc=reconcile_failure_test();if(rc)return rc;rc=release_source_test();if(rc)return rc;

@@ -70,6 +70,34 @@ struct thingset_can_rx_context
 
 static struct thingset_can_rx_context rx_slots[CONFIG_THINGSET_CAN_REPORT_RX_NUM_BUFFERS];
 static struct k_spinlock rx_slots_lock;
+static int64_t rx_expiry_deadline;
+static void thingset_can_report_expiry(struct k_timer *timer);
+K_TIMER_DEFINE(thingset_can_report_expiry_timer, thingset_can_report_expiry, NULL);
+
+/* Caller holds rx_slots_lock. No periodic timer runs when the pool is idle.
+ * Completed slots stay owned by the application callback but need no timeout.
+ */
+static void thingset_can_schedule_report_expiry_locked(int64_t now)
+{
+    int64_t next = 0;
+    for (size_t i = 0; i < ARRAY_SIZE(rx_slots); i++) {
+        struct thingset_can_rx_context *slot = &rx_slots[i];
+        if (slot->used && !slot->dispatching && (next == 0 || slot->deadline < next)) {
+            next = slot->deadline;
+        }
+    }
+    if (next == rx_expiry_deadline) {
+        return;
+    }
+    rx_expiry_deadline = next;
+    if (next == 0) {
+        k_timer_stop(&thingset_can_report_expiry_timer);
+    }
+    else {
+        k_timer_start(&thingset_can_report_expiry_timer,
+                      K_MSEC(next > now ? next - now : 1), K_NO_WAIT);
+    }
+}
 
 static void thingset_can_expire_reports_locked(int64_t now)
 {
@@ -85,11 +113,12 @@ static void thingset_can_expire_reports_locked(int64_t now)
 static void thingset_can_report_expiry(struct k_timer *timer)
 {
     k_spinlock_key_t key = k_spin_lock(&rx_slots_lock);
-    thingset_can_expire_reports_locked(k_uptime_get());
+    int64_t now = k_uptime_get();
+    rx_expiry_deadline = 0;
+    thingset_can_expire_reports_locked(now);
+    thingset_can_schedule_report_expiry_locked(now);
     k_spin_unlock(&rx_slots_lock, key);
 }
-
-K_TIMER_DEFINE(thingset_can_report_expiry_timer, thingset_can_report_expiry, NULL);
 #endif /* CONFIG_THINGSET_CAN_REPORT_RX */
 
 static void thingset_can_addr_claim_tx_cb(const struct device *dev, int error, void *user_data)
@@ -262,12 +291,14 @@ static void thingset_can_report_rx_cb(const struct device *dev, struct can_frame
             slot->used = false;
         }
         atomic_inc(&ts_can->report_rx_dropped);
+        thingset_can_schedule_report_expiry_locked(now);
         k_spin_unlock(&rx_slots_lock, key);
         return;
     }
     if (length > sizeof(slot->data) - slot->len) {
         slot->used = false;
         atomic_inc(&ts_can->report_rx_overflow);
+        thingset_can_schedule_report_expiry_locked(now);
         k_spin_unlock(&rx_slots_lock, key);
         return;
     }
@@ -276,6 +307,7 @@ static void thingset_can_report_rx_cb(const struct device *dev, struct can_frame
     slot->seq = (sequence + 1) & 0xF;
     slot->deadline = now + CONFIG_THINGSET_CAN_REPORT_RX_TIMEOUT;
     slot->dispatching = last;
+    thingset_can_schedule_report_expiry_locked(now);
     k_spin_unlock(&rx_slots_lock, key);
 
     if (last) {
@@ -805,11 +837,6 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
     ts_can->server_tx.client = false;
     k_sem_init(&ts_can->client_tx.sem, 1, 1);
     k_sem_init(&ts_can->server_tx.sem, 1, 1);
-#ifdef CONFIG_THINGSET_CAN_REPORT_RX
-    k_timer_start(&thingset_can_report_expiry_timer,
-                  K_MSEC(CONFIG_THINGSET_CAN_REPORT_RX_TIMEOUT),
-                  K_MSEC(CONFIG_THINGSET_CAN_REPORT_RX_TIMEOUT));
-#endif
     k_sem_init(&ts_can->report_tx_sem, 0, 1);
     k_timer_init(&ts_can->timeout_timer, thingset_can_timeout_timer_expired, NULL);
 

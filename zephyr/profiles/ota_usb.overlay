@@ -9,3 +9,10 @@
 		compatible = "zephyr,cdc-acm-uart";
 	};
 };
+
+/* FDCAN2 must yield to HRTIM's logical priority 0 control interrupt.
+ * Keep normal kernel-aware CAN IRQs; RS485 RX retains its zero-latency IRQ.
+ */
+&fdcan2 {
+	interrupts = <86 2>, <87 2>;
+};

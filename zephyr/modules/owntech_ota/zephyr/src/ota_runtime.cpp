@@ -15,7 +15,7 @@ static_assert(sizeof(OWNTECH_FIRMWARE_VERSION)<=OTA_IDENTITY_TEXT_SIZE,"Firmware
 static_assert(sizeof(OWNTECH_FIRMWARE_BUILD_ID)<=OTA_IDENTITY_TEXT_SIZE,"Firmware build ID too long");
 
 enum WorkType { COMMAND, REPORT, STAGE_BEGIN, STAGE_DATA, STAGE_END, START, COMMIT,
-                ABORT, DISCOVER, RECONCILE, RELEASE };
+                ABORT, DISCOVER, RECONCILE, RELEASE, REFRESH };
 struct Work {
     WorkType type;
     uint8_t source;
@@ -30,6 +30,7 @@ static K_SEM_DEFINE(usb_done,0,1);
 static k_spinlock snapshot_lock;
 static atomic_t losses, initialized, busy, healthy, lead_role;
 static atomic_t identity_conflict, discovery_requested, stage_end_requested, usb_pending, reconcile_mode, release_pending;
+static atomic_t refresh_pending;
 static ota_participant participant;
 static ota_coordinator coordinator;
 static ota_manifest staged_manifest;
@@ -177,12 +178,27 @@ extern "C" int ota_service_target(size_t i,ota_observation *o,bool *is_lead,uint
     *o=table[i].observation;*last=table[i].time;*is_lead=!memcmp(o->identity.eui,eui64,8);
     k_spin_unlock(&snapshot_lock,key);return 0;
 }
+static int enqueue(Work &w);
+static void request_refresh()
+{
+    if(!atomic_cas(&refresh_pending,0,1)) return;
+    Work w{};w.type=REFRESH;
+    /* A full queue already wakes the worker, whose next publication will read
+     * the current address. No extra work item or periodic retry is necessary. */
+    if(enqueue(w)) atomic_clear(&refresh_pending);
+}
 extern "C" void ota_runtime_claim(const uint8_t eui[8],uint8_t address)
 {
     if(!address || address>=254) return;
     uint8_t local_address=thingset_can_get_inst()->node_addr;
     if(!memcmp(eui,eui64,8)) {
         if(address!=local_address) atomic_set(&identity_conflict,1);
+        else {
+            auto key=k_spin_lock(&snapshot_lock);
+            bool changed=local_snapshot.identity.address!=local_address;
+            k_spin_unlock(&snapshot_lock,key);
+            if(changed) request_refresh();
+        }
         return;
     }
     if(address==local_address) atomic_set(&identity_conflict,1);
@@ -533,6 +549,7 @@ static void process(Work &w)
 {
     int rc=0;
     switch(w.type) {
+    case REFRESH: atomic_clear(&refresh_pending);break;
     case COMMAND: {
         auto key=k_spin_lock(&snapshot_lock);
         bool owner=ota_service_busy() && accepted_prepare_campaign==w.command.manifest.campaign_id;
@@ -772,32 +789,46 @@ static void stream_status_poll()
         break;
     }
 }
+static bool coordinator_active()
+{
+    return coordinator.phase!=OTA_COORD_IDLE && coordinator.phase!=OTA_COORD_FAILED &&
+           coordinator.phase!=OTA_COORD_DONE && coordinator.phase!=OTA_COORD_RECOVERY;
+}
+static void worker_iteration()
+{
+    /* Only these worker-owned states have deadlines or autonomous progress.
+     * A participant, USB staging, recovery awaiting a request, and completed
+     * campaigns all advance through the same FIFO, which wakes a blocked get.
+     * In particular busy alone must not turn an idle participant into a poller. */
+    bool timed=discovery_active || reconcile_active || coordinator_active();
+    Work w{};
+    bool received=!k_msgq_get(&ota_queue,&w,timed?K_MSEC(5):K_FOREVER);
+    if(received) process(w);
+    else if(!timed) return; /* No publication on a cancelled/spurious wait. */
+    if(discovery_active) discovery_step();
+    else if(reconcile_active) reconcile_step();
+    else if(coordinator_active()) {
+        if(atomic_get(&identity_conflict) && !participant.reboot_scheduled) {
+            (void)ota_coordinator_abort(&coordinator);service_error=OTA_ERR_IDENTITY;set_phase("FAILED");publish();return;
+        }
+        int rc=ota_coordinator_step(&coordinator,k_uptime_get());
+        pass_snapshot=coordinator.pass_id;
+        if(coordinator.phase==OTA_COORD_STREAM) {event(OTA_EVENT_CAN_TRANSFER_BEGIN);stream_status_poll();}
+        if(coordinator.phase==OTA_COORD_FINALIZE) event(OTA_EVENT_CAN_TRANSFER_END);
+        if(coordinator.phase==OTA_COORD_VALIDATE_BARRIER) event(OTA_EVENT_ALL_VALIDATED);
+        if(rc<0) {service_error=rc;set_phase("FAILED");}
+        else {
+            static const char *phases[]={"IDLE","PREPARING","BEGIN_PASS","CAN_TRANSFER","END_PASS","VERIFYING",
+                "ALL_VALIDATED","COMMITTING","REBOOTING","REBOOTING","SUCCESS","FAILED","RECOVERY_REQUIRED"};
+            set_phase(phases[coordinator.phase]);
+        }
+    }
+    else return; /* process() already published the event's final snapshot. */
+    publish();
+}
 static void run(void *,void *,void *)
 {
     initialize_runtime();
-    int rc;
-    for (;;) {
-        Work w{};
-        if(!k_msgq_get(&ota_queue,&w,K_MSEC(5))) process(w);
-        if(discovery_active) discovery_step();
-        else if(reconcile_active) reconcile_step();
-        else if(coordinator.phase!=OTA_COORD_IDLE && coordinator.phase!=OTA_COORD_FAILED && coordinator.phase!=OTA_COORD_DONE) {
-            if(atomic_get(&identity_conflict) && !participant.reboot_scheduled) {
-                (void)ota_coordinator_abort(&coordinator);service_error=OTA_ERR_IDENTITY;set_phase("FAILED");publish();continue;
-            }
-            rc=ota_coordinator_step(&coordinator,k_uptime_get());
-            pass_snapshot=coordinator.pass_id;
-            if(coordinator.phase==OTA_COORD_STREAM) {event(OTA_EVENT_CAN_TRANSFER_BEGIN);stream_status_poll();}
-            if(coordinator.phase==OTA_COORD_FINALIZE) event(OTA_EVENT_CAN_TRANSFER_END);
-            if(coordinator.phase==OTA_COORD_VALIDATE_BARRIER) event(OTA_EVENT_ALL_VALIDATED);
-            if(rc<0) {service_error=rc;set_phase("FAILED");}
-            else {
-                static const char *phases[]={"IDLE","PREPARING","BEGIN_PASS","CAN_TRANSFER","END_PASS","VERIFYING",
-                    "ALL_VALIDATED","COMMITTING","REBOOTING","REBOOTING","SUCCESS","FAILED","RECOVERY_REQUIRED"};
-                set_phase(phases[coordinator.phase]);
-            }
-        }
-        publish();
-    }
+    for (;;) worker_iteration();
 }
 K_THREAD_DEFINE(ota_worker,CONFIG_OWNTECH_OTA_STACK_SIZE,run,nullptr,nullptr,nullptr,7,0,0);

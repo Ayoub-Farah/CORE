@@ -22,6 +22,8 @@ override selects this directory. ThingSet node C remains separately pinned at
   and retains completed storage until the callback has returned. Counters expose
   expiry, malformed/out-of-order messages and overflow. The callback must copy
   immediately; flash and other blocking work belong to an application worker.
+  An incomplete report arms a one-shot timer for the earliest slot deadline;
+  completion, rejection and expiry leave no periodic timer running in an idle pool.
 - `thingset_can_send_raw_report[_inst]` and the normal report sender share one
   serialized, bounded fragmentation path. Driver errors are propagated. A late
   driver callback after timeout keeps that transmitter unavailable until drained.
@@ -45,7 +47,7 @@ Run `python tests/ota/sdk_transport_test.py` from Core. It compiles the actual
 boundaries. Both classical CAN and FD/BRS builds exercise delayed responses,
 source/route mismatch, callback/timeout ordering, owned payload lifetime,
 oversized RX, server buffer ownership, request peer scope, reassembly loss and
-recovery, pool expiry, sequence wrapping, overflow, TX error/late completion,
+recovery, staggered/prolonged pool expiry and return to idle, sequence wrapping, overflow, TX error/late completion,
 fragmentation, padding, claims and discovery probes. It is a deterministic
 transport regression test, not proof of interrupt scheduling or hardware timing.
 

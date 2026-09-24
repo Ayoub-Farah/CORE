@@ -75,10 +75,32 @@ static int atomic_get(atomic_t *v){return *v;}
 static void atomic_set(atomic_t *v,int n){*v=n;}
 static void atomic_clear(atomic_t *v){*v=0;}
 static void atomic_inc(atomic_t *v){(*v)++;}
-struct k_timer {void (*handler)(struct k_timer *);bool active;};
-static void k_timer_init(struct k_timer *t,void (*fn)(struct k_timer *),void *unused){t->handler=fn;t->active=false;}
-static void k_timer_start(struct k_timer *t,k_timeout_t a,k_timeout_t b){t->active=true;}
-static void k_timer_stop(struct k_timer *t){t->active=false;}
+struct k_timer {
+    void (*handler)(struct k_timer *);
+    bool active;
+    int64_t deadline,period;
+    unsigned starts,stops,fires;
+};
+static void k_timer_init(struct k_timer *t,void (*fn)(struct k_timer *),void *unused){
+    memset(t,0,sizeof(*t));t->handler=fn;
+}
+static void k_timer_start(struct k_timer *t,k_timeout_t a,k_timeout_t b){
+    t->active=a.ticks>=0;t->deadline=host_now+a.ticks;t->period=b.ticks;t->starts++;
+}
+static void k_timer_stop(struct k_timer *t){t->active=false;t->stops++;}
+/* Fire elapsed timers as Zephyr does: one-shot is inactive before its callback.
+ * The callback may rearm it. No production transport code is replaced here.
+ */
+static void host_advance_timer(struct k_timer *t,int64_t until){
+    assert(until>=host_now);
+    unsigned count=0;
+    while(t->active&&t->deadline<=until){
+        assert(count++<1000);host_now=t->deadline;
+        t->active=t->period>0;if(t->active)t->deadline+=t->period;
+        t->fires++;t->handler(t);
+    }
+    host_now=until;
+}
 #define K_TIMER_DEFINE(n,fn,unused) struct k_timer n={.handler=fn}
 struct k_work {int unused;};
 struct k_work_delayable {struct k_work work;};

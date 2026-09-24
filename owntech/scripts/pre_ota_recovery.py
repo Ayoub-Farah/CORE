@@ -53,8 +53,8 @@ def verify_recovery_entry(source, target, env):
     return 0
 
 
-env.AddPostAction("$BUILD_DIR/${PROGNAME}.mcuboot.bin", verify_recovery_entry)
-env.AddPostAction("$BUILD_DIR/${PROGNAME}.mcuboot.bin", artifact_post_action)
+env.AddPostAction(env.Alias("mcuboot-image"), verify_recovery_entry)
+env.AddPostAction(env.Alias("mcuboot-image"), artifact_post_action)
 
 
 def reject_blind_upload(*args, **kwargs):

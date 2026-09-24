@@ -1,6 +1,7 @@
 """Post-sign inspection runs on ordinary builds before any upload action."""
 from contextlib import redirect_stdout
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -310,6 +311,39 @@ if REQUESTED == "upload":
             env.get = lambda key, default=None: default
             with self.assertRaisesRegex(ValueError, "pre_ota_identity"):
                 artifact_options(env)
+
+    def test_recovery_checks_entry_before_artifact_on_shared_signing_alias(self):
+        class RecoveryEnvironment(Environment):
+            def __setitem__(self, key, value):
+                self.values[key] = value
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            config = project / ".pio/ota-recovery-config"
+            config.mkdir(parents=True)
+            header = b"/* test recovery guard */\n"
+            (config / "owntech_ota_recovery_config.h").write_bytes(header)
+            (config / "owntech_ota_recovery_config.json").write_text(json.dumps({
+                "header_sha256": hashlib.sha256(header).hexdigest()}))
+            env = RecoveryEnvironment(project / "build", project)
+            env.values = {}
+            board = SimpleNamespace(get=lambda key, default=None: default, update=lambda key, value: None)
+            env.BoardConfig = lambda: board
+            runpy.run_path(str(ROOT / "owntech/scripts/pre_ota_recovery.py"),
+                           init_globals={"env": env, "Import": lambda name: None})
+            self.assertEqual([node for node, _ in env.post], [env.Alias("mcuboot-image")] * 2)
+            self.assertEqual([action.__name__ for _, action in env.post],
+                             ["verify_recovery_entry", "artifact_post_action"])
+            verify = env.post[0][1]
+            with patch("subprocess.run", return_value=SimpleNamespace(stdout="ota_recovery_run(config)")) as nm:
+                self.assertEqual(verify([], [], env), 0)
+            self.assertEqual(nm.call_args.args[0][-1], str(env.build) + "/firmware.elf")
+            with patch("subprocess.run", return_value=SimpleNamespace(stdout="setup_routine()")):
+                with self.assertRaisesRegex(ValueError, "wrong entry point"):
+                    verify([], [], env)
+            with redirect_stdout(io.StringIO()), patch("subprocess.run") as process:
+                self.assertEqual(env.replacements["UPLOADCMD"]([], [], env), 1)
+            process.assert_not_called()
 
     def test_scons_hooks_execute_without_dunder_file(self):
         # Real SConscript deliberately removes __file__ before exec(), unlike

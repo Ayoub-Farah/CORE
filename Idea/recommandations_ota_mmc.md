@@ -1,6 +1,54 @@
 # Incident OTA du MMC : problèmes identifiés et prévention
 
-État au 25 septembre 2026 : réparation individuelle des deux cartes (SM2 puis SM1), découplage CAN/OTA, puis première campagne CAN complète réussie avec le nouveau main sans callbacks OTA.
+Historique au 25 septembre 2026 : réparation individuelle des deux cartes (SM2 puis SM1), découplage CAN/OTA, puis première campagne CAN complète réussie avec le nouveau main sans callbacks OTA. Un remplacement ultérieur du main a introduit le défaut HRTIM décrit ci-dessous ; les validations historiques ne valent pas pour chaque nouveau main.
+
+## Vérifier chaque nouveau main avant flash
+
+Cette liste est une revue préalable, pas un contrôle automatique déjà intégré au flash. Une compilation réussie et une confirmation MCUboot ne suffisent pas à valider l'application. Les essais sur carte viennent ensuite, sur un banc avec les sorties de puissance arrêtées, avant tout déploiement à la flotte.
+
+### Incident confirmé : CAN bloqué par l'ordre de démarrage HRTIM
+
+Sur la carte `0x0029004C`, le main appelait `task.startCritical()` avant `communication.sync.initSlave()`. Le démarrage activait l'interruption de répétition du master HRTIM (`MREP`). Après passage en synchronisation externe, `_hrtim_callback()` effaçait seulement `SYNC`, laissant `MREP` actif. L'interruption prioritaire se redéclenchait continuellement, empêchant le traitement CAN et les tâches de fond.
+
+Preuves ST-Link du 25 septembre 2026, avant correction :
+
+- `MCR = 0x280B0709` : synchronisation externe sélectionnée.
+- `MISR = 0x50`, `MDIER = 0x10` : répétition à la fois signalée et activée.
+- IRQ HRTIM 67 active sur plusieurs lectures ; IRQ CAN 87 en attente.
+- FDCAN : compteurs d'erreurs émission/réception à zéro, réception en FIFO, `driver_started = 1`, mais `ready = 0` et `can_ready = 0`.
+- Le compteur de contrôle avançait : ce seul compteur ne prouve donc pas que le système fonctionne normalement.
+- Le Lead OTA annonçait `expected 2 receivers excluding Lead, discovered 0`. La présence des câbles CAN ne suffisait pas à exclure un blocage logiciel.
+
+**Correction : configurer RS485, les buffers et callbacks, puis `sync.initMaster()` ou `sync.initSlave()`, avant de démarrer les tâches, en particulier `task.startCritical()`.** Ne pas changer la source de synchronisation à chaud sans arrêter et reconfigurer les interruptions concernées. Les priorités des threads OTA ne protègent pas contre une interruption qui monopolise le processeur.
+
+### Liste des problèmes potentiels à examiner
+
+| À vérifier avant flash | Problème évité / critère de validation |
+|---|---|
+| Ordre d'initialisation | Communications, buffers, capteurs et source de synchronisation prêts avant le démarrage des tâches. Aucun passage REP → SYNC avec l'ancienne interruption encore activée. |
+| Drapeaux d'interruption | Chaque source activée est correctement acquittée. Pas de boucle d'interruptions, d'attente bloquante ou de travail non borné dans une ISR. |
+| Temps CPU et priorités | Le contrôle laisse traiter CAN, USB, SysTick et tâches de fond. Mesurer la durée réelle des ISR et la cadence de contrôle ; un compteur qui augmente ne suffit pas. |
+| Affectations matérielles | UID uniques, rôle attendu pour chaque carte, aucun rôle de puissance attribué par défaut à une carte inconnue. Le main actuel renvoie SM1 pour un UID inconnu : point restant à corriger avant qualification de puissance. |
+| Deux sens du mot Lead | Le Lead OTA (`USB_LEAD`) distribue les images par CAN. Le lead MMC est un rôle de `main.cpp`, qui émet POWER et SYNC. Un lead MMC reste un récepteur OTA ; le nombre OTA exclut uniquement le Lead OTA dédié. |
+| Broches et périphériques partagés | Pas de conflit CAN/SYNC/RS485/PWM ; sur TWIST 1.4.1/1.4.2, SYNC IN utilise PB2/AF13 et CAN TX PB6. Vérifier la révision réellement compilée. |
+| Dépendance à SYNC | Un follower sans SYNC reste accessible à CAN/OTA. Sa confirmation locale ne dépend pas d'un cycle de contrôle fourni par une autre carte. Tester séparément la perte de SYNC en puissance. |
+| Commandes et états | Tester IDLE, POWER, commande inconnue et défaut. Dans le main actuel, `if (module_comand)` capture aussi 2 et rend le `else if (module_comand == 2)` inaccessible. |
+| Activation réelle des PWM | Distinguer le booléen `pwm_enable` des registres matériels. Les appels `shield.power.start(LEG1)` sont actuellement commentés ; une LED POWER ne prouve pas que les sorties commutent. |
+| Protections électriques | Ne pas publier POWER à la place d'un défaut. Les signalements OVER_VOLTAGE et OVER_CURRENT sont actuellement commentés ; à rétablir et valider avant exploitation de puissance. |
+| Mesures et changement de rôle | Les coefficients de calibration doivent suivre la carte physique. Le main applique des coefficients propres au rôle SM1 ; une réaffectation des UID ne valide pas ces coefficients pour la nouvelle carte. |
+| Arrêt, défaut et réarmement | Sorties arrêtées au démarrage, en IDLE et en maintenance ; pas de reprise de puissance implicite après OTA. Délais de perte de communication et commande de réarmement à vérifier. |
+| Intégrité du firmware | Compiler avec le bon profil, archiver source/ELF/image/manifeste, vérifier signature et hash. Le fichier réellement flashé doit être celui examiné. |
+| État OTA préexistant | Examiner campagne, confirmation, primaire/secondaire et activation en attente avant récupération. Ne pas effacer un journal actif pour contourner un refus. Préserver les calibrations et les archives. |
+
+### Essai sur carte avant déploiement à la flotte
+
+1. Relever UID, rôle attendu, build et hash de l'image candidate. Conserver une sauvegarde récupérable avant la première installation de qualification.
+2. Démarrer à l'arrêt, avec puis sans SYNC. Vérifier confirmation locale, disponibilité USB/OTA et progression des tâches de fond.
+3. Avec un pair CAN opérationnel, vérifier `can_ready`, l'inventaire par EUI et une réponse d'état répétée. Si cela bloque, examiner erreurs CAN, FIFO, interruptions actives/en attente et drapeaux HRTIM avant de conclure à un câblage défectueux.
+4. Vérifier le rôle applicatif et les commandes IDLE/POWER uniquement sur un banc adapté. Distinguer statut logiciel, LED, signaux de grille et autorisation effective de puissance.
+5. Consigner séparément les résultats : compilation, revue, flash vérifié, santé OTA, CAN, RS485/SYNC, protections et puissance. Une étape non essayée reste explicitement non validée.
+
+Pour le banc actuel : `0x0029004C` devient lead MMC, `0x00290049` devient SM1 ; `0x002B002A` est réaffecté à SM2. Le Lead OTA USB utilisé lors du diagnostic est `0x002A0053`. Le correctif `ota-848d91c6327b189a2383b2de` a été installé par ST-Link sur les deux cartes : rôles vérifiés en RAM, images confirmées, CAN prêt, sorties arrêtées. Le Lead OTA retrouve désormais les deux récepteurs disponibles et sans erreur. Aucun essai de puissance ni nouvelle campagne de transfert n'a été effectué. Le compte rendu et les preuves sont conservés dans [le dossier ST-Link](../recovery-backups/stlink-main-sync-20260925/README.md).
 
 ## Ce qui a posé problème
 

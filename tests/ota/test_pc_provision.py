@@ -798,6 +798,29 @@ class ProvisionTests(unittest.TestCase):
                  patch("provision_ota.provision", side_effect=inspect_snapshot):
                 self.assertEqual(main(["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused"]), 0)
 
+    def test_gui_error_propagation_keeps_original_cause_and_closes_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "firmware.mcuboot.bin"
+            image.write_bytes(artifact())
+            args = ["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused"]
+            error = TransportError("COM11: port is occupied")
+            self.receiver.close = Mock()
+            for propagate in (False, True):
+                self.receiver.close.reset_mock()
+                with self.subTest(propagate=propagate), \
+                     patch("provision_ota.USBConnection", return_value=self.connection), \
+                     patch("provision_ota.provision", side_effect=error) as provision_call, \
+                     redirect_stderr(io.StringIO()) as output:
+                    if propagate:
+                        with self.assertRaises(TransportError) as caught:
+                            main(args, raise_errors=True)
+                        self.assertIs(caught.exception, error)
+                    else:
+                        self.assertEqual(main(args), 1)
+                        self.assertIn(str(error), output.getvalue())
+                self.receiver.close.assert_called_once()
+                provision_call.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

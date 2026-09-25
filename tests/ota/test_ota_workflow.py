@@ -463,7 +463,8 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
             self.fixture.source_path, self.fixture.source_manifest_path, destination))
         self.workflow.info = Mock(return_value=self.fixture.info)
-        def provision(args):
+        def provision(args, *, raise_errors=False):
+            self.assertTrue(raise_errors)
             image = Path(args[args.index("--image") + 1])
             self.assertEqual(args[args.index("--serial") + 1], "selected")
             self.assertEqual(args[args.index("--image-class") + 1], "receiver")
@@ -495,6 +496,27 @@ class WorkflowTests(unittest.TestCase):
             else:
                 fleet.assert_not_called()
             self.assertEqual(self.ui.show_status.call_args.args[1]["usb_serial"], "selected")
+
+    def test_initialization_dialog_reports_real_failure_instead_of_generic_task_message(self):
+        self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
+            self.fixture.source_path, self.fixture.source_manifest_path, destination))
+        self.workflow.info = Mock()
+        error = OSError("COM11: access denied; close the serial monitor")
+        args = ["initialize", "--project", str(self.root), "--environment", "OTA", "--mcumgr", str(self.fixture.mcumgr)]
+        with patch.object(workflow, "Dialogs", return_value=self.ui), \
+             patch.object(workflow, "Workflow", return_value=self.workflow), \
+             patch("provision_ota.USBConnection", side_effect=error) as connection, \
+             redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(workflow.main(args), 1)
+        connection.assert_called_once()
+        self.assertIn(str(error), output.getvalue())
+        self.assertIn(str(error), self.ui.problem.call_args.args[1])
+        self.workflow.info.assert_not_called()
+        self.ui.show_status.assert_not_called()
+        self.ui.close.assert_called_once()
+        states = list(self.workflow.operations.glob("*/operation.json"))
+        self.assertEqual(len(states), 1)
+        self.assertEqual(workflow.transition._json(states[0])["phase"], "INSTALLING")
 
     def test_can_update_rejects_receiver_and_cancel_before_build_or_campaign(self):
         self.workflow.info = Mock(return_value=self.fixture.info)
@@ -529,7 +551,8 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.build = Mock()
         self.workflow.snapshot = Mock(side_effect=lambda environment, destination, **kwargs: workflow.copy_pair(
             self.fixture.source_path, self.fixture.source_manifest_path, destination))
-        def campaign(args):
+        def campaign(args, *, raise_errors=False):
+            self.assertTrue(raise_errors)
             image = Path(args[args.index("--image") + 1])
             journal = Path(args[args.index("--journal") + 1])
             self.assertEqual(image.parent.parent, journal.parent)

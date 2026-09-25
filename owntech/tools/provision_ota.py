@@ -167,7 +167,7 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
     return result
 
 
-def main(argv=None):
+def main(argv=None, *, raise_errors=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--profile", type=Path)
@@ -200,6 +200,8 @@ def main(argv=None):
                       legacy_console=args.legacy_console, bootloader=args.bootloader)
         return 0
     except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
+        if raise_errors:
+            raise  # The desktop assistant displays the actual failure.
         print("OTA initialization failed: %s" % error, file=sys.stderr)
         return 1
     finally:

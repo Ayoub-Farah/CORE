@@ -369,7 +369,7 @@ class Workflow:
         self.ui.continue_step("Initialize over USB", "Board: " + serial + "\nRole: " + role + "\n\nKeep outputs stopped and close Serial Monitor/Scope. This is for a board running an ordinary USB application with known clean OTA history. If you previously used Switch to USB, use Return to OTA V2 instead.")
         self.save(path, state, "INSTALLING")
         rc = provision_main(["--image", str(image), "--image-class", role, "--serial", serial,
-                             "--mcumgr", str(self.mcumgr), "--legacy-console"])
+                             "--mcumgr", str(self.mcumgr), "--legacy-console"], raise_errors=True)
         require(rc == 0, "Initialization stopped. See the PlatformIO task output; no automatic retry was made.")
         self.save(path, state, "OTA_READY")
         self.ui.show_status("Initialized over USB", self.info(serial))
@@ -394,7 +394,7 @@ class Workflow:
         image, manifest = self.snapshot("OTA", path / "firmware", compact=True)
         self.save(path, state, "UPDATING")
         rc = campaign_main(["--image", str(image), "--manifest", str(manifest), "--serial", serial,
-                            "--expected-count", str(count), "--journal", str(path / "campaign.jsonl")])
+                            "--expected-count", str(count), "--journal", str(path / "campaign.jsonl")], raise_errors=True)
         require(rc == 0, "The CAN update did not finish. Keep the fleet connected and use Finish previous CAN update. Archive: " + str(path))
         self.save(path, state, "COMPLETE")
         self.ui.notice("CAN update complete", "Every expected receiver has been verified. The update log and firmware are saved in:\n" + str(path))
@@ -414,7 +414,7 @@ class Workflow:
         if records and records[-1].get("event") == "SUCCESS":
             self.ui.notice("Update already completed", "This saved update already ended in SUCCESS. Its original log has been preserved. Use Check connected board for current status, or Switch to USB to continue.")
             return
-        rc = campaign_main(["--serial", serial, "--reconcile-journal", str(journal)])
+        rc = campaign_main(["--serial", serial, "--reconcile-journal", str(journal)], raise_errors=True)
         require(rc == 0, "Reconciliation stopped. Preserve the board state and saved log; see the PlatformIO task output.")
         self.ui.notice("Update reconciled", "The original update has reached SUCCESS. Its saved log can be used by Switch to USB.")
 

@@ -684,7 +684,7 @@ def read_only_status(transport):
     return {"info": info, "status": result}
 
 
-def main(argv=None):
+def main(argv=None, *, raise_errors=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--bootstrap-image", type=Path,
@@ -766,6 +766,8 @@ def main(argv=None):
     except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
         if journal:
             journal.emit("PARTIAL" if str(error).startswith("PARTIAL") else "FAILED", error=str(error))
+        if raise_errors:
+            raise  # Preserve the journal, then let the assistant show the cause.
         print("Lead update failed: %s" % error, file=sys.stderr)
         return 1
     finally:

@@ -113,6 +113,22 @@ class CampaignTests(unittest.TestCase):
                         timeout=1, poll_interval=0.4, clock=self.clock, sleep=self.clock.sleep,
                         output=lambda value: None)
 
+    def test_gui_error_propagates_after_preserving_failed_journal_and_closing_connection(self):
+        error = TransportError("Selected Lead USB port is occupied")
+        transport = Mock()
+        connection = SimpleNamespace(connect=Mock(side_effect=error), transport=transport, serial_number="selected")
+        with patch("lead_update.prepare_manifest", return_value=(b"x" * 512, MANIFEST)), \
+             patch("lead_update.Journal", return_value=self.journal), \
+             patch("lead_update.USBConnection", return_value=connection), \
+             self.assertRaises(TransportError) as caught:
+            main(["--image", "saved.bin", "--expected-count", "3"], raise_errors=True)
+        self.assertIs(caught.exception, error)
+        transport.close.assert_called_once()
+        self.assertTrue(self.journal.stream.closed)
+        records = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual(records[-1]["event"], "FAILED")
+        self.assertEqual(records[-1]["error"], str(error))
+
     def test_success_always_stages_and_only_commits_after_validation(self):
         self.assertEqual(self.client().run(), "SUCCESS")
         commands = [command for command, _ in self.transport.calls]

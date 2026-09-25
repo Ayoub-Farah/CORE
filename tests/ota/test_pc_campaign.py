@@ -138,6 +138,28 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn("reset", commands)
         self.assertNotIn("abort", commands)
 
+    def test_unavailable_receiver_reports_identity_fault_and_never_stages(self):
+        original = self.transport.request
+        def request(command, payload):
+            result = original(command, payload)
+            if command == "discover":
+                result["targets"][0].update(available=False, healthy=False, confirmed=True, error=-4, state="IDLE")
+            return result
+        self.transport.request = request
+        with self.assertRaises(CampaignError) as caught:
+            self.client().run()
+        message = str(caught.exception)
+        self.assertIn(IDS[0], message)
+        self.assertIn("OTA_ERR_IDENTITY", message)
+        self.assertIn("confirmed=True", message)
+        self.assertIn("CAN address 1", message)
+        records = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        rejected = next(record for record in records if record["event"] == "INVENTORY_REJECTED")
+        self.assertEqual(len(rejected["inventory"]), 3)
+        self.assertEqual([row["identity"] for row in rejected["rejected"]], [IDS[0]])
+        self.assertFalse(any(name in ("stage_begin", "stage_data", "start", "commit", "reset")
+                             for name, _ in self.transport.calls))
+
     def test_pc_source_credit_and_retransmission_are_exact(self):
         client = self.client()
         for offset, length in ((256, 256), (0, 256), (500, 12)):

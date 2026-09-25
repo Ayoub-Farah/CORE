@@ -450,7 +450,17 @@ class Campaign:
         if self.expected_count is not None and len(discovered) != self.expected_count:
             raise CampaignError("expected %d receivers excluding Lead, discovered %d" % (self.expected_count, len(discovered)))
         if not rows or any(row.get("available") is not True or row.get("compatible") is not True for row in rows):
-            raise CampaignError("all expected boards must expose a compatible, available OTA receiver")
+            rejected = [row for row in rows if row.get("available") is not True or row.get("compatible") is not True]
+            self.journal.emit("INVENTORY_REJECTED", inventory=rows, rejected=rejected)
+            details = []
+            for row in rejected:
+                error = row.get("error")
+                reason = "OTA_ERR_IDENTITY: CAN identity/address conflict" if error == -4 else str(error)
+                details.append("%s (CAN address %s): compatible=%s, available=%s, confirmed=%s, healthy=%s, state=%s, error=%s" % (
+                    row["identity"], row.get("address"), row.get("compatible"), row.get("available"),
+                    row.get("confirmed"), row.get("healthy"), row.get("state"), reason))
+            raise CampaignError("all expected boards must expose a compatible, available OTA receiver; "
+                                + ("; ".join(details) if details else "no receiver reported"))
         self.targets = sorted(discovered)
         self.journal.emit("DISCOVER", lead_identity=self.lead, targets=self.targets, inventory=rows, manifest=self.manifest)
         return rows

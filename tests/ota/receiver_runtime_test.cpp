@@ -81,6 +81,20 @@ static ota_command command()
 }
 static int test_receiver()
 {
+    /* A foreign claim against our provisional address is normal arbitration,
+     * not an identity failure. The SDK selects a free address before ready. */
+    reset();fake_can.ready=0;initialize_runtime();
+    uint8_t starting_peer[8]={0xaa};ota_runtime_claim(starting_peer,1);
+    CHECK(!identity_conflict && !ota_service_error());
+    fake_can.node_addr=7;fake_can.ready=1;state_callback(state_arg);worker_iteration();
+    CHECK(ota_service_healthy() && !ota_service_error() && local_snapshot.identity.address==7);
+    ota_runtime_claim(starting_peer,7);worker_iteration();
+    CHECK(identity_conflict && ota_service_error()==OTA_ERR_IDENTITY && inhibited);
+    /* Active transfers stay strict; a duplicate local EUI always conflicts. */
+    reset();fake_can.ready=0;initialize_runtime();atomic_set(&busy,1);
+    ota_runtime_claim(starting_peer,1);CHECK(identity_conflict);
+    reset();fake_can.ready=0;initialize_runtime();ota_runtime_claim(eui64,2);
+    CHECK(identity_conflict);
     reset();fake_can.ready=0;confirmed=false;initialize_runtime();
     CHECK(confirms==1 && ota_service_local_healthy() && !ota_service_healthy());
     CHECK(!inhibited && !memcmp(ota_service_phase(),"WAITING_CAN",11));
@@ -130,6 +144,9 @@ static int test_receiver()
     reset();cmd=command();persist(nullptr,&cmd.manifest,OTA_COMMITTED,42);
     memcpy(journal.lead_eui,cmd.lead_eui,8);maintenance=recovery=true;confirmed=false;
     fake_can.ready=0;initialize_runtime();CHECK(confirms==1 && inhibited && !ota_service_healthy());
+    ota_runtime_claim(cmd.lead_eui,1);CHECK(!identity_conflict && lead_bound);
+    CHECK(!memcmp(lead_eui,cmd.lead_eui,8));
+    fake_can.node_addr=7; /* Postboot address arbitration retains the Lead binding. */
     fake_can.ready=1;state_callback(state_arg);worker_iteration();
     ota_runtime_claim(cmd.lead_eui,2);
     CHECK(ota_runtime_release(eui64,active_hash,76,2)==OTA_ERR_HEALTH);

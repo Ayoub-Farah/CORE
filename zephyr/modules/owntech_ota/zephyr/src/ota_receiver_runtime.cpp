@@ -126,12 +126,20 @@ static void publish()
 extern "C" void ota_runtime_claim(const uint8_t eui[8],uint8_t address)
 {
     if(!address || address>=254) return;
-    uint8_t local_address=thingset_can_get_inst()->node_addr;
+    auto can=thingset_can_get_inst();
+    uint8_t local_address=can->node_addr;
     auto key=k_spin_lock(&snapshot_lock);
     if(!memcmp(eui,eui64,8)) {
         if(address!=local_address) atomic_set(&identity_conflict,1);
     }
-    else if(address==local_address) atomic_set(&identity_conflict,1);
+    /* The SDK starts with a provisional address (usually 1) and reports
+     * foreign claims before it selects a free one. Do not latch that normal
+     * arbitration as a permanent OTA fault before CAN becomes ready, including
+     * post-update startup. Active transfers and established addresses stay
+     * strict; the Lead EUI/address binding checks below remain unchanged. */
+    else if(address==local_address &&
+            (atomic_get(&can->ready) || ota_service_busy()))
+        atomic_set(&identity_conflict,1);
     else if(!lead_bound || (!ota_service_busy() && local_snapshot.status.state==OTA_SUCCEEDED)) {memcpy(lead_eui,eui,8);lead_address=address;lead_seen=true;}
     else if(!memcmp(eui,lead_eui,8)) {
         if(lead_seen && lead_address!=address && ota_service_busy()) atomic_set(&identity_conflict,1);

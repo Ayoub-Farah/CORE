@@ -20,6 +20,10 @@ class CampaignError(RuntimeError):
     pass
 
 
+class BootloaderNotReady(CampaignError):
+    """Image-service wait expired before firmware upload or post-upload reset."""
+
+
 class ReceiverStatus:
     """Read-only minimal receiver status; no bytes are injected into console RX."""
     def __init__(self, device, timeout=2):
@@ -228,7 +232,7 @@ class USBConnection:
             if ready and not unresolved:
                 return ready[0]
             time.sleep(0.25)
-        raise CampaignError("image service did not become ready for USB serial %s (%s). "
+        raise BootloaderNotReady("image service did not become ready for USB serial %s (%s). "
                             "No firmware upload or post-upload reset sent; check the board's bootloader mode and close the serial monitor"
                             % (self.serial_number, last))
 

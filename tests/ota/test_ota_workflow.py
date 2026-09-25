@@ -497,6 +497,52 @@ class WorkflowTests(unittest.TestCase):
                 fleet.assert_not_called()
             self.assertEqual(self.ui.show_status.call_args.args[1]["usb_serial"], "selected")
 
+    def test_initialization_offers_one_manual_boot_entry_only_after_preupload_timeout(self):
+        self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
+            self.fixture.source_path, self.fixture.source_manifest_path, destination))
+        self.workflow.info = Mock(return_value=self.fixture.info)
+        with patch.object(workflow, "provision_main", side_effect=[workflow.BootloaderNotReady("COM11: Write timeout"), 0]) as provision:
+            self.workflow.initialize("selected")
+        self.assertEqual(provision.call_count, 2)
+        first, second = [call.args[0] for call in provision.call_args_list]
+        self.assertEqual(first[:-1], second[:-1])
+        self.assertEqual(first[-1], "--legacy-console")
+        self.assertEqual(second[-1], "--bootloader")
+        self.assertTrue(all(call.kwargs["raise_errors"] for call in provision.call_args_list))
+        prompt = self.ui.continue_step.call_args.args
+        self.assertEqual(prompt[0], "Initialize OTA V2 through USB bootloader")
+        self.assertIn("No firmware was sent", prompt[1])
+        self.assertIn("Hold BOOT", prompt[1])
+        self.assertIn("COM11: Write timeout", prompt[1])
+        self.ui.show_status.assert_called_once()
+
+    def test_initialization_manual_entry_cancel_or_second_timeout_never_retries_again(self):
+        self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
+            self.fixture.source_path, self.fixture.source_manifest_path, destination))
+        self.workflow.info = Mock()
+        for cancel in (True, False):
+            self.ui.cancel_title = "Initialize OTA V2 through USB bootloader" if cancel else None
+            failure = workflow.BootloaderNotReady("image service not ready")
+            with self.subTest(cancel=cancel), patch.object(workflow, "provision_main", side_effect=failure) as provision, \
+                 self.assertRaises(Cancelled if cancel else workflow.BootloaderNotReady):
+                self.workflow.initialize("selected")
+            self.assertEqual(provision.call_count, 1 if cancel else 2)
+        self.workflow.info.assert_not_called()
+        self.ui.show_status.assert_not_called()
+
+    def test_initialization_does_not_offer_reset_for_other_refusals_or_upload_errors(self):
+        self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
+            self.fixture.source_path, self.fixture.source_manifest_path, destination))
+        self.workflow.info = Mock()
+        for failure in (CampaignError("different application already running"), TransportError("post-upload disconnect")):
+            self.ui.continue_step.reset_mock()
+            with self.subTest(failure=failure), patch.object(workflow, "provision_main", side_effect=failure) as provision, \
+                 self.assertRaises(type(failure)):
+                self.workflow.initialize("selected")
+            provision.assert_called_once()
+            self.ui.continue_step.assert_called_once()
+        self.workflow.info.assert_not_called()
+
     def test_initialization_dialog_reports_real_failure_instead_of_generic_task_message(self):
         self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
             self.fixture.source_path, self.fixture.source_manifest_path, destination))

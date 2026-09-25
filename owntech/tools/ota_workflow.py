@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 
-from lead_update import CampaignError, USBConnection, identity, json_value, read_only_status
+from lead_update import BootloaderNotReady, CampaignError, USBConnection, identity, json_value, read_only_status
 from lead_update import main as campaign_main
 from provision_ota import main as provision_main
 import transition_ota_usb as transition
@@ -246,8 +246,9 @@ class Workflow:
         return transition.inputs(path / "config/owntech_ota_recovery_config.json", path / "helper/image.bin",
                                  path / "helper/manifest.json", state["serial"], state["identity"])
 
-    def boot_prompt(self, serial, next_action):
-        self.ui.continue_step(next_action, "Board: " + serial + "\n\nKeep the power stage stopped. Close Serial Monitor and Scope.\n\nHold BOOT, press and release RESET, keep BOOT held for about one second, then release it.\n\nClick OK when the board is connected in its OwnTech USB bootloader. The next step will " + next_action.lower() + ".")
+    def boot_prompt(self, serial, next_action, *, reason=None):
+        introduction = reason + "\n\n" if reason else ""
+        self.ui.continue_step(next_action, introduction + "Board: " + serial + "\n\nKeep the power stage stopped. Close Serial Monitor and Scope.\n\nHold BOOT, press and release RESET, keep BOOT held for about one second, then release it.\n\nClick OK when the board is connected in its OwnTech USB bootloader. The next step will " + next_action.lower() + ".")
 
     def install(self, path, state, stage, config, helper, image, data, *, usb=None):
         kwargs = dict(image=image, data=data, usb=usb, receipt=path / "cleanup-receipt.json" if stage != "install-helper" else None,
@@ -368,8 +369,16 @@ class Workflow:
         role = "lead" if self.environment == "USB_LEAD" else "receiver"
         self.ui.continue_step("Initialize over USB", "Board: " + serial + "\nRole: " + role + "\n\nKeep outputs stopped and close Serial Monitor/Scope. This is for a board running an ordinary USB application with known clean OTA history. If you previously used Switch to USB, use Return to OTA V2 instead.")
         self.save(path, state, "INSTALLING")
-        rc = provision_main(["--image", str(image), "--image-class", role, "--serial", serial,
-                             "--mcumgr", str(self.mcumgr), "--legacy-console"], raise_errors=True)
+        args = ["--image", str(image), "--image-class", role, "--serial", serial, "--mcumgr", str(self.mcumgr)]
+        try:
+            rc = provision_main(args + ["--legacy-console"], raise_errors=True)
+        except BootloaderNotReady as error:
+            # This exception is raised only before the first firmware upload.
+            # Other refusals and upload/postboot failures must never reset/retry.
+            self.boot_prompt(serial, "Initialize OTA V2 through USB bootloader", reason=
+                             "Automatic USB bootloader entry did not succeed. No firmware was sent. "
+                             "Enter the bootloader manually to continue with the same saved firmware.\n\n" + str(error))
+            rc = provision_main(args + ["--bootloader"], raise_errors=True)
         require(rc == 0, "Initialization stopped. See the PlatformIO task output; no automatic retry was made.")
         self.save(path, state, "OTA_READY")
         self.ui.show_status("Initialized over USB", self.info(serial))

@@ -50,6 +50,10 @@ Click the **PlatformIO icon** in the VS Code sidebar, then open
 A receiver can report that it is waiting for a CAN peer until the network is
 connected. Its local installation must still pass verification.
 
+If automatic USB bootloader entry fails before any firmware is sent, the assistant
+asks you to use **BOOT + RESET**, then click **OK**. It checks the same board again
+and continues with the saved firmware. This also applies when preparing the Lead.
+
 ### Prepare the Lead
 
 1. Connect the board reserved for the Lead by USB.

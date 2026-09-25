@@ -14,7 +14,7 @@ from test_pc_smp import Serial, response
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
-from lead_update import CampaignError, USBConnection
+from lead_update import BootloaderNotReady, CampaignError, USBConnection
 from bootloader_upload import UploadError
 from ota_artifact import inspect_usb_image as inspect_image
 from provision_ota import provision, main
@@ -570,7 +570,7 @@ class ProvisionTests(unittest.TestCase):
                     if ready:
                         self.assertIs(connection.bootstrap(Path("exact.mcuboot.bin"), executable), self.receiver)
                     else:
-                        with self.assertRaisesRegex(CampaignError, "image service did not become ready"):
+                        with self.assertRaisesRegex(BootloaderNotReady, "image service did not become ready"):
                             connection.bootstrap(Path("exact.mcuboot.bin"), executable)
                 serial.assert_called_once_with("COM1", baudrate=1200, timeout=0.2)
                 self.assertTrue(factory.called)
@@ -638,9 +638,10 @@ class ProvisionTests(unittest.TestCase):
         for lines, error_type in cases:
             with self.subTest(error_type=error_type):
                 streams, _ = self.use_wire_connection({"COM1": lines})
-                with self.assertRaises(error_type), patch("lead_update.upload_image") as upload, \
+                with self.assertRaises(error_type) as failure, patch("lead_update.upload_image") as upload, \
                      patch("lead_update.subprocess.run") as reset:
                     self.connection._wait_image_service()
+                self.assertNotIsInstance(failure.exception, BootloaderNotReady)
                 upload.assert_not_called()
                 reset.assert_not_called()
                 streams["COM1"].close.assert_called_once()
@@ -668,6 +669,7 @@ class ProvisionTests(unittest.TestCase):
                     connection.bootstrap(Path("exact.mcuboot.bin"), executable, enter_bootloader=enter_bootloader)
                 self.assertIn("primary/secondary state cannot be verified", str(failure.exception))
                 self.assertIn("1200-baud entry may already have occurred", str(failure.exception))
+                self.assertNotIsInstance(failure.exception, BootloaderNotReady)
                 candidate.request.assert_called_once_with("info")
                 candidate.image_state.assert_called_once_with()
                 candidate.close.assert_called_once_with()
@@ -705,12 +707,50 @@ class ProvisionTests(unittest.TestCase):
                      patch("lead_update.SerialSMP", factory), patch("lead_update.time.monotonic", side_effect=count(step=0.1)), \
                      patch("lead_update.time.sleep"), patch("lead_update.upload_image") as upload, \
                      patch("lead_update.subprocess.run") as reset, \
-                     self.assertRaisesRegex(CampaignError, "image service did not become ready"):
+                     self.assertRaisesRegex(BootloaderNotReady, "image service did not become ready"):
                     connection.bootstrap(Path("exact.mcuboot.bin"), executable, enter_bootloader=False)
                 self.assertTrue(factory.called)
                 serial.assert_not_called()
                 upload.assert_not_called()
                 reset.assert_not_called()
+
+    def test_write_timeout_closes_all_ports_before_bootloader_not_ready_without_upload_or_reset(self):
+        for enter_bootloader in (False, True):
+            with self.subTest(enter_bootloader=enter_bootloader), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "mcumgr.exe"
+                executable.touch()
+                connection = USBConnection.__new__(USBConnection)
+                connection.serial_number = "one"
+                connection.bootstrap_port = "COM11"
+                connection.timeout = 1
+                previous = connection.transport = Mock()
+                connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="one", device="COM11")]
+                connection.reconnect = Mock()
+                candidate = Mock()
+                candidate.request.side_effect = TransportError("Write timeout")
+                serial = MagicMock()
+                with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
+                     patch("lead_update.SerialSMP", return_value=candidate) as factory, \
+                     patch("lead_update.time.monotonic", side_effect=count(step=0.1)), \
+                     patch("lead_update.time.sleep"), patch("lead_update.upload_image") as upload, \
+                     patch("lead_update.subprocess.run") as reset, \
+                     self.assertRaisesRegex(BootloaderNotReady, "COM11: Write timeout") as failure:
+                    connection.bootstrap(Path("exact.mcuboot.bin"), executable, enter_bootloader=enter_bootloader)
+                self.assertIsInstance(failure.exception, CampaignError)
+                previous.close.assert_called_once_with()
+                self.assertIsNone(connection.transport)
+                self.assertGreater(factory.call_count, 0)
+                self.assertEqual(candidate.close.call_count, factory.call_count)
+                candidate.image_state.assert_not_called()
+                upload.assert_not_called()
+                reset.assert_not_called()
+                connection.reconnect.assert_not_called()
+                if enter_bootloader:
+                    serial.assert_called_once_with("COM11", baudrate=1200, timeout=0.2)
+                    serial.return_value.__enter__.return_value.setDTR.assert_called_once_with(False)
+                    serial.return_value.__exit__.assert_called_once_with(None, None, None)
+                else:
+                    serial.assert_not_called()
 
     def test_bootloader_already_present_uploads_without_1200_touch_and_failure_never_resets(self):
         for failure in (None, UploadError("upload stopped at zero bytes")):

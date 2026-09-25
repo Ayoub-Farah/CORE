@@ -70,7 +70,7 @@ get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
 list(APPEND ZEPHYR_EXTRA_MODULES ${PARENT_DIR}/third_party/thingset-zephyr-sdk)
 
 # Looking for app.conf file
-if(NOT OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+if(NOT OWNTECH_BUILD_PROFILE MATCHES "^(ota_lead|ota_recovery)$")
   FILELIST(EXTRA_APP_CONF_FILE ${PARENT_DIR}/src conf)
 endif()
 # Add app.conf path to zephyr variables
@@ -89,7 +89,7 @@ if(DEFINED OWNTECH_BUILD_PROFILE)
 endif()
 
 # Looking for app.overlay file
-if(NOT OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+if(NOT OWNTECH_BUILD_PROFILE MATCHES "^(ota_lead|ota_recovery)$")
   FILELIST(EXTRA_OVERLAY_APP_FILE ${PARENT_DIR}/src overlay)
 endif()
 # Add app.overlay path to zephyr variables
@@ -98,6 +98,8 @@ if(OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
   list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_usb.overlay)
 elseif(OWNTECH_BUILD_PROFILE STREQUAL "ota_receiver")
   list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_receiver.overlay)
+elseif(OWNTECH_BUILD_PROFILE STREQUAL "ota_recovery")
+  list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_recovery.overlay)
 endif()
 
 # Check for third party modules
@@ -160,7 +162,8 @@ if(OWNTECH_BUILD_PROFILE STREQUAL "ota_recovery")
   if(NOT EXISTS "${OWNTECH_RECOVERY_CONFIG_DIR}/owntech_ota_recovery_config.h")
     message(FATAL_ERROR "Prepare the explicitly scoped OTA recovery configuration before building")
   endif()
-  target_sources(app PRIVATE ../owntech/recovery/main.cpp ../owntech/recovery/recovery_core.cpp)
+  target_sources(app PRIVATE ../owntech/recovery/main.cpp ../owntech/recovery/recovery_core.cpp
+    ../owntech/recovery/transition_core.cpp)
   target_include_directories(app PRIVATE ${OWNTECH_RECOVERY_CONFIG_DIR} ../owntech/recovery)
 elseif(OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
   target_sources(app PRIVATE ../owntech/lead/main.cpp)

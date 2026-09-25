@@ -1,0 +1,6 @@
+/* Both USB maintenance utilities must report on USB even after an STLink build. */
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};

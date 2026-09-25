@@ -82,6 +82,17 @@ void init_prepared(Fixture &f)
     init(f,false);f.config.prepared_follower_only=true;
     auto journal=find(f,0x502);journal->bytes[24]=2;put32(journal->bytes+164,3);checksum(journal->bytes,232);
 }
+void init_compact(Fixture &f)
+{
+    init(f,false);f.config.compact_receiver_only=true;f.config.image_size=200;
+    f.config.boards[0]=f.config.boards[1];f.config.board_count=1;
+    for(unsigned i=0;i<32;i++) f.config.artifact_hash[i]=uint8_t(i+170);
+    auto &journal=add(f,0x502,168);uint8_t *p=journal.bytes;
+    put32(p,0x324c544f);put32(p+4,168U<<16|2U);put64(p+8,f.config.campaign);
+    put32(p+20,f.config.image_size);p[24]=6;p[25]=2;p[26]=1;
+    memcpy(p+28,f.config.lead_eui,8);memcpy(p+36,f.config.artifact_hash,32);
+    memcpy(p+68,f.config.image_hash,32);checksum(p,164);
+}
 bool clean(Fixture &f)
 {for(uint16_t key=0x501;key<=0x504;key++) {auto r=find(f,key);if(r && r->size!=-1) return false;}return true;}
 bool preserved(Fixture &f,const uint8_t role[12])
@@ -233,6 +244,48 @@ extern "C" int ota_recovery_test_run()
     CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER);CHECK(f.mutations==mutations);
     f.config.prepared_follower_only=true;put32(find(f,0x502)->bytes+16,1);checksum(find(f,0x502)->bytes,232);
     CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL);CHECK(f.mutations==mutations);
+    /* Compact receivers require their own explicit policy and both hash
+     * domains. Every mutation is restartable without touching Core keys. */
+    const unsigned prearm_states[]={1,2,6,9,10};
+    for(unsigned state:prearm_states) {
+        init_compact(f);find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,164);
+        memcpy(original_role,find(f,0x500)->bytes,12);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERED);
+        CHECK(f.confirmed&&clean(f)&&preserved(f,original_role));
+    }
+    for(unsigned cut=1;cut<=6;cut++) {
+        init_compact(f);memcpy(original_role,find(f,0x500)->bytes,12);f.cut=cut;
+        CHECK(ota_recovery_run(f.config,io(f))<0);CHECK(preserved(f,original_role));
+        f.cut=0;int rc=ota_recovery_run(f.config,io(f));CHECK(rc==OTA_RECOVERED||rc==OTA_RECOVERY_ALREADY_DONE);
+        CHECK(f.confirmed&&clean(f)&&preserved(f,original_role));
+    }
+    for(unsigned state=0;state<=14;state++) if(state!=1&&state!=2&&state!=6&&state!=9&&state!=10) {
+        init_compact(f);find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,164);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    }
+    const unsigned compact_bad_fields[]={0,4,6,8,16,20,25,26,27,28,36,68};
+    for(unsigned offset:compact_bad_fields) {
+        init_compact(f);find(f,0x502)->bytes[offset]^=1;checksum(find(f,0x502)->bytes,164);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    }
+    init_compact(f);find(f,0x502)->bytes[100]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    init_compact(f);find(f,0x502)->size=167;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    init_compact(f);add(f,0x503,308);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_FLEET&&!f.mutations);
+    init_compact(f);f.health_fail=true; /* Includes a pending/inconsistent boot swap. */
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_HEALTH&&!f.mutations);
+    init_compact(f);f.backup[0]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_BACKUP&&!f.mutations);
+    init_compact(f);memcpy(f.config.boards[0].eui,f.config.lead_eui,8);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_CONFIG&&!f.mutations);
+    init_compact(f);f.config.prepared_follower_only=true;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_CONFIG&&!f.mutations);
+    init_compact(f);f.cut=1;CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_STORAGE);f.cut=0;
+    CHECK(find(f,0x504)->bytes[4]==4);mutations=f.mutations;
+    f.config.artifact_hash[0]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER&&f.mutations==mutations);
     return 0;
 }
 #ifndef OWNTECH_FREESTANDING_TEST

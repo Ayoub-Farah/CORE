@@ -17,6 +17,9 @@ struct OtaRecoveryConfig {
     bool staged_lead_only;
     /* Explicit pre-transfer preparation failure; a frozen follower only. */
     bool prepared_follower_only;
+    /* Protocol v2 receiver journal, before any commit intention or arm. */
+    bool compact_receiver_only;
+    uint8_t artifact_hash[32];
 };
 struct OtaRecoveryIO {
     void *context;

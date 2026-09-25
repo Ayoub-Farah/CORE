@@ -4,7 +4,7 @@
 
 namespace {
 constexpr uint16_t MAINTENANCE = 0x0501, JOURNAL = 0x0502, FLEET = 0x0503, MARKER = 0x0504;
-constexpr uint32_t OTA1 = 0x3141544f, OTA2 = 0x3241544f, REC1 = 0x3152434f;
+constexpr uint32_t OTA1 = 0x3141544f, OTA2 = 0x3241544f, OTL2 = 0x324c544f, REC1 = 0x3152434f;
 constexpr int MISSING = -2;
 uint32_t le32(const uint8_t *p)
 { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
@@ -16,6 +16,15 @@ bool crc(const uint8_t *p, size_t offset) { return le32(p+offset)==ota_recovery_
 
 bool journal_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 {
+    if(c.compact_receiver_only) {
+        /* Fixed-width v2: a lost arm acknowledgement must never look prearm.
+         * INTENT(13), COMMITTED(7) and REBOOTING(8) are deliberately excluded. */
+        if(n!=168 || le32(p)!=OTL2 || le32(p+4)!=(168U<<16|2U) || !crc(p,164) ||
+           le64(p+8)!=c.campaign || le32(p+16)!=0 || le32(p+20)!=c.image_size ||
+           p[25]!=2 || p[26]!=1 || p[27] || memcmp(p+28,c.lead_eui,8) ||
+           memcmp(p+36,c.artifact_hash,32) || memcmp(p+68,c.image_hash,32)) return false;
+        return p[24]==1 || p[24]==2 || p[24]==6 || p[24]==9 || p[24]==10;
+    }
     /* Legacy OTA1 Cortex-M ABI uses -fshort-enums: state is one byte.
      * local_record=240, journal at8, CRC at232; padding is CRC-covered. */
     if(n!=240 || le32(p)!=OTA1 || !crc(p,232) || le64(p+8)!=c.campaign ||
@@ -76,8 +85,8 @@ bool fleet_ok(const uint8_t *p, int n, const OtaRecoveryConfig &c)
 void make_marker(uint8_t p[64],const OtaRecoveryConfig &c,const uint8_t eui[8])
 {
     memset(p,0,64);put32(p,REC1);
-    put32(p+4,c.prepared_follower_only?3:(c.staged_lead_only?2:1));put64(p+8,c.campaign);
-    memcpy(p+16,eui,8);memcpy(p+24,c.image_hash,32);put32(p+56,c.image_size);
+    put32(p+4,c.compact_receiver_only?4:(c.prepared_follower_only?3:(c.staged_lead_only?2:1)));put64(p+8,c.campaign);
+    memcpy(p+16,eui,8);memcpy(p+24,c.compact_receiver_only?c.artifact_hash:c.image_hash,32);put32(p+56,c.image_size);
     put32(p+60,ota_recovery_crc32(p,60));
 }
 bool erase_verified(const OtaRecoveryIO &io,uint16_t key)
@@ -97,6 +106,7 @@ uint32_t ota_recovery_crc32(const uint8_t *p,size_t n)
 int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
 {
     if((c.staged_lead_only && c.prepared_follower_only) ||
+       (c.compact_receiver_only && (c.staged_lead_only || c.prepared_follower_only || !nonzero(c.artifact_hash,32))) ||
        !c.campaign || !c.image_size || !c.board_count || c.board_count>16 ||
        !nonzero(c.lead_eui,8) || !nonzero(c.image_hash,32) || !io.read || !io.write ||
        !io.erase || !io.identity || !io.backup_hash || !io.health || !io.confirmed || !io.confirm)
@@ -107,7 +117,7 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
         for(size_t j=0;j<i;j++) if(!memcmp(c.boards[i].eui,c.boards[j].eui,8)) return OTA_RECOVERY_CONFIG;
         if(!memcmp(c.boards[i].eui,c.lead_eui,8)) ++lead_count;
     }
-    if(lead_count!=1) return OTA_RECOVERY_CONFIG;
+    if(lead_count!=(c.compact_receiver_only?0U:1U)) return OTA_RECOVERY_CONFIG;
     uint8_t eui[8],backup[32];
     if(io.identity(io.context,eui)) return OTA_RECOVERY_IDENTITY;
     if(c.staged_lead_only && memcmp(eui,c.lead_eui,8)) return OTA_RECOVERY_IDENTITY;
@@ -131,7 +141,7 @@ int ota_recovery_run(const OtaRecoveryConfig &c,const OtaRecoveryIO &io)
      * to be absent. Any remaining record must still pass every original guard. */
     if(!(resume && jr==MISSING) && !journal_ok(journal,jr,c)) return OTA_RECOVERY_JOURNAL;
     if(!(resume && ar==MISSING) && !maintenance_ok(maintenance,ar)) return OTA_RECOVERY_MAINTENANCE;
-    if((c.prepared_follower_only && fr!=MISSING) ||
+    if(((c.prepared_follower_only || c.compact_receiver_only) && fr!=MISSING) ||
        (c.staged_lead_only && !resume && fr==MISSING) ||
        (fr!=MISSING && !fleet_ok(fleet,fr,c))) return OTA_RECOVERY_FLEET;
     if(io.health(io.context)) return OTA_RECOVERY_HEALTH;

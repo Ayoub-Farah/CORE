@@ -21,12 +21,26 @@
 #ifndef OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY
 #define OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY 0
 #endif
+#ifndef OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY
+#define OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY 0
+#endif
+#ifndef OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES
+#define OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES {0}
+#endif
+#ifndef OWNTECH_OTA_RECOVERY_USEFUL_CAPACITY
+#define OWNTECH_OTA_RECOVERY_USEFUL_CAPACITY 221184U
+#endif
 static_assert(OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY==0 || OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY==1,
               "explicit recovery mode must be 0 or 1");
 static_assert(OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY==0 || OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY==1,
               "explicit follower recovery mode must be 0 or 1");
 static_assert(!(OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY && OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY),
               "recovery modes are mutually exclusive");
+static_assert(OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY==0 || OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY==1,
+              "explicit compact recovery mode must be 0 or 1");
+static_assert(!OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY ||
+              !(OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY || OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY),
+              "compact recovery is separate from legacy policies");
 
 extern uint8_t dt_leg_count;
 extern uint16_t dt_pin_driver[],dt_pin_capacitor[];
@@ -37,7 +51,8 @@ static const uint8_t original_hashes[][32]=OWNTECH_OTA_RECOVERY_ORIGINAL_HASHES;
 static OtaRecoveryConfig config={OWNTECH_OTA_RECOVERY_CAMPAIGN_ID,
     OWNTECH_OTA_RECOVERY_LEAD_EUI_BYTES,OWNTECH_OTA_RECOVERY_IMAGE_HASH_BYTES,
     OWNTECH_OTA_RECOVERY_IMAGE_SIZE,OWNTECH_OTA_RECOVERY_TARGET_COUNT,{},
-    OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY!=0,OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY!=0};
+    OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY!=0,OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY!=0,
+    OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY!=0,OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES};
 static_assert(sizeof(allowed_euis)/8==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"EUI count");
 static_assert(sizeof(original_hashes)/32==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"hash count");
 static_assert(OWNTECH_OTA_RECOVERY_TARGET_COUNT>0 && OWNTECH_OTA_RECOVERY_TARGET_COUNT<=16,"bounded targets");
@@ -102,7 +117,11 @@ int health(void *)
 {
     const int type=mcuboot_swap_type();
     if(type!=BOOT_SWAP_TYPE_NONE && type!=BOOT_SWAP_TYPE_REVERT) return -1;
-    if(config.image_size!=FIXED_PARTITION_SIZE(slot1_partition)) return -1;
+    if(config.compact_receiver_only) {
+        if(!config.image_size || config.image_size>OWNTECH_OTA_RECOVERY_USEFUL_CAPACITY ||
+           OWNTECH_OTA_RECOVERY_USEFUL_CAPACITY>=FIXED_PARTITION_SIZE(slot1_partition)) return -1;
+    }
+    else if(config.image_size!=FIXED_PARTITION_SIZE(slot1_partition)) return -1;
     return safe_outputs();
 }
 bool confirmed(void *) {return boot_is_img_confirmed();}

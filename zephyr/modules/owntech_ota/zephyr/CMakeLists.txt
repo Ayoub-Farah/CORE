@@ -8,7 +8,12 @@ if(CONFIG_OWNTECH_OTA)
   zephyr_include_directories(public_api)
   zephyr_library()
   zephyr_library_sources(src/ota_protocol.c src/ota_participant.cpp
-    src/ota_coordinator.cpp src/ota_safety.cpp src/ota_storage.cpp
-    src/ota_runtime.cpp src/ota_thingset.cpp src/ota_feedback.cpp)
+    src/ota_safety.cpp src/ota_storage.cpp
+    src/ota_thingset.cpp src/ota_feedback.cpp src/ota_console.cpp)
+  if(CONFIG_OWNTECH_OTA_LEAD)
+    zephyr_library_sources(src/ota_lead_runtime.cpp src/ota_coordinator.cpp)
+  else()
+    zephyr_library_sources(src/ota_receiver_runtime.cpp)
+  endif()
   zephyr_library_sources_ifdef(CONFIG_OWNTECH_OTA_LEAD src/ota_usb.cpp)
 endif()

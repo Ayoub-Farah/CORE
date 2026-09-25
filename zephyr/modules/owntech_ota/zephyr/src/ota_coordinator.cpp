@@ -20,6 +20,7 @@ static void next(ota_coordinator *c, uint64_t now)
 { ++c->current_target; c->target_started_ms = now; c->command_sent = false; c->status_polled = false; }
 void ota_coordinator_default_options(ota_coordinator_options *o)
 {
+    memset(o, 0, sizeof(*o));
     o->total_timeout_ms = 600000; o->command_timeout_ms = 20000; o->retry_interval_ms = 250;
     o->inter_block_ms = 10; o->reboot_delay_ms = 1000; o->max_passes = 5; o->max_stalled_passes = 2;
 }
@@ -29,11 +30,11 @@ static int init(ota_coordinator *c, const ota_manifest *m, const ota_target *tar
 {
     if (!c || !m || !targets || !count || count > OTA_MAX_TARGETS || !commit || !hooks ||
         !m->campaign_id || !m->image_size || !m->image_content_size ||
-        m->image_content_size > m->image_size || m->protocol_version != OTA_PROTOCOL_VERSION ||
+        m->image_content_size != m->image_size || m->image_class != OTA_IMAGE_RECEIVER || m->protocol_version != OTA_PROTOCOL_VERSION ||
         !hooks->send_command || !hooks->read_status || !hooks->read_image ||
-        !hooks->send_report || !hooks->report_complete || !hooks->persist || !hooks->reboot_lead)
+        !hooks->send_report || !hooks->report_complete || !hooks->persist)
         return OTA_ERR_ARGUMENT;
-    unsigned leads = 0;
+
     for (size_t i = 0; i < count; ++i) {
         const ota_identity &id = targets[i].identity;
         if (!id.address || id.address >= 254) return OTA_ERR_IDENTITY;
@@ -42,24 +43,30 @@ static int init(ota_coordinator *c, const ota_manifest *m, const ota_target *tar
         for (size_t j = 0; j < i; ++j)
             if (!memcmp(id.eui, targets[j].identity.eui, 8) || id.address == targets[j].identity.address)
                 return OTA_ERR_IDENTITY;
-        if (id.protocol_version != OTA_PROTOCOL_VERSION || id.hardware_id != m->hardware_id ||
+        if (id.protocol_version != OTA_PROTOCOL_VERSION || id.image_class != OTA_IMAGE_RECEIVER || id.hardware_id != m->hardware_id ||
             id.layout_id != m->layout_id || id.bootloader_id != m->bootloader_id) return OTA_ERR_COMPATIBILITY;
         if (id.usable_slot_size < m->image_size || id.usable_image_size < m->image_content_size)
             return OTA_ERR_CAPACITY;
-        if (!recovery && !targets[i].is_lead && (!id.active_confirmed || !id.slot_available)) return OTA_ERR_STATE;
-        if (targets[i].is_lead) ++leads;
+        if (!recovery && (!id.active_confirmed || !id.slot_available)) return OTA_ERR_STATE;
+        if (targets[i].is_lead) return OTA_ERR_IDENTITY;
     }
-    if (leads != 1) return OTA_ERR_IDENTITY;
     memset(c, 0, sizeof(*c)); c->manifest = *m; c->hooks = *hooks; c->commit_id = commit;
     if (options) c->options = *options; else ota_coordinator_default_options(&c->options);
     if (!c->options.total_timeout_ms || !c->options.command_timeout_ms ||
         !c->options.retry_interval_ms || !c->options.max_passes || !c->options.max_stalled_passes ||
         !c->options.reboot_delay_ms || c->options.reboot_delay_ms > 120000) return OTA_ERR_ARGUMENT;
     memcpy(c->targets, targets, count * sizeof(*targets)); c->target_count = (uint8_t)count;
-    for (size_t i = 0; i < count; ++i) if (targets[i].is_lead) c->lead_index = (uint8_t)i;
+    uint8_t any=0;for (unsigned i=0;i<8;i++) any|=c->options.lead_eui[i];
+    if (!any || !c->options.lead_address || c->options.lead_address>=254) return OTA_ERR_IDENTITY;
+    for (size_t i=0;i<count;i++)
+        if (!memcmp(c->options.lead_eui,targets[i].identity.eui,8) ||
+            c->options.lead_address==targets[i].identity.address) return OTA_ERR_IDENTITY;
     c->started_ms = now; c->state = recovery ? OTA_REBOOTING : OTA_PREPARING;
     c->pass_id = 1; c->passes = 1; c->repair_offset = m->image_size;
     phase(c, recovery ? OTA_COORD_RECONCILE : OTA_COORD_PREPARE, now);
+    /* Freeze the complete receiver roster durably before any remote erase. */
+    if (!recovery && c->hooks.persist(c->hooks.context, &c->manifest, c->targets,
+            c->target_count, c->commit_id, OTA_PREPARING)) return fail(c, OTA_ERR_JOURNAL);
     return OTA_OK;
 }
 int ota_coordinator_start(ota_coordinator *c, const ota_manifest *m, const ota_target *targets,
@@ -88,9 +95,9 @@ static int control(ota_coordinator *c, ota_command_type command, uint64_t now)
     if (!c->command_sent || (c->status_polled && now - c->last_command_ms >= c->options.retry_interval_ms)) {
         ota_command cmd = {};
         cmd.type = command; cmd.manifest = c->manifest; cmd.pass_id = c->pass_id;
-        cmd.start_offset = c->pass_start; cmd.commit_id = c->commit_id; cmd.adopt = target->is_lead;
-        cmd.lead_address = c->targets[c->lead_index].identity.address;
-        memcpy(cmd.lead_eui, c->targets[c->lead_index].identity.eui, 8);
+        cmd.start_offset = c->pass_start; cmd.commit_id = c->commit_id; cmd.adopt = false;
+        cmd.lead_address = c->options.lead_address;
+        memcpy(cmd.lead_eui, c->options.lead_eui, 8);
         int rc = c->hooks.send_command(c->hooks.context, target, &cmd);
         if (rc < 0) return fail(c, rc);
         if (rc == OTA_AGAIN) return OTA_AGAIN;
@@ -151,7 +158,9 @@ int ota_coordinator_step(ota_coordinator *c, uint64_t now)
         uint8_t data[OTA_MAX_PAYLOAD];
         size_t n = c->manifest.image_size - c->tx_offset;
         if (n > OTA_MAX_PAYLOAD) n = OTA_MAX_PAYLOAD;
-        if (c->hooks.read_image(c->hooks.context, c->tx_offset, data, n)) return fail(c, OTA_ERR_STORAGE);
+        int source_rc=c->hooks.read_image(c->hooks.context, c->tx_offset, data, n);
+        if (source_rc==OTA_AGAIN) return OTA_AGAIN;
+        if (source_rc) return fail(c, source_rc<0?source_rc:OTA_ERR_STORAGE);
         ota_report report = {OTA_REPORT_DATA, c->manifest.campaign_id, c->pass_id,
                              c->tx_offset, (uint16_t)n, data};
         if (ota_report_encode(&report, c->tx_buffer, sizeof(c->tx_buffer), &c->tx_length)) return fail(c, OTA_ERR_FORMAT);
@@ -175,8 +184,6 @@ int ota_coordinator_step(ota_coordinator *c, uint64_t now)
         if (rc == OTA_AGAIN) return rc;
         if (c->hooks.persist(c->hooks.context, &c->manifest, c->targets, c->target_count,
                              c->commit_id, OTA_REBOOTING)) return fail(c, OTA_ERR_JOURNAL);
-        if (c->hooks.reboot_lead(c->hooks.context, c->manifest.campaign_id, c->commit_id,
-                                c->options.reboot_delay_ms)) return fail(c, OTA_ERR_STATE);
         c->state = OTA_REBOOTING; phase(c, OTA_COORD_RECONCILE, now);
         return OTA_AGAIN;
     }
@@ -241,10 +248,11 @@ int ota_coordinator_step(ota_coordinator *c, uint64_t now)
 }
 int ota_coordinator_abort(ota_coordinator *c)
 {
-    if (!c || c->state == OTA_REBOOTING || c->state == OTA_SUCCEEDED) return OTA_ERR_STATE;
+    if (!c || c->commit_requested || c->commit_may_have_executed || c->committed_count ||
+        c->state == OTA_COMMITTED || c->state == OTA_REBOOTING || c->state == OTA_SUCCEEDED) return OTA_ERR_STATE;
     ota_command cmd = {}; cmd.type = OTA_CMD_ABORT; cmd.manifest = c->manifest;
-    cmd.lead_address = c->targets[c->lead_index].identity.address;
-    memcpy(cmd.lead_eui, c->targets[c->lead_index].identity.eui, 8);
+    cmd.lead_address = c->options.lead_address;
+    memcpy(cmd.lead_eui, c->options.lead_eui, 8);
     int result = OTA_OK;
     for (size_t i = 0; i < c->target_count; ++i) {
         int rc = c->hooks.send_command(c->hooks.context, &c->targets[i], &cmd);

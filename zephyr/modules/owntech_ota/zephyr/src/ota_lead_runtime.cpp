@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "ota_runtime.h"
+#include "OtaLeadService.h"
 #include "ota_storage.h"
 #include "ota_protocol.h"
 #include "owntech_build_info.h"
@@ -25,11 +26,9 @@ struct Work {
     uint8_t data[OTA_MAX_REPORT_SIZE];
 };
 K_MSGQ_DEFINE(ota_queue,sizeof(Work),CONFIG_OWNTECH_OTA_QUEUE_DEPTH,4);
-static K_MUTEX_DEFINE(api_lock);
-static K_SEM_DEFINE(usb_done,0,1);
 static k_spinlock snapshot_lock;
 static atomic_t losses, initialized, busy, healthy, local_healthy, can_ready, lead_role;
-static atomic_t identity_conflict, discovery_requested, stage_end_requested, usb_pending, reconcile_mode, release_pending;
+static atomic_t identity_conflict, discovery_requested, stage_end_requested, reconcile_mode;
 static atomic_t refresh_pending;
 static ota_participant participant;
 static ota_coordinator coordinator;
@@ -47,7 +46,7 @@ static uint64_t discovery_deadline, campaign_id;
 static uint64_t discovery_token;
 static bool discovery_reserved;
 static uint32_t stage_offset;
-static int service_error, usb_result;
+static int service_error;
 static ota_state stage_state=OTA_IDLE;
 static const char *phase_snapshot="BOOT";
 static uint32_t pass_snapshot;
@@ -56,7 +55,18 @@ static ota_manifest reconcile_manifest;
 static uint32_t reconcile_commit;
 static uint64_t reconcile_deadline;
 static bool reconcile_active;
-static ota_participant_hooks storage_hooks;
+/* Exactly one PC-supplied block, never an image in the Lead's secondary slot. */
+struct SourceWindow {
+    uint64_t campaign, deadline;
+    uint32_t offset, length;
+    bool requested, ready;
+    uint8_t data[OTA_MAX_PAYLOAD];
+};
+static SourceWindow source_window;
+/* One previous response permits an ACK-lost retry after the worker advanced
+ * its credit. It cannot authorize a different payload at the same offset. */
+static SourceWindow last_source;
+static ota_manifest accepted_source;
 static uint32_t event_mask, event_ms[OTA_EVENT_COUNT];
 static uint8_t event_order[OTA_EVENT_COUNT], next_event_order;
 static uint64_t event_campaign;
@@ -87,20 +97,20 @@ static void event(ota_event id)
 {
     if(event_mask&(1U<<id)) return;
     event_mask|=1U<<id;event_ms[id]=(uint32_t)k_uptime_get();event_order[id]=++next_event_order;
-    ota_storage_set_events(event_mask,event_ms,event_order);
+
 }
 static void event_campaign_begin(uint64_t id)
 {
     if(event_campaign==id) return;
     event_campaign=id;event_mask=0;next_event_order=0;
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
-    ota_storage_set_events(0,event_ms,event_order);
+
 }
 
 extern "C" const char *ota_state_name(ota_state s)
 {
     static const char *names[]={"IDLE","PREPARING","READY","PASS_OPEN","PASS_CLOSED",
-        "VERIFYING","VALID","COMMITTED","REBOOTING","FAILED","ABORTED","RECOVERY_REQUIRED","SUCCESS"};
+        "VERIFYING","VALID","COMMITTED","REBOOTING","FAILED","ABORTED","RECOVERY_REQUIRED","SUCCESS","COMMIT_INTENT"};
     return (unsigned)s<ARRAY_SIZE(names)?names[s]:"UNKNOWN";
 }
 extern "C" bool ota_service_busy(void) { return atomic_get(&busy); }
@@ -254,51 +264,13 @@ static int enqueue(Work &w)
     if(!atomic_get(&initialized)) return OTA_ERR_STATE;
     return k_msgq_put(&ota_queue,&w,K_NO_WAIT)?OTA_ERR_QUEUE_FULL:0;
 }
-extern "C" void ota_runtime_report(const uint8_t *data,size_t n,uint8_t source)
-{
-    if(n>OTA_MAX_REPORT_SIZE || n<OTA_HEADER_SIZE || memcmp(data,"OTAC",4) ||
-       source==thingset_can_get_inst()->node_addr) return;
-    /* Only the worker decodes/validates the report. SDK-owned bytes are copied. */
-    Work w{};w.type=REPORT;w.source=source;w.length=n;memcpy(w.data,data,n);
-    if(enqueue(w)) atomic_inc(&losses);
-}
-extern "C" int ota_runtime_command(const ota_command *cmd,uint8_t source)
-{
-    if(!cmd || !cmd->manifest.campaign_id) return OTA_ERR_ARGUMENT;
-    if(!ota_service_healthy()) return OTA_ERR_STATE;
-    if(source!=cmd->lead_address || cmd->adopt) return OTA_ERR_IDENTITY;
-    bool found=false;
-    auto key=k_spin_lock(&snapshot_lock);
-    for(unsigned i=0;i<inventory_count;i++) if(inventory[i].observation.identity.address==source &&
-        !memcmp(inventory[i].observation.identity.eui,cmd->lead_eui,8)) found=true;
-    bool conflict=atomic_get(&identity_conflict);k_spin_unlock(&snapshot_lock,key);
-    if(conflict) return OTA_ERR_IDENTITY;
-    if(!found) return OTA_AGAIN; /* A lost claim is retried before PREPARE. */
-    Work w{};w.type=COMMAND;w.command=*cmd;w.source=source;
-    /* Persisted role is a USB preference. Atomically admit all remote commands
-     * against the actual reserved campaign, including their queue insertion. */
-    key=k_spin_lock(&snapshot_lock);
-    if(cmd->type!=OTA_CMD_PREPARE) {
-        if(!ota_service_busy() || accepted_prepare_campaign!=cmd->manifest.campaign_id) {
-            k_spin_unlock(&snapshot_lock,key);return OTA_ERR_CONFLICT;
-        }
-        int rc=enqueue(w);k_spin_unlock(&snapshot_lock,key);return rc;
-    }
-    bool reserved=atomic_cas(&busy,0,1);
-    if(!reserved && accepted_prepare_campaign!=cmd->manifest.campaign_id) {
-        k_spin_unlock(&snapshot_lock,key);return OTA_ERR_STATE;
-    }
-    accepted_prepare_campaign=cmd->manifest.campaign_id;
-    int rc=enqueue(w);
-    if(rc && reserved) {atomic_clear(&busy);accepted_prepare_campaign=0;}
-    k_spin_unlock(&snapshot_lock,key);return rc;
-}
+extern "C" void ota_runtime_report(const uint8_t *,size_t,uint8_t) {}
+extern "C" int ota_runtime_command(const ota_command *,uint8_t) { return OTA_ERR_COMPATIBILITY; }
+
 static int control(void *,const ota_target *t,const ota_command *cmd)
 {
     if(atomic_get(&identity_conflict)) return OTA_ERR_IDENTITY;
-    if(t->is_lead) {
-        int rc=ota_participant_command(&participant,cmd);publish();return rc;
-    }
+    if(t->is_lead) return OTA_ERR_IDENTITY;
     if(cmd->type==OTA_CMD_PREPARE && thingset_can_announce_address(K_MSEC(100))) return OTA_AGAIN;
     int rc=ota_network_command(t,cmd);
     return rc==OTA_ERR_TRANSPORT || rc==OTA_ERR_TIMEOUT || rc==OTA_ERR_QUEUE_FULL?OTA_AGAIN:rc;
@@ -322,68 +294,98 @@ static int observe(void *,const ota_target *t,ota_observation *o)
     }
     k_spin_unlock(&snapshot_lock,key);return 0;
 }
-static int read_image(void *,uint32_t off,uint8_t *p,size_t n) {return ota_storage_read(off,p,n);}
+static int read_image(void *,uint32_t off,uint8_t *p,size_t n)
+{
+    auto key=k_spin_lock(&snapshot_lock);
+    auto &w=source_window;
+    if(!w.requested || w.offset!=off || w.length!=n) {
+        w={};w.campaign=campaign_id;w.offset=off;w.length=n;
+        w.requested=true;w.deadline=k_uptime_get()+20000;
+    }
+    int rc=OTA_AGAIN;
+    if(w.ready) {memcpy(p,w.data,n);rc=0;}
+    else if(k_uptime_get()>=(int64_t)w.deadline) rc=OTA_ERR_TIMEOUT;
+    k_spin_unlock(&snapshot_lock,key);return rc;
+}
+extern "C" void ota_service_source_request(uint64_t *campaign,uint32_t *offset,uint32_t *length)
+{
+    auto key=k_spin_lock(&snapshot_lock);
+    *campaign=source_window.campaign;*offset=source_window.offset;
+    *length=source_window.requested&&!source_window.ready&&!runtime_snapshot.error?source_window.length:0;
+    k_spin_unlock(&snapshot_lock,key);
+}
+extern "C" int ota_service_source_data(uint64_t campaign,uint32_t off,const uint8_t *data,size_t n)
+{
+    if(!data || !n || n>OTA_MAX_PAYLOAD) return OTA_ERR_ARGUMENT;
+    auto key=k_spin_lock(&snapshot_lock);auto &w=source_window;
+    int rc=0;
+    if(runtime_snapshot.error) rc=runtime_snapshot.error;
+    else if(last_source.ready && campaign==last_source.campaign && off==last_source.offset && n==last_source.length) {
+        rc=memcmp(last_source.data,data,n)?OTA_ERR_CONFLICT:0;
+    }
+    else if(!w.requested || campaign!=w.campaign || off!=w.offset || n!=w.length)
+        rc=OTA_ERR_CONFLICT;
+    else if(w.ready && memcmp(w.data,data,n)) rc=OTA_ERR_CONFLICT;
+    else if(!w.ready && k_uptime_get()>=(int64_t)w.deadline) rc=OTA_ERR_TIMEOUT;
+    else {memcpy(w.data,data,n);w.ready=true;last_source=w;}
+    k_spin_unlock(&snapshot_lock,key);return rc;
+}
 static int send_report(void *,const uint8_t *p,size_t n) {return thingset_can_send_raw_report(p,n,K_SECONDS(2));}
 static int report_complete(void *) {return 0;} /* raw sender waits for actual callbacks */
 static int persist(void *,const ota_manifest *m,const ota_target *t,size_t n,uint32_t commit,ota_state state)
 { return ota_storage_persist_campaign(m,t,n,commit,state); }
-static int reboot(void *,uint64_t id,uint32_t commit,uint32_t delay)
-{
-    uint8_t buf[OTA_HEADER_SIZE+8];size_t n;
-    int rc=ota_report_encode_reboot(id,commit,delay,buf,sizeof(buf),&n);
-    return rc?rc:ota_participant_report(&participant,participant.lead_address,buf,n,false);
-}
+/* The dedicated Lead remains running while every receiver reboots. */
+static int reboot(void *,uint64_t,uint32_t,uint32_t) { return 0; }
 static ota_coordinator_hooks hooks={nullptr,control,observe,read_image,send_report,report_complete,persist,reboot};
 
 extern "C" int ota_service_set_role(bool value)
-{
-    if(!atomic_get(&initialized) || !ota_service_local_healthy() || ota_service_error() || !boot_is_img_confirmed() ||
-       ota_storage_recovery_required() || ota_storage_maintenance() || !atomic_cas(&busy,0,1)) return OTA_ERR_STATE;
-    int rc=ota_storage_persist_role(value);
-    if(!rc) {
-        auto key=k_spin_lock(&snapshot_lock);atomic_set(&lead_role,value);
-        diagnostics_snapshot.is_lead=value;k_spin_unlock(&snapshot_lock,key);
-    }
-    atomic_clear(&busy);return rc;
-}
+{ return value?0:OTA_ERR_COMPATIBILITY; }
+
 extern "C" int ota_service_stage_begin(const ota_manifest *m)
 {
-    if(!m || !ota_service_is_lead() || !ota_service_healthy() ||
-       !atomic_cas(&busy,0,1)) return OTA_ERR_STATE;
-    Work w{};w.type=STAGE_BEGIN;w.command.manifest=*m;
-    set_phase("ERASE_BEGIN",true);
+    if(!m || m->protocol_version!=OTA_PROTOCOL_VERSION || m->image_class!=OTA_IMAGE_RECEIVER ||
+       !m->campaign_id || !m->image_size || m->image_size!=m->image_content_size ||
+       m->image_size>CONFIG_OWNTECH_OTA_USABLE_SLOT_SIZE ||
+       m->hardware_id!=CONFIG_OWNTECH_OTA_HARDWARE_ID || m->layout_id!=CONFIG_OWNTECH_OTA_LAYOUT_ID ||
+       m->bootloader_id!=CONFIG_OWNTECH_OTA_BOOTLOADER_ID) return OTA_ERR_COMPATIBILITY;
+    if(!ota_service_is_lead() || !ota_service_healthy()) return OTA_ERR_STATE;
     auto key=k_spin_lock(&snapshot_lock);
+    if(accepted_source.campaign_id) {
+        const auto &a=accepted_source;
+        bool same=a.campaign_id==m->campaign_id && a.image_size==m->image_size &&
+            a.image_content_size==m->image_content_size && a.hardware_id==m->hardware_id &&
+            a.layout_id==m->layout_id && a.bootloader_id==m->bootloader_id &&
+            a.protocol_version==m->protocol_version && a.image_class==m->image_class &&
+            !memcmp(a.artifact_sha256,m->artifact_sha256,32) && !memcmp(a.mcuboot_image_hash,m->mcuboot_image_hash,32) &&
+            !memcmp(a.version,m->version,32) && !memcmp(a.build_id,m->build_id,32);
+        int result=same?runtime_snapshot.error:OTA_ERR_CONFLICT;
+        k_spin_unlock(&snapshot_lock,key);return result;
+    }
+    if(!atomic_cas(&busy,0,1)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_STATE;}
+    accepted_source=*m;
+    k_spin_unlock(&snapshot_lock,key);
+    Work w{};w.type=STAGE_BEGIN;w.command.manifest=*m;
+    set_phase("SOURCE_OPEN",true);
+    key=k_spin_lock(&snapshot_lock);
     accepted_start={};accepted_reconcile={};accepted_prepare_campaign=0;
     runtime_snapshot.campaign=m->campaign_id;runtime_snapshot.image_size=m->image_size;
     runtime_snapshot.offset=0;runtime_snapshot.staging_state=OTA_PREPARING;
     local_snapshot.status.campaign_id=m->campaign_id;local_snapshot.status.state=OTA_PREPARING;
     k_spin_unlock(&snapshot_lock,key);
-    int rc=enqueue(w);if(rc) {atomic_clear(&busy);set_phase("FAILED",true);}return rc;
+    int rc=enqueue(w);if(rc) {
+        key=k_spin_lock(&snapshot_lock);accepted_source={};k_spin_unlock(&snapshot_lock,key);
+        atomic_clear(&busy);set_phase("FAILED",true);
+    }return rc;
 }
 extern "C" int ota_service_stage_data(uint32_t off,const uint8_t *data,size_t n)
-{
-    auto state=view();
-    if(!data || !state.staging || state.verifying || state.staging_state!=OTA_READY ||
-       n>OTA_MAX_PAYLOAD || !n || state.error || atomic_get(&stage_end_requested)) return OTA_ERR_STATE;
-    if(k_mutex_lock(&api_lock,K_NO_WAIT)) return OTA_ERR_CONFLICT;
-    auto key=k_spin_lock(&snapshot_lock);
-    bool reserved=atomic_cas(&usb_pending,0,1);
-    if(reserved) k_sem_reset(&usb_done);
-    k_spin_unlock(&snapshot_lock,key);
-    if(!reserved) {k_mutex_unlock(&api_lock);return OTA_ERR_CONFLICT;}
-    Work w{};w.type=STAGE_DATA;w.offset=off;w.length=n;memcpy(w.data,data,n);
-    int rc=enqueue(w);
-    if(!rc) rc=k_sem_take(&usb_done,K_SECONDS(20))?OTA_ERR_TIMEOUT:usb_result;
-    else atomic_clear(&usb_pending);
-    /* A timed-out operation remains reserved until its worker completion. */
-    k_mutex_unlock(&api_lock);return rc;
-}
+{ return ota_service_source_data(view().campaign,off,data,n); }
+
 extern "C" int ota_service_stage_end(void)
 {
     auto state=view();
     if(state.staged) return 0;
     if(state.verifying || atomic_get(&stage_end_requested)) return OTA_AGAIN;
-    if(!state.staging || state.offset!=state.image_size) return OTA_ERR_INCOMPLETE;
+    if(!state.staging) return OTA_ERR_STATE;
     if(!atomic_cas(&stage_end_requested,0,1)) return OTA_AGAIN;
     Work w{};w.type=STAGE_END;int rc=enqueue(w);if(rc) atomic_clear(&stage_end_requested);return rc;
 }
@@ -412,14 +414,16 @@ extern "C" int ota_service_start(uint64_t campaign,const uint8_t ids[][8],size_t
 extern "C" int ota_service_commit(uint64_t campaign)
 {
     auto state=view();
+    if(campaign==state.campaign && (state.coordinator_phase==OTA_COORD_COMMIT ||
+       state.coordinator_phase==OTA_COORD_REBOOT || state.coordinator_phase==OTA_COORD_RECONCILE)) return state.error;
     if(state.coordinator_phase!=OTA_COORD_VALIDATE_BARRIER || campaign!=state.campaign) return OTA_ERR_STATE;
     Work w{};w.type=COMMIT;w.command.manifest.campaign_id=campaign;return enqueue(w);
 }
 extern "C" int ota_service_abort(uint64_t campaign)
 {
     auto state=view();
-    if(campaign && campaign!=state.campaign) return OTA_ERR_CONFLICT;
-    if(state.reboot_scheduled || state.coordinator_phase==OTA_COORD_REBOOT ||
+    if(!campaign || campaign!=state.campaign) return OTA_ERR_CONFLICT;
+    if(state.reboot_scheduled || state.coordinator_phase==OTA_COORD_COMMIT || state.coordinator_phase==OTA_COORD_REBOOT ||
        state.coordinator_phase==OTA_COORD_RECONCILE) return OTA_ERR_STATE;
     Work w{};w.type=ABORT;return enqueue(w);
 }
@@ -471,37 +475,15 @@ extern "C" int ota_service_reconcile(uint64_t campaign,const uint8_t ids[][8],si
     int rc=enqueue(w);if(rc) {accepted_reconcile={};atomic_clear(&busy);}
     k_spin_unlock(&snapshot_lock,key);return rc;
 }
-extern "C" int ota_runtime_release(const uint8_t identity[8],const uint8_t hash[32],uint8_t source)
-{
-    if(memcmp(identity,eui64,8) || !ota_service_healthy()) return OTA_ERR_IDENTITY;
-    ota_storage_journal journal{};
-    if(ota_storage_get_journal(&journal) || !journal.campaign_id ||
-       memcmp(journal.mcuboot_image_hash,hash,32) || !memcmp(journal.lead_eui,eui64,8)) return OTA_ERR_IDENTITY;
-    bool found=false;
-    auto key=k_spin_lock(&snapshot_lock);
-    for(unsigned i=0;i<inventory_count;i++)
-        if(inventory[i].observation.identity.address==source &&
-           !memcmp(inventory[i].observation.identity.eui,journal.lead_eui,8)) found=true;
-    k_spin_unlock(&snapshot_lock,key);
-    if(atomic_get(&identity_conflict)) return OTA_ERR_IDENTITY;
-    if(!found) return OTA_AGAIN;
-    ota_observation local{};ota_service_local(&local);
-    if(local.status.campaign_id!=journal.campaign_id || local.status.commit_id!=journal.commit_id ||
-       !journal.commit_id || local.rolled_back || !local.confirmed || local.status.error ||
-       memcmp(local.active_mcuboot_image_hash,hash,32) ||
-       strncmp(local.active_version,journal.version,32) || strncmp(local.active_build_id,journal.build_id,32))
-        return OTA_ERR_HEALTH;
-    if(local.status.state==OTA_SUCCEEDED) return 0;
-    if(!atomic_cas(&release_pending,0,1)) return 0;
-    Work w{};w.type=RELEASE;memcpy(w.data,hash,32);
-    int rc=enqueue(w);if(rc) atomic_clear(&release_pending);return rc;
-}
+extern "C" int ota_runtime_release(const uint8_t[8],const uint8_t[32],uint64_t,uint8_t)
+{ return OTA_ERR_COMPATIBILITY; }
+
 static void begin_discovery()
 {
     discovery_active=true;discovery_done=false;probe_address=1;discovery_deadline=k_uptime_get()+18000;
     atomic_set(&discovery_requested,1);
     (void)thingset_can_announce_address(K_MSEC(100));
-    auto key=k_spin_lock(&snapshot_lock);inventory_count=1;inventory[0]={local_snapshot,(uint64_t)k_uptime_get(),true};
+    auto key=k_spin_lock(&snapshot_lock);inventory_count=0;
     if(!reconcile_active) frozen_count=0;
     /* A previously observed conflicting identity cannot be silently forgotten
      * by a rescan, especially when it used this node's own (unprobed) address. */
@@ -521,7 +503,7 @@ static void discovery_step()
     }
     unsigned i;
     auto key=k_spin_lock(&snapshot_lock);
-    for(i=1;i<inventory_count;i++) if(!inventory[i].valid) break;
+    for(i=0;i<inventory_count;i++) if(!inventory[i].valid) break;
     uint8_t address=i<inventory_count?inventory[i].observation.identity.address:0;
     uint8_t expected[8]={};if(address) memcpy(expected,inventory[i].observation.identity.eui,8);
     k_spin_unlock(&snapshot_lock,key);
@@ -540,60 +522,30 @@ static void discovery_step()
 }
 static int freeze(const uint8_t *ids,size_t n,ota_target *targets,bool recovery)
 {
-    bool has_lead=false;
     auto key=k_spin_lock(&snapshot_lock);
     /* Validate the entire set before changing the published frozen roster. */
     for(size_t i=0;i<n;i++) {
         for(size_t j=0;j<i;j++) if(!memcmp(ids+i*8,ids+j*8,8)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_IDENTITY;}
         size_t j=0;for(;j<inventory_count;j++) if(!memcmp(ids+i*8,inventory[j].observation.identity.eui,8)) break;
         if(j==inventory_count && !recovery) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_IDENTITY;}
-        has_lead|=!memcmp(ids+i*8,eui64,8);
+        if(!memcmp(ids+i*8,eui64,8)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_IDENTITY;}
     }
-    if(!has_lead) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_IDENTITY;}
     for(size_t i=0;i<n;i++) {
         size_t j=0;for(;j<inventory_count;j++) if(!memcmp(ids+i*8,inventory[j].observation.identity.eui,8)) break;
         frozen[i]={};
         if(j<inventory_count) frozen[i]=inventory[j];
         else {memcpy(frozen[i].observation.identity.eui,ids+i*8,8);frozen[i].observation.status.error=OTA_ERR_TIMEOUT;}
-        targets[i].identity=frozen[i].observation.identity;targets[i].is_lead=!memcmp(ids+i*8,eui64,8);
-        has_lead|=targets[i].is_lead;
+        targets[i].identity=frozen[i].observation.identity;targets[i].is_lead=false;
     }
-    frozen_count=n;k_spin_unlock(&snapshot_lock,key);return has_lead?0:OTA_ERR_IDENTITY;
+    frozen_count=n;k_spin_unlock(&snapshot_lock,key);return 0;
 }
-static int tracked_prepare(void *,const ota_manifest *m,bool adopt)
-{
-    event_campaign_begin(m->campaign_id);campaign_id=m->campaign_id;
-    if(!adopt) event(OTA_EVENT_ERASE_BEGIN);
-    publish();
-    int rc=storage_hooks.prepare(storage_hooks.context,m,adopt);
-    if(!rc && !adopt) event(OTA_EVENT_ERASE_END);
-    return rc;
-}
-static int tracked_flush(void *)
-{
-    int rc=storage_hooks.flush(storage_hooks.context);
-    if(!rc) event(OTA_EVENT_FLASH_COMPLETE);
-    return rc;
-}
-static int tracked_validate(void *,const ota_manifest *m)
-{
-    event(OTA_EVENT_VERIFY_BEGIN);publish();
-    int rc=storage_hooks.validate(storage_hooks.context,m);
-    if(!rc) event(OTA_EVENT_VERIFY_END);
-    return rc;
-}
-static int tracked_journal(void *,const ota_manifest *m,ota_state state,uint32_t commit)
-{
-    if(state==OTA_COMMITTED) event(OTA_EVENT_ALL_VALIDATED);
-    if(state==OTA_REBOOTING) event(OTA_EVENT_REBOOTING);
-    return storage_hooks.journal(storage_hooks.context,m,state,commit);
-}
+
 static void complete_local_release()
 {
     participant.status.state=OTA_SUCCEEDED;
     ota_storage_boot_identity(&participant.identity);
     coordinator={};staging=staged=verifying=false;discovery_done=false;
-    auto key=k_spin_lock(&snapshot_lock);accepted_prepare_campaign=0;k_spin_unlock(&snapshot_lock,key);
+    auto key=k_spin_lock(&snapshot_lock);accepted_prepare_campaign=0;source_window={};last_source={};accepted_source={};k_spin_unlock(&snapshot_lock,key);
     service_error=0;atomic_clear(&busy);set_phase("SUCCESS");
 }
 static void finish_reconcile(int result)
@@ -609,61 +561,19 @@ static void process(Work &w)
     int rc=0;
     switch(w.type) {
     case REFRESH: atomic_clear(&refresh_pending);break;
-    case COMMAND: {
-        auto key=k_spin_lock(&snapshot_lock);
-        bool owner=ota_service_busy() && accepted_prepare_campaign==w.command.manifest.campaign_id;
-        k_spin_unlock(&snapshot_lock,key);
-        if(!owner) {participant.status.rx_rejected++;break;}
-        participant.status.queue_depth=0;
-        if(w.command.type==OTA_CMD_PREPARE) {
-            atomic_set(&busy,1);rc=ota_storage_expect_lead(w.command.lead_eui);
-        }
-        if(!rc) rc=ota_participant_command(&participant,&w.command);
-        if(!rc && w.command.type==OTA_CMD_BEGIN_PASS) event(OTA_EVENT_CAN_TRANSFER_BEGIN);
-        if(!rc && w.command.type==OTA_CMD_END_PASS && participant.status.offset==participant.status.image_size)
-            event(OTA_EVENT_CAN_TRANSFER_END);
-        if(rc==OTA_ERR_CONFLICT || rc==OTA_ERR_STATE) {participant.status.rx_rejected++;rc=0;}
-        break;
-    }
-    case REPORT:
-        ota_participant_note_loss(&participant,atomic_set(&losses,0));
-        (void)ota_participant_report(&participant,w.source,w.data,w.length,false);break;
+    case COMMAND: case REPORT: case RELEASE: rc=OTA_ERR_COMPATIBILITY;break;
     case STAGE_BEGIN:
         staged_manifest=w.command.manifest;campaign_id=staged_manifest.campaign_id;stage_offset=0;
-        event_campaign_begin(campaign_id);event(OTA_EVENT_ERASE_BEGIN);
+        event_campaign_begin(campaign_id);
         staging=true;staged=verifying=false;service_error=0;atomic_clear(&stage_end_requested);
-        stage_state=OTA_PREPARING;set_phase("ERASE_BEGIN");publish();
-        rc=ota_storage_expect_lead(eui64);
-        if(!rc) rc=ota_storage_stage_begin(&staged_manifest);
-        if(!rc) {event(OTA_EVENT_ERASE_END);event(OTA_EVENT_USB_STAGE_BEGIN);stage_state=OTA_READY;set_phase("STAGING");}
-        else {staging=false;stage_state=OTA_FAILED;}
-        break;
-    case STAGE_DATA:
-        rc=(!staging || verifying || service_error || stage_state!=OTA_READY)?OTA_ERR_STATE:
-            ota_storage_stage_append(w.offset,w.data,w.length);
-        if(!rc && w.offset==stage_offset) stage_offset+=w.length;
-        usb_result=rc;publish();
-        {
-            auto key=k_spin_lock(&snapshot_lock);
-            k_sem_give(&usb_done);atomic_clear(&usb_pending);
-            k_spin_unlock(&snapshot_lock,key);
-        }
-        break;
+        {auto key=k_spin_lock(&snapshot_lock);source_window={};last_source={};k_spin_unlock(&snapshot_lock,key);}
+        stage_state=OTA_READY;set_phase("SOURCE_OPEN");break;
+    case STAGE_DATA: rc=OTA_ERR_STATE;break;
     case STAGE_END:
-        if(staged) {atomic_clear(&stage_end_requested);break;}
-        if(!staging || stage_offset!=staged_manifest.image_size) {
-            rc=OTA_ERR_INCOMPLETE;atomic_clear(&stage_end_requested);break;
-        }
-        event(OTA_EVENT_USB_STAGE_END);
-        rc=tracked_flush(nullptr);
-        if(!rc) {
-            verifying=true;stage_state=OTA_VERIFYING;event(OTA_EVENT_VERIFY_BEGIN);set_phase("VERIFYING");publish();
-            rc=ota_storage_stage_end(&staged_manifest);
-            if(!rc) event(OTA_EVENT_VERIFY_END);
-        }
-        verifying=false;atomic_clear(&stage_end_requested);
-        if(!rc) {staged=true;staging=false;stage_state=OTA_VALID;set_phase("STAGED");}
-        break;
+        if(!staging && !staged) rc=OTA_ERR_STATE;
+        else {staged=true;staging=false;stage_state=OTA_READY;set_phase("SOURCE_READY");}
+        atomic_clear(&stage_end_requested);break;
+
     case START: {
         if(!staged || coordinator.phase!=OTA_COORD_IDLE ||
            w.command.manifest.campaign_id!=staged_manifest.campaign_id) {rc=OTA_ERR_STATE;break;}
@@ -671,6 +581,7 @@ static void process(Work &w)
         if(!rc) {
             ota_coordinator_options opts;ota_coordinator_default_options(&opts);
             opts.inter_block_ms=CONFIG_OWNTECH_OTA_BLOCK_INTERVAL_MS;
+            memcpy(opts.lead_eui,eui64,8);opts.lead_address=thingset_can_get_inst()->node_addr;
             uint32_t commit=(uint32_t)staged_manifest.campaign_id;if(!commit) commit=1;
             rc=ota_coordinator_start(&coordinator,&staged_manifest,targets,w.length,commit,&opts,&hooks,k_uptime_get());
             if(!rc) {staged=false;next_stream_poll=0;stream_poll_target=0;set_phase("PREPARING");}
@@ -685,7 +596,7 @@ static void process(Work &w)
     case ABORT:
         if(participant.reboot_scheduled) rc=OTA_ERR_STATE;
         else if(coordinator.phase!=OTA_COORD_IDLE) rc=ota_coordinator_abort(&coordinator);
-        else {ota_storage_abort();rc=0;}
+        else rc=0;
         if(rc<0 && participant.reboot_scheduled) {
             service_error=rc;set_phase("REBOOTING");publish();return;
         }
@@ -707,14 +618,10 @@ static void process(Work &w)
         if(reconcile_active || staging || staged || verifying || coordinator.phase!=OTA_COORD_IDLE) {
             rc=OTA_ERR_STATE;break;
         }
-        ota_storage_journal j{};rc=ota_storage_get_journal(&j);
-        if(rc || j.campaign_id!=w.command.manifest.campaign_id || memcmp(j.mcuboot_image_hash,w.command.manifest.mcuboot_image_hash,32)) {
-            rc=OTA_ERR_CONFLICT;break;
-        }
         ota_manifest recorded{};ota_target expected[OTA_MAX_TARGETS]{};
         size_t count=OTA_MAX_TARGETS;uint32_t commit=0;
         rc=ota_storage_load_campaign(&recorded,expected,&count,&commit);
-        if(rc || count!=w.length || recorded.campaign_id!=j.campaign_id || commit!=j.commit_id ||
+        if(rc || count!=w.length || recorded.campaign_id!=w.command.manifest.campaign_id || !commit ||
            memcmp(recorded.mcuboot_image_hash,w.command.manifest.mcuboot_image_hash,32)) {
             rc=OTA_ERR_IDENTITY;break;
         }
@@ -726,16 +633,11 @@ static void process(Work &w)
         if(rc) break;
         ota_target targets[OTA_MAX_TARGETS]{};rc=freeze(w.data,w.length,targets,true);
         if(rc) break;
-        campaign_id=j.campaign_id;memcpy(reconcile_hash,w.command.manifest.mcuboot_image_hash,32);
+        campaign_id=recorded.campaign_id;memcpy(reconcile_hash,w.command.manifest.mcuboot_image_hash,32);
         reconcile_manifest=recorded;reconcile_commit=commit;
         reconcile_active=true;atomic_set(&reconcile_mode,1);atomic_set(&busy,1);reconcile_deadline=k_uptime_get()+60000;
         begin_discovery();break;
     }
-    case RELEASE:
-        rc=ota_storage_release_maintenance(w.data);
-        if(!rc) complete_local_release();
-        atomic_clear(&release_pending);
-        break;
     }
     if(rc<0) {
         if(w.type==RECONCILE) finish_reconcile(rc);
@@ -758,6 +660,7 @@ static void reconcile_step()
            (o.status.state!=OTA_RECOVERY_REQUIRED && o.status.state!=OTA_SUCCEEDED) ||
            o.status.campaign_id!=campaign_id || o.status.commit_id!=reconcile_commit ||
            o.status.image_size!=reconcile_manifest.image_size ||
+           o.identity.protocol_version!=OTA_PROTOCOL_VERSION || o.identity.image_class!=OTA_IMAGE_RECEIVER ||
            o.identity.hardware_id!=reconcile_manifest.hardware_id || o.identity.layout_id!=reconcile_manifest.layout_id ||
            o.identity.bootloader_id!=reconcile_manifest.bootloader_id ||
            memcmp(o.active_mcuboot_image_hash,reconcile_hash,32) ||
@@ -771,12 +674,16 @@ static void reconcile_step()
             if(frozen[i].observation.status.state==OTA_SUCCEEDED &&
                frozen[i].observation.status.campaign_id==campaign_id &&
                frozen[i].observation.status.commit_id==reconcile_commit) continue;
-            int rc=ota_network_release(frozen[i].observation.identity.address,frozen[i].observation.identity.eui,reconcile_hash);
+            int rc=ota_network_release(frozen[i].observation.identity.address,frozen[i].observation.identity.eui,reconcile_hash,campaign_id);
             if(rc) return;
             released=false; /* Accepted is not completed: confirm the next fresh status. */
         }
         if(!released) return;
-        if(ota_storage_release_maintenance(reconcile_hash)) {finish_reconcile(OTA_ERR_JOURNAL);return;}
+        ota_target targets[OTA_MAX_TARGETS]{};
+        for(unsigned i=0;i<frozen_count;i++) targets[i].identity=frozen[i].observation.identity;
+        if(ota_storage_persist_campaign(&reconcile_manifest,targets,frozen_count,reconcile_commit,OTA_SUCCEEDED)) {
+            finish_reconcile(OTA_ERR_JOURNAL);return;
+        }
         complete_local_release();finish_reconcile(0);return;
     }
     if(k_uptime_get()>(int64_t)reconcile_deadline) finish_reconcile(OTA_ERR_TIMEOUT);
@@ -801,53 +708,12 @@ static void update_can_readiness()
 }
 static void initialize_runtime()
 {
-    int rc=ota_storage_init();bool role=false;
-    if(!rc) rc=ota_storage_load_role(&role);
-    atomic_set(&lead_role,role);ota_identity id{};memcpy(id.eui,eui64,8);id.protocol_version=OTA_PROTOCOL_VERSION;
-    ota_storage_boot_identity(&id);ota_storage_hooks(&storage_hooks);
-    ota_participant_hooks tracked=storage_hooks;
-    tracked.prepare=tracked_prepare;tracked.flush=tracked_flush;tracked.validate=tracked_validate;tracked.journal=tracked_journal;
-    ota_participant_init(&participant,&id,&tracked,ota_storage_recovery_required());
-    if(rc) service_error=OTA_ERR_JOURNAL;
-
-    /* Identity is useful even when CAN or application validation fails. Never
-     * substitute an unpublished zero hash for the actual running image. */
+    int rc=ota_storage_init();
+    atomic_set(&lead_role,1);memcpy(participant.identity.eui,eui64,8);
+    ota_storage_boot_identity(&participant.identity);
+    if(rc || ota_storage_recovery_required() || ota_storage_maintenance()) service_error=OTA_ERR_JOURNAL;
     if(!service_error && ota_storage_active_hash(local_snapshot.active_mcuboot_image_hash)) service_error=OTA_ERR_HEALTH;
-    ota_storage_journal j{};int jr=ota_storage_get_journal(&j);
-    if(jr) service_error=OTA_ERR_JOURNAL;
-    bool strict_boot=j.campaign_id || ota_storage_maintenance() || ota_storage_recovery_required();
-    if(!jr && j.campaign_id) {
-        campaign_id=j.campaign_id;event_campaign=j.campaign_id;
-        participant.status.campaign_id=j.campaign_id;participant.status.commit_id=j.commit_id;
-        participant.status.image_size=j.image_size;
-        participant.manifest.campaign_id=j.campaign_id;participant.manifest.image_size=j.image_size;
-        memcpy(participant.manifest.version,j.version,32);memcpy(participant.manifest.build_id,j.build_id,32);
-        memcpy(participant.manifest.mcuboot_image_hash,j.mcuboot_image_hash,32);
-        memcpy(participant.manifest.artifact_sha256,j.artifact_sha256,32);
-        memcpy(participant.lead_eui,j.lead_eui,8);
-        event_mask=j.event_mask;memcpy(event_ms,j.event_ms,sizeof(event_ms));
-        memcpy(event_order,j.event_order,sizeof(event_order));
-        next_event_order=0;uint32_t orders=0;uint8_t count=0;
-        if(event_mask&~((1U<<OTA_EVENT_COUNT)-1)) service_error=OTA_ERR_JOURNAL;
-        for(size_t i=0;i<OTA_EVENT_COUNT;i++) if(event_mask&(1U<<i)) {
-            ++count;
-            uint8_t order=event_order[i];
-            if(!order || order>OTA_EVENT_COUNT || (orders&(1U<<order))) service_error=OTA_ERR_JOURNAL;
-            else {orders|=1U<<order;if(order>next_event_order) next_event_order=order;}
-        }
-        else if(event_ms[i] || event_order[i]) service_error=OTA_ERR_JOURNAL;
-        if(next_event_order!=count) service_error=OTA_ERR_JOURNAL;
-        if(j.state==OTA_SUCCEEDED && !ota_storage_maintenance()) participant.status.state=OTA_SUCCEEDED;
-        if(j.state==OTA_VALID || j.state==OTA_COMMITTED || j.state==OTA_REBOOTING || j.state==OTA_SUCCEEDED) {
-            participant.status.offset=j.image_size;participant.status.flash_complete=true;participant.status.validated=true;
-        }
-        if(memcmp(j.mcuboot_image_hash,local_snapshot.active_mcuboot_image_hash,32) ||
-           strncmp(j.version,OWNTECH_FIRMWARE_VERSION,32) || strncmp(j.build_id,OWNTECH_FIRMWARE_BUILD_ID,32))
-            local_snapshot.rolled_back=true;
-        if(local_snapshot.rolled_back || (!boot_is_img_confirmed() &&
-           j.state!=OTA_COMMITTED && j.state!=OTA_REBOOTING && j.state!=OTA_SUCCEEDED)) service_error=OTA_ERR_HEALTH;
-    }
-    else if(strict_boot) service_error=OTA_ERR_JOURNAL;
+    bool strict_boot=false;
 
     auto can=thingset_can_get_inst();
     thingset_can_set_state_callback(can_state_changed,nullptr);
@@ -919,10 +785,16 @@ static void worker_iteration()
             (void)ota_coordinator_abort(&coordinator);service_error=OTA_ERR_IDENTITY;set_phase("FAILED");publish();return;
         }
         int rc=ota_coordinator_step(&coordinator,k_uptime_get());
-        pass_snapshot=coordinator.pass_id;
+        pass_snapshot=coordinator.pass_id;stage_offset=coordinator.tx_offset;
         if(coordinator.phase==OTA_COORD_STREAM) {event(OTA_EVENT_CAN_TRANSFER_BEGIN);stream_status_poll();}
         if(coordinator.phase==OTA_COORD_FINALIZE) event(OTA_EVENT_CAN_TRANSFER_END);
         if(coordinator.phase==OTA_COORD_VALIDATE_BARRIER) event(OTA_EVENT_ALL_VALIDATED);
+        if(coordinator.phase==OTA_COORD_RECONCILE) {
+            reconcile_manifest=coordinator.manifest;reconcile_commit=coordinator.commit_id;
+            memcpy(reconcile_hash,coordinator.manifest.mcuboot_image_hash,32);
+            reconcile_active=true;atomic_set(&reconcile_mode,1);
+            reconcile_deadline=k_uptime_get()+60000;begin_discovery();
+        }
         if(rc<0) {service_error=rc;set_phase("FAILED");}
         else {
             static const char *phases[]={"IDLE","PREPARING","BEGIN_PASS","CAN_TRANSFER","END_PASS","VERIFYING",

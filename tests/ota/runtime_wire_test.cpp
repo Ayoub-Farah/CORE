@@ -1,4 +1,5 @@
 /* Execute both sides of the production ThingSet OTA adapter wire codec. */
+#define CONFIG_OWNTECH_OTA_LEAD 1
 #include "sdk_shim/sdk_host.h"
 #undef CONFIG_THINGSET_CAN_MULTIPLE_INSTANCES
 #define K_SEM_DEFINE(n,v,m) struct k_sem n={(v),(m)}
@@ -25,8 +26,8 @@ static uint8_t packet_copy[256];
 static size_t packet_length;
 extern "C" int ota_runtime_command(const ota_command *cmd,uint8_t source)
 {captured_command=*cmd;assert(source==2);return command_result;}
-extern "C" int ota_runtime_release(const uint8_t id[8],const uint8_t hash[32],uint8_t source)
-{assert(!memcmp(id,eui64,8));assert(!memcmp(hash,observation.active_mcuboot_image_hash,32));assert(source==2);release_calls++;return 0;}
+extern "C" int ota_runtime_release(const uint8_t id[8],const uint8_t hash[32],uint64_t campaign,uint8_t source)
+{assert(!memcmp(id,eui64,8));assert(!memcmp(hash,observation.active_mcuboot_image_hash,32));assert(source==2);assert(campaign==observation.status.campaign_id);release_calls++;return 0;}
 extern "C" void ota_service_local(ota_observation *o){*o=observation;}
 extern "C" void ota_runtime_claim(const uint8_t id[8],uint8_t address){}
 extern "C" void ota_runtime_report(const uint8_t *data,size_t length,uint8_t address){}
@@ -52,7 +53,7 @@ extern "C" int thingset_can_send(uint8_t *packet,size_t n,uint8_t address,uint8_
         int rc;
         if(id==COMMAND){assert(n==7+COMMAND_LENGTH);memcpy(command_buffer,packet+7,COMMAND_LENGTH);
             command_value.num_bytes=packet[6];rc=receive_command();}
-        else {assert(id==RELEASE&&n==47);memcpy(release_buffer,packet+7,40);release_value.num_bytes=40;rc=release_maintenance();}
+        else {assert(id==RELEASE&&n==55);memcpy(release_buffer,packet+7,48);release_value.num_bytes=48;rc=release_maintenance();}
         assert(rc>=-24&&rc<24);reply[2]=rc<0?0x20-rc-1:rc;
     }
     callback(reply,size,0,0,address,arg);return 0;
@@ -63,18 +64,18 @@ int main()
     ota_command cmd{};cmd.type=OTA_CMD_PREPARE;cmd.manifest.campaign_id=UINT64_C(0x1234567890ABCDEF);
     cmd.manifest.image_size=227328;cmd.manifest.image_content_size=98127;
     cmd.manifest.hardware_id=42;cmd.manifest.layout_id=17;cmd.manifest.bootloader_id=99;
-    cmd.manifest.protocol_version=1;memcpy(cmd.manifest.version,"1.2.3",6);memcpy(cmd.manifest.build_id,"build-A",8);
+    cmd.manifest.protocol_version=OTA_PROTOCOL_VERSION;cmd.manifest.image_class=OTA_IMAGE_RECEIVER;memcpy(cmd.manifest.version,"1.2.3",6);memcpy(cmd.manifest.build_id,"build-A",8);
     memset(cmd.manifest.artifact_sha256,0xAB,32);memset(cmd.manifest.mcuboot_image_hash,0xCD,32);
     memset(cmd.lead_eui,0x19,8);cmd.lead_address=2;cmd.pass_id=3;cmd.start_offset=512;cmd.commit_id=7;
     assert(ota_network_command(&target,&cmd)==0);
-    assert(packet_length==195&&!memcmp(&cmd,&captured_command,sizeof(cmd)));
+    assert(packet_length==196&&!memcmp(&cmd,&captured_command,sizeof(cmd)));
     request_scope=false;assert(ota_network_command(&target,&cmd)==OTA_ERR_IDENTITY);request_scope=true;
     actual_source=3;assert(ota_network_command(&target,&cmd)==OTA_ERR_IDENTITY);actual_source=2;
     actual_route=1;assert(ota_network_command(&target,&cmd)==OTA_ERR_IDENTITY);actual_route=0;
     command_result=OTA_AGAIN;assert(ota_network_command(&target,&cmd)==OTA_AGAIN);command_result=0;
     command_result=OTA_ERR_QUEUE_FULL;assert(ota_network_command(&target,&cmd)==OTA_ERR_QUEUE_FULL);command_result=0;
 
-    observation.identity=target.identity;observation.identity.protocol_version=1;
+    observation.identity=target.identity;observation.identity.protocol_version=OTA_PROTOCOL_VERSION;observation.identity.image_class=OTA_IMAGE_RECEIVER;
     observation.identity.usable_slot_size=227328;observation.identity.usable_image_size=221184;
     observation.identity.hardware_id=42;observation.identity.layout_id=17;observation.identity.bootloader_id=99;
     observation.identity.active_confirmed=true;observation.identity.slot_available=true;
@@ -92,7 +93,7 @@ int main()
     observation.event_ms[OTA_EVENT_POSTBOOT_CHECK]=10;observation.event_order[OTA_EVENT_POSTBOOT_CHECK]=3;
     ota_observation decoded{};assert(ota_network_status(2,&decoded)==0);
     assert(!memcmp(&observation,&decoded,sizeof(observation)));
-    assert(ota_network_release(2,eui64,observation.active_mcuboot_image_hash)==0);
+    assert(ota_network_release(2,eui64,observation.active_mcuboot_image_hash,observation.status.campaign_id)==0);
     assert(release_calls==1&&claim_announcements==1);
     response_data[0]=THINGSET_STATUS_CHANGED;response_data[1]=0xF6;response_data[2]=0;
     response_length=4;assert(exec_result()==OTA_ERR_TRANSPORT);

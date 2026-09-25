@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 from lead_update import CampaignError, Journal, identity, select_port
-from ota_artifact import inspect_image
+from ota_artifact import inspect_usb_image
 from prepare_ota_recovery import _object, recovery_config, render_header, require
 from smp_transport import CommandError, ProtocolError, SerialSMP, TransportError
 from bootloader_upload import upload_image, UploadError
@@ -41,7 +41,7 @@ def verify_inputs(config_path, image_path, manifest_path, target_identity, *, st
     require(manifest.get("version") == version and manifest.get("build_id") == build_id,
             "image manifest does not identify this dedicated recovery configuration")
     data = Path(image_path).read_bytes()
-    actual = inspect_image(data, manifest["profile"], version, build_id)
+    actual = inspect_usb_image(data, manifest["profile"], version, build_id, manifest.get("image_class", "receiver"))
     for field in ("protocol", "format", "activation_trailer", "artifact_size", "useful_size", "artifact_sha256",
                   "mcuboot_image_hash", "version", "build_id", "hardware_id", "layout_id", "bootloader_id"):
         require(manifest.get(field) == actual[field], "recovery image bytes contradict manifest " + field)

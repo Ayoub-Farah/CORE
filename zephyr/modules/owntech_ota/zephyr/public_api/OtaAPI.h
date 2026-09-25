@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define OTA_PROTOCOL_VERSION 1U
+#define OTA_PROTOCOL_VERSION 2U
 #define OTA_MAX_PAYLOAD 256U
 #define OTA_HEADER_SIZE 32U
 #define OTA_MAX_REPORT_SIZE 320U
@@ -20,8 +20,10 @@ extern "C" {
 enum ota_state {
     OTA_IDLE, OTA_PREPARING, OTA_READY, OTA_PASS_OPEN, OTA_PASS_CLOSED,
     OTA_VERIFYING, OTA_VALID, OTA_COMMITTED, OTA_REBOOTING, OTA_FAILED,
-    OTA_ABORTED, OTA_RECOVERY_REQUIRED, OTA_SUCCEEDED
+    OTA_ABORTED, OTA_RECOVERY_REQUIRED, OTA_SUCCEEDED, OTA_COMMIT_INTENT
 };
+
+enum ota_image_class { OTA_IMAGE_RECEIVER = 1, OTA_IMAGE_LEAD = 2 };
 
 enum ota_result {
     OTA_OK = 0, OTA_IGNORED = 1, OTA_AGAIN = 2,
@@ -35,15 +37,16 @@ enum ota_result {
 };
 
 /* IDs identify the complete provisioned compatibility tuple, including revisions.
- * artifact_sha256 is SHA256 of the exact padded firmware.mcuboot.bin file, not MCUboot's image hash. */
+ * artifact_sha256 is SHA256 of the exact compact signed file, not MCUboot's image hash. */
 struct ota_manifest {
     uint64_t campaign_id;
-    uint32_t image_size; /* Exact padded file length. */
+    uint32_t image_size; /* Exact compact file length, equal to image_content_size. */
     uint32_t image_content_size; /* Header + program + protected/unprotected TLVs. */
     uint32_t hardware_id;
     uint32_t layout_id;
     uint32_t bootloader_id;
     uint8_t protocol_version;
+    uint8_t image_class;
     uint8_t artifact_sha256[32];
     uint8_t mcuboot_image_hash[32];
     char version[OTA_IDENTITY_TEXT_SIZE];
@@ -54,7 +57,8 @@ struct ota_identity {
     uint8_t eui[8];
     uint8_t address;
     uint8_t protocol_version;
-    uint32_t usable_slot_size; /* Maximum padded artifact length. */
+    uint8_t image_class;
+    uint32_t usable_slot_size; /* Physical secondary slot size. */
     uint32_t usable_image_size; /* Qualified useful content bound. */
     uint32_t hardware_id;
     uint32_t layout_id;
@@ -83,13 +87,13 @@ struct ota_status {
 /* All callbacks run in the OTA worker, never CAN RX/ISR or under ThingSet locks.
  * prepare must atomically reserve the shared slot owner and revalidate MCUboot
  * state, establish safe maintenance, persist/verify its marker BEFORE erase,
- * then initialize the writer. adopt=true instead claims a closed, fully staged
- * USB image for exclusive reading; it MUST NOT erase or initialize a writer.
+ * then initialize the writer. adopt=true is rejected by the v2 receiver.
  * prepare failure must clean up any partial acquisition, retaining maintenance.
- * validate rereads exact image_size bytes, checks artifact SHA256, padded image
+ * validate rereads exact image_size bytes, checks artifact SHA256, compact image
  * bounds/TLV and compatibility. It is not authoritative signature validation.
  * journal persists campaign/state/commit and maintenance through the existing
- * NVS owner. Commit only authorizes reset: padded files may already be pending.
+ * NVS owner. COMMIT_INTENT is durable before arm requests an MCUboot test swap;
+ * COMMITTED is durable only after successful arming. No transfer writes trailer.
  * All callbacks return 0 on success.
  * close releases resources WITHOUT clearing maintenance or erasing an armed slot.
  * schedule_reboot must preserve the first deadline for the same commit.
@@ -103,6 +107,7 @@ struct ota_participant_hooks {
     int (*journal)(void *, const struct ota_manifest *, enum ota_state, uint32_t commit_id);
     int (*schedule_reboot)(void *, uint32_t commit_id, uint32_t delay_ms);
     void (*close)(void *);
+    int (*arm)(void *, const struct ota_manifest *, uint32_t commit_id);
 };
 
 struct ota_participant {
@@ -192,6 +197,8 @@ struct ota_target {
 };
 
 struct ota_coordinator_options {
+    uint8_t lead_eui[8];
+    uint8_t lead_address;
     uint32_t total_timeout_ms;
     uint32_t command_timeout_ms;
     uint32_t retry_interval_ms;
@@ -208,10 +215,11 @@ struct ota_coordinator_options {
  * After reboot the discovery layer may resolve that EUI at a new address.
  * report_complete returns OTA_OK only after true TX completion, OTA_AGAIN while
  * in flight, negative on failure. send_report must retain/copy bytes until then.
- * read_image reads the exclusively owned Lead slot; it never changes its writer.
+ * read_image reads the bounded PC source window; OTA_AGAIN requests host data.
  * persist records the manifest, COMPLETE frozen target list and commit before
- * COMMIT; return failure if durability is unavailable. reboot_lead schedules the
- * local reboot only after broadcast TX completion. On restart, reconstruct the
+ * COMMIT; return failure if durability is unavailable. The dedicated Lead never
+ * reboots for a receiver campaign (reboot_lead is a reserved legacy callback).
+ * On restart, reconstruct the
  * same list/manifest from the journal and call resume_reconciliation.
  */
 struct ota_coordinator_hooks {
@@ -278,7 +286,7 @@ int ota_coordinator_start(struct ota_coordinator *, const struct ota_manifest *,
  * One call performs bounded work (one control/status exchange or one block).
  * OTA_AGAIN denotes ongoing work; terminal errors remain observable. */
 int ota_coordinator_step(struct ota_coordinator *, uint64_t now_ms);
-/* Explicit all-VALID barrier; never requests an MCUboot arm operation. */
+/* Explicit all-VALID barrier; permits COMMIT commands which arm receiver trials. */
 int ota_coordinator_commit(struct ota_coordinator *, uint64_t campaign_id, uint32_t commit_id);
 int ota_coordinator_abort(struct ota_coordinator *);
 int ota_coordinator_resume_reconciliation(struct ota_coordinator *,

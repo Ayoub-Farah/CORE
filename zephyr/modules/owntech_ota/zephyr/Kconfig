@@ -10,7 +10,7 @@ menuconfig OWNTECH_OTA
 	select CRC
 	select ZCBOR
 	select NET_BUF
-	select BASE64
+	select BASE64 if OWNTECH_OTA_LEAD
 	help
 	  One bus, one campaign, sequential storage. Legacy ThingSet DFU must be
 	  disabled so it cannot bypass the shared slot owner. A provisioned boot
@@ -19,15 +19,25 @@ menuconfig OWNTECH_OTA
 if OWNTECH_OTA
 
 config OWNTECH_OTA_LEAD
-	bool "Compile coordinator and application USB staging"
+	bool "Compile dedicated coordinator and USB file source"
 	default n
 	help
-	  Capability only. Lead/participant role is persisted separately.
+	  Build-time image class: a Lead cannot adopt a receiver application.
+	  The receiver build omits the coordinator and fleet tables.
+
+config OWNTECH_OTA_DEFERRED_ARM_QUALIFIED
+	bool "Installed bootloader qualified for compact images and deferred arm"
+	default n
+	help
+	  Enable only after validating erase geometry, sparse trailer writes and
+	  MCUboot test-swap/rollback on the installed bootloader. Without this
+	  qualification the receiver refuses PREPARE before erasing its slot.
 
 config OWNTECH_OTA_QUEUE_DEPTH
 	int "Ordered command/data queue depth"
 	range 2 32
-	default 8
+	default 8 if OWNTECH_OTA_LEAD
+	default 3
 
 config OWNTECH_OTA_STACK_SIZE
 	int "OTA worker stack size"

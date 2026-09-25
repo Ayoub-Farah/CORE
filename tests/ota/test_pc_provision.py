@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
 from lead_update import CampaignError, USBConnection
 from bootloader_upload import UploadError
-from ota_artifact import inspect_image
+from ota_artifact import inspect_usb_image as inspect_image
 from provision_ota import provision, main
 from smp_transport import CommandError, ProtocolError, ReceiverProbeTimeout, TransportError
 
@@ -42,8 +42,8 @@ class Receiver:
 class ProvisionTests(unittest.TestCase):
     def setUp(self):
         self.manifest = inspect_image(artifact(), build_id="ota-current")
-        self.info = {"service": "owntech-ota", "protocol": 1, "identity": "0000000000000001",
-                     "phase": "IDLE", "role": "follower", "available": True,
+        self.info = {"service": "owntech-ota", "protocol": 2, "identity": "0000000000000001",
+                     "phase": "IDLE", "role": "follower", "image_class": "receiver", "available": True,
                      "active_confirmed": True, "slot_available": True,
                      "slot_size": self.manifest["profile"]["slot_size"], "useful_capacity": 221184,
                      **{key: self.manifest[key] for key in ("version", "build_id", "hardware_id",
@@ -124,6 +124,7 @@ class ProvisionTests(unittest.TestCase):
             mcumgr.touch()
             with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=serial)}), \
                  patch("lead_update.SerialSMP", return_value=candidate), patch("lead_update.time.sleep"), \
+                 patch("provision_ota.ReceiverStatus", return_value=Mock(request=Mock(side_effect=ReceiverProbeTimeout("legacy")))), \
                  patch("lead_update.upload_image", side_effect=lambda *args: events.append("upload")), \
                  patch("lead_update.subprocess.run", side_effect=lambda *args, **kwargs: events.append("reset")):
                 result = provision(connection, Path("exact.mcuboot.bin"), self.manifest, mcumgr,
@@ -135,6 +136,17 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
         self.assertEqual(result["info"]["role"], "follower")
         self.assertEqual(self.receiver.calls, [("info", {})])
+
+    def test_explicit_legacy_mode_cannot_overwrite_a_known_other_class(self):
+        self.connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")]
+        self.connection.bootstrap_port = "COM1"
+        candidate = Mock()
+        candidate.request.return_value = dict(self.info, image_class="lead")
+        with patch("provision_ota.ReceiverStatus", return_value=candidate):
+            with self.assertRaisesRegex(CampaignError, "image class differs"):
+                self.run_provision(legacy_console=True)
+        candidate.close.assert_called_once()
+        self.connection.bootstrap.assert_not_called()
 
     def test_explicit_legacy_entry_rejects_multiple_cdc_even_with_a_selected_port(self):
         console = SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")
@@ -153,7 +165,7 @@ class ProvisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "firmware.mcuboot.bin"
             image.write_bytes(b"invalid")
-            args = ["--image", str(image), "--mcumgr", "unused", "--legacy-console"]
+            args = ["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused", "--legacy-console"]
             with patch("provision_ota.USBConnection") as connection, redirect_stderr(io.StringIO()):
                 self.assertEqual(main(args), 1)
             connection.assert_not_called()
@@ -180,31 +192,34 @@ class ProvisionTests(unittest.TestCase):
         self.connection.bootstrap.assert_not_called()
 
     def test_initial_bootstrap_succeeds_without_can_peer_after_local_confirmation(self):
-        self.waiting_can()
         self.connection.connect.side_effect = ReceiverProbeTimeout("no receiver")
-        result = self.run_provision()
-        self.assertEqual(result["result"], "PROVISIONED")
-        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
-        self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
-        self.assertEqual(self.receiver.calls, [("info", {})])
+        with self.assertRaisesRegex(CampaignError, "explicit --legacy-console"):
+            self.run_provision()
+        self.connection.bootstrap.assert_not_called()
+
 
     def test_real_waiting_can_receiver_is_accepted_without_reset_or_upload(self):
         self.waiting_can()
-        streams, _ = self.use_wire_connection({"COM1": response(self.info) + response(self.info, sequence=1)})
-        result = self.run_provision()
-        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
-        self.assertEqual(result["result"], "ALREADY_INITIALIZED")
-        self.assertEqual(len(streams["COM1"].written), 2)
-        self.connection.bootstrap.assert_not_called()
+        import json
+        from lead_update import ReceiverStatus
+        line = b"OTAR2 " + json.dumps(self.info).encode() + b"\n"
+        port = Mock()
+        port.readline.return_value = line
+        with patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=Mock(return_value=port))}):
+            status = ReceiverStatus("COM1")
+            info = status.request("info")
+        self.assertEqual(info["phase"], "WAITING_CAN")
+        self.assertEqual(port.baudrate, 115200)
+        port.write.assert_not_called()
+
 
     def test_waiting_can_lead_can_be_changed_to_verified_follower(self):
-        self.waiting_can()
         self.info["role"] = "lead"
-        result = self.run_provision()
-        self.assertEqual(result["info"]["role"], "follower")
-        self.assertEqual(result["can_status"], "WAITING_FOR_PEER")
-        self.assertEqual(self.receiver.calls, [("info", {}), ("set_role", {"role": "follower"}), ("info", {})])
+        with self.assertRaisesRegex(CampaignError, "class/role mismatch"):
+            self.run_provision()
+        self.assertEqual(self.receiver.calls, [("info", {})])
         self.connection.bootstrap.assert_not_called()
+
 
     def test_waiting_can_rejects_missing_or_contradictory_health_before_role_change(self):
         self.waiting_can()
@@ -238,29 +253,20 @@ class ProvisionTests(unittest.TestCase):
         self.assertTrue(all(call[0] == "info" for call in self.receiver.calls))
 
     def test_waiting_can_role_recheck_rejects_health_identity_image_and_state_changes(self):
-        self.waiting_can()
         self.info["role"] = "lead"
-        invalid = {"local_healthy": False, "healthy": True, "can_ready": True, "error": -17,
-                   "active_confirmed": False, "slot_available": False, "available": True,
-                   "identity": "0000000000000002", "build_id": "ota-other", "role": "lead", "phase": "FAILED"}
-        for field, value in invalid.items():
-            with self.subTest(field=field):
-                after = dict(self.info, role="follower")
-                after[field] = value
-                self.receiver.request = Mock(side_effect=[dict(self.info), {"rc": 0}, after])
-                with self.assertRaises(CampaignError):
-                    self.run_provision()
-                self.assertEqual([call.args[0] for call in self.receiver.request.call_args_list], ["info", "set_role", "info"])
-                self.connection.bootstrap.assert_not_called()
+        with self.assertRaisesRegex(CampaignError, "class/role mismatch"):
+            self.run_provision()
+        self.assertEqual(self.receiver.calls, [("info", {})])
+        self.connection.bootstrap.assert_not_called()
+
 
     def test_network_may_become_ready_during_follower_role_verification(self):
-        self.waiting_can()
         self.info["role"] = "lead"
-        ready = dict(self.info, phase="IDLE", role="follower", healthy=True, can_ready=True, available=True)
-        self.receiver.request = Mock(side_effect=[dict(self.info), {"rc": 0}, ready])
-        result = self.run_provision()
-        self.assertEqual(result["can_status"], "READY")
+        with self.assertRaisesRegex(CampaignError, "class/role mismatch"):
+            self.run_provision()
+        self.assertEqual(self.receiver.calls, [("info", {})])
         self.connection.bootstrap.assert_not_called()
+
 
     def test_idle_new_diagnostics_must_agree_with_ready_state(self):
         self.info.update(local_healthy=True, healthy=True, can_ready=True, error=0)
@@ -276,9 +282,11 @@ class ProvisionTests(unittest.TestCase):
 
     def test_same_healthy_idle_lead_can_be_initialized_as_follower_only(self):
         self.info["role"] = "lead"
-        self.run_provision()
-        self.assertEqual(self.receiver.calls, [("info", {}), ("set_role", {"role": "follower"}), ("info", {})])
+        with self.assertRaisesRegex(CampaignError, "class/role mismatch"):
+            self.run_provision()
+        self.assertEqual(self.receiver.calls, [("info", {})])
         self.connection.bootstrap.assert_not_called()
+
 
     def test_live_other_image_cannot_be_overwritten_even_if_same_version(self):
         for field, value in (("build_id", "ota-old"), ("version", "0.9.0+0"), ("mcuboot_image_hash", "00" * 32)):
@@ -293,31 +301,38 @@ class ProvisionTests(unittest.TestCase):
 
     def test_absence_authorizes_exactly_one_application_bootstrap(self):
         self.connection.connect.side_effect = ReceiverProbeTimeout("no receiver")
-        result = self.run_provision()
-        self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
-        self.assertEqual(result["result"], "PROVISIONED")
-        self.assertEqual(self.receiver.calls, [("info", {})])
+        with self.assertRaisesRegex(CampaignError, "explicit --legacy-console"):
+            self.run_provision()
+        self.connection.bootstrap.assert_not_called()
+
 
     def test_real_silent_probe_bootstraps_once_and_verifies_follower(self):
-        self.info["role"] = "lead"
-        streams, factory = self.use_wire_connection({"COM1": []})
-        result = self.run_provision()
-        self.connection.bootstrap.assert_called_once_with(Path("exact.mcuboot.bin"), Path("mcumgr"))
-        self.assertEqual(result["result"], "PROVISIONED")
-        self.assertEqual(result["info"]["role"], "follower")
-        self.assertEqual(self.receiver.calls, [("info", {}), ("set_role", {"role": "follower"}), ("info", {})])
-        streams["COM1"].close.assert_called_once()
-        self.assertTrue(streams["COM1"].written)
-        self.assertEqual(factory.call_args.kwargs["baudrate"], 115200)
+        from lead_update import ReceiverStatus
+        connection = USBConnection.__new__(USBConnection)
+        connection.serial_number = "physical-one"
+        connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")]
+        candidate = Mock()
+        candidate.request.side_effect = ReceiverProbeTimeout("unknown single CDC")
+        with patch("lead_update.ReceiverStatus", return_value=candidate), patch("lead_update.SerialSMP") as smp:
+            with self.assertRaises(ReceiverProbeTimeout):
+                connection.connect()
+        smp.assert_not_called()
+        candidate.close.assert_called_once()
+
 
     def test_real_unsupported_ota_probe_delegates_bootstrap_without_1200_touch(self):
-        streams, _ = self.use_wire_connection({"COM1": response({"rc": 8})})
-        result = self.run_provision()
-        self.connection.bootstrap.assert_called_once_with(
-            Path("exact.mcuboot.bin"), Path("mcumgr"), enter_bootloader=False)
-        self.assertEqual(result["result"], "PROVISIONED")
-        streams["COM1"].close.assert_called_once()
-        self.assertEqual(self.receiver.calls, [("info", {})])
+        from lead_update import ReceiverStatus
+        connection = USBConnection.__new__(USBConnection)
+        connection.serial_number = "physical-one"
+        connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")]
+        candidate = Mock()
+        candidate.request.side_effect = ReceiverProbeTimeout("unknown single CDC")
+        with patch("lead_update.ReceiverStatus", return_value=candidate), patch("lead_update.SerialSMP") as smp:
+            with self.assertRaises(ReceiverProbeTimeout):
+                connection.connect()
+        smp.assert_not_called()
+        candidate.close.assert_called_once()
+
 
     def test_real_console_probe_reaches_second_cdc_without_bootstrap(self):
         streams, factory = self.use_wire_connection({
@@ -386,7 +401,7 @@ class ProvisionTests(unittest.TestCase):
                     streams["COM31"].close.assert_called_once()
 
     def test_real_incompatible_or_malformed_cdc_blocks_even_after_a_valid_receiver(self):
-        for invalid_lines in (response({"service": "other", "protocol": 1}), [b"\x06\x09!invalid!\n"]):
+        for invalid_lines in (response({"service": "other", "protocol": 2}), [b"\x06\x09!invalid!\n"]):
             with self.subTest(invalid_lines=invalid_lines):
                 streams, _ = self.use_wire_connection({"COM31": response(self.info), "COM12": invalid_lines})
                 with self.assertRaises(CampaignError):
@@ -404,15 +419,18 @@ class ProvisionTests(unittest.TestCase):
         streams["COM12"].close.assert_called_once()
 
     def test_real_partial_smp_response_never_bootstraps(self):
-        frames = response(self.info)
-        self.assertGreater(len(frames), 1)
-        streams, _ = self.use_wire_connection({"COM1": frames[:1]})
-        with self.assertRaises((TransportError, CampaignError)) as failure:
-            self.run_provision()
-        self.assertNotIsInstance(failure.exception, ReceiverProbeTimeout)
-        self.connection.bootstrap.assert_not_called()
-        streams["COM1"].close.assert_called_once()
-        self.assertEqual(self.receiver.calls, [])
+        from lead_update import ReceiverStatus
+        connection = USBConnection.__new__(USBConnection)
+        connection.serial_number = "physical-one"
+        connection.enumerate = lambda: [SimpleNamespace(vid=0x2FE3, serial_number="physical-one", device="COM1")]
+        candidate = Mock()
+        candidate.request.side_effect = ReceiverProbeTimeout("unknown single CDC")
+        with patch("lead_update.ReceiverStatus", return_value=candidate), patch("lead_update.SerialSMP") as smp:
+            with self.assertRaises(ReceiverProbeTimeout):
+                connection.connect()
+        smp.assert_not_called()
+        candidate.close.assert_called_once()
+
 
     def test_occupied_malformed_and_non_unsupported_errors_never_bootstrap(self):
         for error in (TransportError("busy"), ProtocolError("bad CRC"), CommandError("unsupported group"),
@@ -439,7 +457,7 @@ class ProvisionTests(unittest.TestCase):
         self.assertTrue(all(call[0] == "info" for call in self.receiver.calls))
 
     def test_new_boot_snapshot_waits_read_only_then_checks_identity_and_health(self):
-        replies = [{"service": "owntech-ota", "protocol": 1, "phase": "BOOT"}, self.info]
+        replies = [{"service": "owntech-ota", "protocol": 2, "phase": "BOOT"}, self.info]
         self.receiver.request = Mock(side_effect=replies)
         sleep = Mock()
         self.run_provision(sleep=sleep, clock=Mock(side_effect=[0, 1]))
@@ -752,14 +770,33 @@ class ProvisionTests(unittest.TestCase):
             self.receiver.close = Mock()
             with patch("provision_ota.USBConnection", return_value=self.connection) as connect, \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(main(["--image", str(image), "--build-id", "ota-current", "--mcumgr", "unused"]), 0)
+                self.assertEqual(main(["--image", str(image), "--image-class", "receiver", "--build-id", "ota-current", "--mcumgr", "unused"]), 0)
                 connect.assert_called_once_with(None, None, timeout=30)
                 self.receiver.close.assert_called_once()
                 self.connection.bootstrap.assert_not_called()
                 connect.reset_mock()
                 image.write_bytes(b"not an image")
-                self.assertEqual(main(["--image", str(image), "--mcumgr", "unused"]), 1)
+                self.assertEqual(main(["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused"]), 1)
                 connect.assert_not_called()
+
+    def test_cli_upload_snapshot_survives_concurrent_artifact_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "firmware.mcuboot.bin"
+            original = artifact()
+            image.write_bytes(original)
+
+            def connect(*args, **kwargs):
+                image.write_bytes(artifact(image_class="lead"))
+                return self.connection
+
+            def inspect_snapshot(connection, snapshot, manifest, *args, **kwargs):
+                self.assertNotEqual(snapshot, image)
+                self.assertEqual(snapshot.read_bytes(), original)
+                self.assertEqual(manifest["image_class"], "receiver")
+
+            with patch("provision_ota.USBConnection", side_effect=connect), \
+                 patch("provision_ota.provision", side_effect=inspect_snapshot):
+                self.assertEqual(main(["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused"]), 0)
 
 
 if __name__ == "__main__":

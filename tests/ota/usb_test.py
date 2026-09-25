@@ -21,14 +21,15 @@ from smp_transport import SerialSMP, CommandError, cbor_encode, cbor_decode, uar
 from lead_update import Campaign, Journal
 
 IDS = ["0102030405060708", "1112131415161718", "2122232425262728"]
-MANIFEST = {"artifact_size": 512, "useful_size": 300, "artifact_sha256": "aa" * 32,
+MANIFEST = {"artifact_size": 512, "useful_size": 512, "artifact_sha256": "aa" * 32,
             "mcuboot_image_hash": "bb" * 32, "version": "1.0.1+0", "build_id": "test-app-next",
-            "protocol": 1, "hardware_id": 0x01020142, "layout_id": 0x00010001,
+            "protocol": 2, "image_class": "receiver", "format": "mcuboot-compact", "activation_trailer": False,
+            "hardware_id": 0x01020142, "layout_id": 0x00010001,
             "bootloader_id": 0x00010100, "profile": {"slot_size": 227328}}
 
 
 def stage_payload():
-    values = {key: value for key, value in MANIFEST.items() if key != "profile"}
+    values = {key: value for key, value in MANIFEST.items() if key not in ("profile", "format", "activation_trailer")}
     values.update(campaign=0x0123456789ABCDEF,
                   artifact_sha256=bytes.fromhex(MANIFEST["artifact_sha256"]),
                   mcuboot_image_hash=bytes.fromhex(MANIFEST["mcuboot_image_hash"]))
@@ -158,8 +159,9 @@ class USBTests(unittest.TestCase):
     def test_info_discover_and_paged_status_shape_and_size(self):
         info = self.client.request("info")
         self.assertEqual(info["service"], "owntech-ota")
-        self.assertEqual(info["protocol"], 1)
-        self.assertEqual(info["identity"], IDS[0])
+        self.assertEqual(info["protocol"], 2)
+        self.assertEqual(info["image_class"], "lead")
+        self.assertEqual(info["identity"], "ff" * 8)
         self.assertEqual((info["slot_size"], info["useful_capacity"]), (227328, 221184))
         self.assertTrue(info["available"] and info["active_confirmed"] and info["slot_available"])
         self.assertTrue(info["local_healthy"] and info["healthy"] and info["can_ready"])

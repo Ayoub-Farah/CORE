@@ -17,7 +17,7 @@ from recover_ota import recover, main, verify_inputs
 from prepare_ota_recovery import generate
 from smp_transport import CommandError, TransportError
 from bootloader_upload import UploadError
-from ota_artifact import inspect_image
+from ota_artifact import inspect_usb_image as inspect_image
 from test_pc_artifact import artifact
 from test_pc_recovery_config import records, staged_records, IDS
 
@@ -75,7 +75,7 @@ class RecoveryUploadTests(unittest.TestCase):
         self.journal.write_text("".join(json.dumps(event) + "\n" for event in events))
         config = generate(self.journal, self.root / "config")
         self.config = self.root / "config/owntech_ota_recovery_config.json"
-        data = bytearray(artifact())
+        data = bytearray(artifact(image_class=None))
         struct.pack_into("<BBHI", data, 20, 0, 0, 1, 0)
         data[648:680] = hashlib.sha256(data[:640]).digest()
         self.image = self.root / "recovery.mcuboot.bin"

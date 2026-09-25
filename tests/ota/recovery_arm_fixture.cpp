@@ -1,8 +1,35 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Compiled for the deployed Cortex-M4 ABI, never executed on hardware. The
- * fixture uses production types so host tests cannot invent their offsets. */
-#include "ota_storage.h"
+ * fixture freezes deployed v1 types independently of the v2 production API. */
+#include <stdint.h>
 #include <stddef.h>
+
+enum ota_state {
+    OTA_IDLE, OTA_PREPARING, OTA_READY, OTA_PASS_OPEN, OTA_PASS_CLOSED,
+    OTA_VERIFYING, OTA_VALID, OTA_COMMITTED, OTA_REBOOTING, OTA_FAILED,
+    OTA_ABORTED, OTA_RECOVERY_REQUIRED, OTA_SUCCEEDED
+};
+struct ota_storage_journal {
+    uint64_t campaign_id;
+    uint32_t commit_id, image_size;
+    ota_state state;
+    uint8_t lead_eui[8], artifact_sha256[32], mcuboot_image_hash[32];
+    char version[32], build_id[32];
+    uint32_t event_mask, event_ms[12];
+    uint8_t event_order[12];
+};
+struct ota_manifest {
+    uint64_t campaign_id;
+    uint32_t image_size, image_content_size, hardware_id, layout_id, bootloader_id;
+    uint8_t protocol_version, artifact_sha256[32], mcuboot_image_hash[32];
+    char version[32], build_id[32];
+};
+struct ota_identity {
+    uint8_t eui[8], address, protocol_version;
+    uint32_t usable_slot_size, usable_image_size, hardware_id, layout_id, bootloader_id;
+    bool active_confirmed, slot_available;
+};
+struct ota_target { ota_identity identity; bool is_lead; };
 
 struct LegacyLocal { uint32_t magic; ota_storage_journal journal; uint32_t crc; };
 struct LegacyFleet {

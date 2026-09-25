@@ -12,11 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "owntech" / "tools"
 from lead_update import (Campaign, CampaignError, Journal, USBConnection, journal_campaign,
                          select_port, ReceiverProbeTimeout, TransportError, read_only_status, main)
 
+LEAD = "eeeeeeeeeeeeeeee"
 IDS = ["0102030405060708", "1112131415161718", "2122232425262728"]
 MANIFEST = {"artifact_size": 512, "useful_size": 256, "artifact_sha256": "aa" * 32,
             "mcuboot_image_hash": "bb" * 32, "version": "2.0.0+0", "build_id": "B",
-            "protocol": 1, "hardware_id": 1, "layout_id": 1, "bootloader_id": 1,
-            "profile": {"slot_size": 512}}
+            "protocol": 2, "hardware_id": 1, "layout_id": 1, "bootloader_id": 1,
+            "profile": {"slot_size": 512}, "image_class": "receiver",
+            "format": "mcuboot-compact", "activation_trailer": False}
 
 
 class Clock:
@@ -43,7 +45,7 @@ class Transport:
         self.committed = False
 
     def rows(self, values):
-        return [{"identity": value, "address": index + 1, "role": "lead" if index == 0 else "follower",
+        return [{"identity": value, "address": index + 1, "role": "follower",
                  "available": True, "compatible": True, "offset": 512, "queue_depth": 0,
                  "state": "VALIDATED", "flash_complete": self.complete, "validated": True,
                  "version": "2.0.0", "build_id": "B", "healthy": True, "confirmed": True,
@@ -53,7 +55,7 @@ class Transport:
     def request(self, command, payload):
         self.calls.append((command, payload))
         if command == "info":
-            return {"service": "owntech-ota", "protocol": 1, "identity": IDS[0], "role": "follower",
+            return {"service": "owntech-ota", "protocol": 2, "identity": LEAD, "role": "lead", "image_class": "lead",
                     "available": True, "active_confirmed": True, "slot_available": True,
                     "slot_size": 512, "useful_capacity": 256}
         if command in ("discover", "status", "reconcile"):
@@ -66,11 +68,11 @@ class Transport:
                     "targets": rows[payload.get("index", 0):payload.get("index", 0) + 1] if self.paged else rows}
         if command == "stage_begin":
             self.committed = False
-            return {"state": "STAGING"}
+            return {"state": "SOURCE_OPEN"}
         if command == "stage_data":
             return {"offset": payload["offset"] + len(payload["data"])}
         if command == "stage_end":
-            return {"state": "STAGED"}
+            return {"state": "SOURCE_READY"}
         if command == "commit":
             self.committed = True
         return {"rc": 0}
@@ -114,11 +116,59 @@ class CampaignTests(unittest.TestCase):
     def test_success_always_stages_and_only_commits_after_validation(self):
         self.assertEqual(self.client().run(), "SUCCESS")
         commands = [command for command, _ in self.transport.calls]
-        self.assertEqual(commands.count("stage_data"), 2)
+        self.assertEqual(commands.count("stage_data"), 0)
         self.assertLess(commands.index("stage_end"), commands.index("start"))
         self.assertLess(commands.index("status"), commands.index("commit"))
         self.assertNotIn("reset", commands)
         self.assertNotIn("abort", commands)
+
+    def test_pc_source_credit_and_retransmission_are_exact(self):
+        client = self.client()
+        for offset, length in ((256, 256), (0, 256), (500, 12)):
+            self.assertTrue(client._serve_source({"source_campaign": 42, "source_offset": offset,
+                                                  "source_length": length}))
+            command, payload = self.transport.calls[-1]
+            self.assertEqual(command, "stage_data")
+            self.assertEqual(payload, {"campaign": 42, "offset": offset, "data": b"x" * length})
+        for credit in ({"source_length": 257}, {"source_length": -1},
+                       {"source_campaign": 43, "source_offset": 0, "source_length": 1},
+                       {"source_campaign": 42, "source_offset": 512, "source_length": 1}):
+            with self.assertRaises(CampaignError):
+                client._serve_source(credit)
+        self.assertFalse(client._serve_source({"source_length": 0}))
+
+    def test_async_source_setup_waits_before_next_command(self):
+        client = self.client()
+        original = self.transport.request
+        stage = [None]
+
+        def request(command, payload):
+            result = original(command, payload)
+            if command in ("stage_begin", "stage_end"):
+                if command == "stage_end":
+                    self.assertEqual(stage[0], "SOURCE_OPEN")
+                stage[0] = "OPEN_PENDING" if command == "stage_begin" else "READY_PENDING"
+                return {"state": "ACCEPTED"}
+            if command == "status":
+                stage[0] = "SOURCE_OPEN" if stage[0] == "OPEN_PENDING" else "SOURCE_READY"
+                result["phase"] = stage[0]
+            return result
+
+        self.transport.request = request
+        client.stage()
+        self.assertEqual([name for name, _ in self.transport.calls],
+                         ["stage_begin", "status", "stage_end", "status"])
+
+    def test_lead_and_wrong_artifact_class_never_enter_fleet(self):
+        self.transport.discovered.append(LEAD)
+        with self.assertRaisesRegex(CampaignError, "excluded"):
+            self.client().run()
+        self.transport.discovered.remove(LEAD)
+        client = self.client()
+        client.manifest = dict(MANIFEST, image_class="lead")
+        with self.assertRaisesRegex(CampaignError, "receiver compact"):
+            client.run()
+        self.assertNotIn("start", [cmd for cmd, _ in self.transport.calls])
 
     def test_paged_inventory_and_status(self):
         self.transport.paged = True
@@ -293,7 +343,7 @@ class CampaignTests(unittest.TestCase):
         inventory, lead, serial = journal_campaign(self.journal.path)
         self.assertEqual(inventory["targets"], IDS)
         self.assertEqual(inventory["manifest"], MANIFEST)
-        self.assertEqual(lead, IDS[0])
+        self.assertEqual(lead, LEAD)
 
     def test_wrong_lead_recovery_probe_cannot_rebind_frozen_journal(self):
         self.journal.emit("USB_SELECTED", usb_serial="original-usb")
@@ -302,7 +352,7 @@ class CampaignTests(unittest.TestCase):
         self.journal.emit("USB_SELECTED", usb_serial="wrong-usb")
         self.journal.emit("PROBE_LEAD", IDS[1], info={"identity": IDS[1]})
         inventory, lead, serial = journal_campaign(self.journal.path)
-        self.assertEqual(lead, IDS[0])
+        self.assertEqual(lead, LEAD)
         self.assertEqual(serial, "original-usb")
         self.assertEqual(inventory["targets"], IDS)
 
@@ -436,7 +486,7 @@ class CampaignTests(unittest.TestCase):
             def request(self, command):
                 if self.port == "COM1":
                     raise ReceiverProbeTimeout("console")
-                return {"service": "owntech-ota", "protocol": 1}
+                return {"service": "owntech-ota", "protocol": 2}
 
         with patch("lead_update.SerialSMP", Interface):
             connection.connect()

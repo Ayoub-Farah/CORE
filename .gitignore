@@ -13,3 +13,6 @@ ota-journals/
 
 # Board-specific flash/calibration backups; retain independently of build cleanup.
 recovery-backups/
+
+# Durable signed OTA artifacts (archive externally for campaigns).
+/ota-artifacts/

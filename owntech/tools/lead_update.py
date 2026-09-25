@@ -11,13 +11,57 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from ota_artifact import inspect_image, load_profile
+from ota_artifact import inspect_image, inspect_usb_image, load_profile
 from smp_transport import SerialSMP, TransportError, ReceiverProbeTimeout, ProtocolError, CommandError
 from bootloader_upload import upload_image, UploadError
 
 
 class CampaignError(RuntimeError):
     pass
+
+
+class ReceiverStatus:
+    """Read-only minimal receiver status; no bytes are injected into console RX."""
+    def __init__(self, device, timeout=2):
+        import serial
+        self.port = serial.Serial(device, baudrate=115200, timeout=0.2, write_timeout=0.2)
+        self.timeout = timeout
+        self.last_request = -1e9
+
+    def close(self):
+        self.port.close()
+
+    def request(self, command, payload=None):
+        if command != "info" or payload:
+            raise CampaignError("minimal receiver USB status is read-only")
+        pause = 0.3 - (time.monotonic() - self.last_request)
+        if pause > 0:
+            time.sleep(pause)
+        self.port.reset_input_buffer()
+        self.port.baudrate = 115200
+        self.port.baudrate = 2400
+        self.last_request = time.monotonic()
+        deadline = time.monotonic() + self.timeout
+        try:
+            while time.monotonic() < deadline:
+                line = self.port.readline(1025)
+                if len(line) > 1024:
+                    raise ProtocolError("receiver status exceeds the bounded response")
+                marker = line.find(b"OTAR2 ")
+                if marker < 0:
+                    continue
+                try:
+                    result = json.loads(line[marker + 6:])
+                except (ValueError, UnicodeError) as error:
+                    raise ProtocolError("invalid receiver status JSON") from error
+                if (not isinstance(result, dict) or result.get("service") != "owntech-ota"
+                        or result.get("protocol") != 2 or result.get("image_class") not in ("receiver", "lead")):
+                    raise ProtocolError("incompatible receiver status")
+                result["role"] = "lead" if result["image_class"] == "lead" else "follower"
+                return result
+            raise ReceiverProbeTimeout("no OTAR2 status: legacy/bootloader state requires explicit initialization mode")
+        finally:
+            self.port.baudrate = 115200
 
 
 DEVICE_EVENTS = ("ERASE_BEGIN", "ERASE_END", "USB_STAGE_BEGIN", "USB_STAGE_END",
@@ -72,6 +116,16 @@ class USBConnection:
                       if port.vid == 0x2FE3 and port.serial_number == self.serial_number]
         if not 1 <= len(candidates) <= 4:
             raise TransportError("same USB serial is absent or has too many interfaces")
+        if len(candidates) == 1:
+            # Unknown single-CDC applications must never receive an SMP probe.
+            candidate = ReceiverStatus(candidates[0].device)
+            try:
+                info = candidate.request("info")
+            except Exception:
+                candidate.close()
+                raise
+            self.device, self.transport, self.last_info = candidates[0].device, candidate, info
+            return candidate
         selected = []
         transport_errors = []
         try:
@@ -80,7 +134,7 @@ class USBConnection:
                 try:
                     candidate = SerialSMP(port.device)
                     info = candidate.request("info")
-                    if info.get("service") != "owntech-ota" or info.get("protocol") != 1:
+                    if info.get("service") != "owntech-ota" or info.get("protocol") != 2:
                         raise CampaignError("USB interface replied with an incompatible OTA service")
                     selected.append((port.device, candidate, info))
                 except ReceiverProbeTimeout:
@@ -264,8 +318,10 @@ class Campaign:
 
     def probe(self):
         response = self.request("info")
-        if response.get("service") != "owntech-ota" or response.get("protocol") != 1:
+        if response.get("service") != "owntech-ota" or response.get("protocol") != 2:
             raise CampaignError("USB board replied with an incompatible service; no automatic bootstrap")
+        if response.get("image_class") != "lead":
+            raise CampaignError("campaign requires a dedicated Lead image")
         self.lead = identity(response.get("identity"))
         self.journal.emit("PROBE_LEAD", self.lead, info=response)
         if response.get("slot_size") != self.manifest["profile"]["slot_size"]:
@@ -360,12 +416,13 @@ class Campaign:
                 raise CampaignError("target error during %s" % description)
             if predicate(result):
                 return result
-            self.sleep(self.poll_interval)
+            served = self._serve_source(result)
+            self.sleep(0.001 if served else self.poll_interval)
         raise CampaignError("bounded timeout during " + description)
 
     def discover(self):
         if not self.expected_ids and not self.expected_count:
-            raise CampaignError("expected identities or expected total count (including Lead) is required")
+            raise CampaignError("expected identities or expected total count (excluding Lead) is required")
         if self.expected_ids and len(self.expected_ids) != len(set(self.expected_ids)):
             raise CampaignError("duplicate expected identity")
         deadline = self.clock() + self.timeout
@@ -378,8 +435,8 @@ class Campaign:
             self.sleep(self.poll_interval)
         rows = result["targets"]
         discovered = [identity(row["identity"]) for row in rows]
-        if self.lead not in discovered:
-            raise CampaignError("discovery must include the USB Lead")
+        if self.lead in discovered:
+            raise CampaignError("dedicated Lead must be excluded from the receiver target list")
         addresses = [row.get("address") for row in rows]
         if None in addresses or len(addresses) != len(set(addresses)):
             raise CampaignError("discovery contains absent or duplicate CAN addresses")
@@ -387,7 +444,7 @@ class Campaign:
             raise CampaignError("inventory differs: missing=%s unexpected=%s" % (
                 sorted(set(self.expected_ids) - set(discovered)), sorted(set(discovered) - set(self.expected_ids))))
         if self.expected_count is not None and len(discovered) != self.expected_count:
-            raise CampaignError("expected %d cards including Lead, discovered %d" % (self.expected_count, len(discovered)))
+            raise CampaignError("expected %d receivers excluding Lead, discovered %d" % (self.expected_count, len(discovered)))
         if not rows or any(row.get("available") is not True or row.get("compatible") is not True for row in rows):
             raise CampaignError("all expected boards must expose a compatible, available OTA receiver")
         self.targets = sorted(discovered)
@@ -396,36 +453,43 @@ class Campaign:
 
     def stage(self):
         manifest = self.manifest
+        if (manifest.get("protocol") != 2 or manifest.get("image_class") != "receiver"
+                or manifest.get("format") != "mcuboot-compact" or manifest.get("activation_trailer") is not False):
+            raise CampaignError("campaign requires a receiver compact v2 artifact without activation trailer")
         begin = {key: manifest[key] for key in ("protocol", "artifact_size", "useful_size", "version",
                                                  "build_id", "hardware_id", "layout_id", "bootloader_id")}
-        begin.update(campaign=self.journal.campaign,
+        begin.update(image_class="receiver", campaign=self.journal.campaign,
                      artifact_sha256=bytes.fromhex(manifest["artifact_sha256"]),
                      mcuboot_image_hash=bytes.fromhex(manifest["mcuboot_image_hash"]))
-        self.journal.emit("USB_STAGE_REQUEST", self.lead, manifest=manifest)
+        self.journal.emit("PC_SOURCE_OPEN", self.lead, manifest=manifest)
         result = self.request("stage_begin", begin)
-        if result.get("state", "").upper() not in ("STAGING", "READY"):
-            self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() in ("STAGING", "READY"), "Lead erase")
-        offset = 0
-        deadline = self.clock() + self.timeout
-        last_display = self.clock() - self.poll_interval
-        # Custom stage_data enters the same firmware slot owner/writer as CAN.
-        # It cannot shortcut an image already active on the Lead.
-        while offset < len(self.artifact):
-            if self.clock() >= deadline:
-                raise CampaignError("bounded timeout during USB staging")
-            chunk = self.artifact[offset:offset + 256]
-            result = self.request("stage_data", {"offset": offset, "data": chunk})
-            if result.get("offset") != offset + len(chunk):
-                raise CampaignError("USB writer did not accept the exact sequential offset")
-            offset += len(chunk)
-            self.rows.setdefault(self.lead, {"identity": self.lead, "role": "lead"}).update(
-                offset=offset, state="USB_STAGING", flash_complete=False, validated=False)
-            if self.clock() - last_display >= self.poll_interval or offset == len(self.artifact):
-                self._table({"phase": "USB_STAGE", "targets": [self.rows[self.lead]]})
-                last_display = self.clock()
-        result = self.request("stage_end")
-        if result.get("state", "").upper() != "STAGED":
-            result = self._poll(lambda state: str(state.get("phase", state.get("state", ""))).upper() == "STAGED", "Lead reread validation")
+        if result.get("state", "").upper() == "ACCEPTED":
+            self._poll(lambda state: state.get("phase", state.get("state")) == "SOURCE_OPEN", "PC source open")
+        elif result.get("state", "").upper() != "SOURCE_OPEN":
+            raise CampaignError("Lead did not open a bounded PC source")
+        result = self.request("stage_end", {"campaign": self.journal.campaign})
+        if result.get("state", "").upper() == "ACCEPTED":
+            self._poll(lambda state: state.get("phase", state.get("state")) == "SOURCE_READY", "PC source readiness")
+        elif result.get("state", "").upper() != "SOURCE_READY":
+            raise CampaignError("Lead did not accept the PC source")
+
+    def _serve_source(self, result):
+        length = result.get("source_length", 0)
+        if type(length) is not int or not 0 <= length <= 256:
+            raise CampaignError("invalid source credit length")
+        if not length:
+            return False
+        offset = result.get("source_offset")
+        if (result.get("source_campaign") != self.journal.campaign or type(offset) is not int
+                or offset < 0 or offset + length > len(self.artifact)):
+            raise CampaignError("invalid source credit campaign or bounds")
+        # Retransmissions can request older offsets. The immutable PC bytes
+        # remain the authority; only the exact requested block is sent.
+        reply = self.request("stage_data", {"campaign": self.journal.campaign,
+            "offset": offset, "data": self.artifact[offset:offset + length]})
+        if reply.get("offset") != offset + length:
+            raise CampaignError("Lead did not accept the exact source credit")
+        return True
 
     def _all_valid(self, result):
         current = {identity(row["identity"]): row for row in result["targets"]}
@@ -520,7 +584,7 @@ class Campaign:
         if info.get("available") is not True or info.get("active_confirmed") is not True or info.get("slot_available") is not True:
             raise CampaignError("Lead not available/confirmed; preserve its rollback slot and reconcile first")
         if info.get("role") != "lead":
-            self.request("set_role", {"role": "lead"})
+            raise CampaignError("dedicated Lead role is required")
         self.discover()
         try:
             self.stage()
@@ -543,7 +607,7 @@ class Campaign:
                 except (TransportError, ProtocolError):
                     pass
                 self.journal.emit("FAILED", error=str(error), targets=self.targets,
-                                  activation_trailer_may_remain=True)
+                                  activation_uncertain=self.committed)
             raise
 
 
@@ -569,7 +633,7 @@ def journal_campaign(path):
     return inventory, identity(frozen_lead), frozen_serial
 
 
-def prepare_manifest(image_path, output_path=None, profile=None, version=None, build_id=None):
+def prepare_manifest(image_path, output_path=None, profile=None, version=None, build_id=None, image_class=None, *, usb=False):
     """Reuse verified build metadata; never overwrite contradictory provenance."""
     image_path = Path(image_path)
     output_path = Path(output_path) if output_path else image_path.with_suffix(".json")
@@ -581,10 +645,16 @@ def prepare_manifest(image_path, output_path=None, profile=None, version=None, b
     artifact = image_path.read_bytes()
     effective_profile = profile if profile is not None else (existing.get("profile") if existing else None)
     effective_build = build_id or (existing.get("build_id") if existing else None)
-    manifest = inspect_image(artifact, effective_profile, version, effective_build)
+    effective_class = image_class or (existing.get("image_class") if existing else None)
+    if effective_class not in ("receiver", "lead"):
+        raise CampaignError("a generated manifest or explicit image class is required")
+    inspector = inspect_usb_image if usb else inspect_image
+    manifest = inspector(artifact, effective_profile, version, effective_build, effective_class,
+                         **({"require_class": True} if usb else {}))
     manifest["filename"] = image_path.name
     if existing is not None:
-        for field in ("artifact_size", "useful_size", "artifact_sha256", "mcuboot_image_hash",
+        for field in ("schema_version", "protocol", "format", "activation_trailer", "image_class",
+                      "artifact_size", "useful_size", "artifact_sha256", "mcuboot_image_hash",
                       "version", "build_id", "hardware_id", "layout_id", "bootloader_id"):
             if existing.get(field) != manifest[field]:
                 raise CampaignError("existing manifest contradicts %s; rebuild/regenerate it explicitly before a campaign" % field)
@@ -596,7 +666,7 @@ def prepare_manifest(image_path, output_path=None, profile=None, version=None, b
 def read_only_status(transport):
     """Take one complete snapshot without discovering, adopting a role or writing."""
     info = transport.request("info", {})
-    if info.get("service") != "owntech-ota" or info.get("protocol") != 1:
+    if info.get("service") != "owntech-ota" or info.get("protocol") != 2:
         raise CampaignError("incompatible application service")
     result = transport.request("status", {})
     rows = list(result.get("targets", []))
@@ -618,7 +688,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--bootstrap-image", type=Path,
-                        help="optional initial receiver image, distinct from the campaign target")
+                        help="retired: install the dedicated Lead separately with USB_LEAD ota_init")
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--serial")
@@ -630,12 +700,12 @@ def main(argv=None):
     parser.add_argument("--build-id")
     parser.add_argument("--version")
     parser.add_argument("--receiver-absent", action="store_true",
-                        help="operator evidence permits initial application provisioning if no service replies")
+                        help="retired: campaigns never bootstrap or flash the Lead")
     parser.add_argument("--mcumgr", type=Path)
     recovery = parser.add_mutually_exclusive_group()
     recovery.add_argument("--status", action="store_true", help="read info/status only; no discovery, upload, role change or reset")
     recovery.add_argument("--reconcile-journal", type=Path, help="verify an existing frozen campaign without upload/reset")
-    recovery.add_argument("--abort-journal", type=Path, help="stop automatic transfer/reset; padded trailer may remain")
+    recovery.add_argument("--abort-journal", type=Path, help="stop transfer; inspect boot state if commit was already requested")
     args = parser.parse_args(argv)
     journal = None
     connection = None
@@ -647,7 +717,7 @@ def main(argv=None):
             return 0
         recovery_path = args.reconcile_journal or args.abort_journal
         if not recovery_path and not args.expected_id and not args.expected_count:
-            raise CampaignError("supply --expected-id for each card or --expected-count including Lead")
+            raise CampaignError("supply --expected-id for each card or --expected-count excluding Lead")
         if args.expected_count is not None and not 1 <= args.expected_count <= 16:
             raise CampaignError("expected count must be between 1 and 16")
         if args.timeout <= 0:
@@ -665,8 +735,8 @@ def main(argv=None):
             client.targets = inventory["targets"]
             if args.abort_journal:
                 client.request("abort", {"campaign": journal.campaign})
-                journal.emit("ABORTED", activation_trailer_may_remain=True)
-                print("ABORTED; maintenance and padded activation trailer may remain")
+                journal.emit("ABORTED", activation_uncertain=True)
+                print("ABORTED; maintenance remains; inspect boot state if commit was requested")
             else:
                 print(client.reconcile())
             return 0
@@ -675,28 +745,18 @@ def main(argv=None):
         artifact, manifest = prepare_manifest(args.image, args.manifest,
                                              load_profile(args.profile) if args.profile else None,
                                              args.version, args.build_id)
+        if manifest["image_class"] != "receiver":
+            raise CampaignError("the campaign artifact must be receiver class")
         campaign_id = secrets.randbits(63) or 1
         journal = Journal(args.journal or Path.cwd() / "ota-journals" / ("campaign-%016x.jsonl" % campaign_id), campaign_id)
         connection = USBConnection(args.serial, args.port)
         journal.emit("USB_SELECTED", usb_serial=connection.serial_number)
         journal.emit("PROBE_LEAD", usb_serial=connection.serial_number, state="BEGIN")
-        try:
-            transport = connection.connect()
-            probe = connection.last_info
-        except ReceiverProbeTimeout:
-            if not args.receiver_absent or not args.mcumgr:
-                raise
-            bootstrap_image = args.bootstrap_image or args.image
-            bootstrap_profile = dict(manifest["profile"])
-            bootstrap_profile.pop("version", None)
-            bootstrap_profile.pop("build_id", None)
-            bootstrap_manifest = inspect_image(bootstrap_image.read_bytes(), bootstrap_profile)
-            journal.emit("INIT_LEAD", usb_serial=connection.serial_number,
-                         receiver_absent_evidence="explicit operator assertion",
-                         manifest=bootstrap_manifest)
-            transport = connection.bootstrap(bootstrap_image, args.mcumgr)
-            probe = connection.last_info
-        if probe.get("service") != "owntech-ota" or probe.get("protocol") != 1:
+        if args.receiver_absent or args.bootstrap_image:
+            raise CampaignError("campaigns never install a Lead; run USB_LEAD ota_init separately")
+        transport = connection.connect()
+        probe = connection.last_info
+        if probe.get("service") != "owntech-ota" or probe.get("protocol") != 2:
             raise CampaignError("incompatible response; refusing blind bootstrap")
         campaign = Campaign(transport, manifest, artifact, journal, args.expected_id, args.expected_count,
                             reconnect=connection.reconnect, timeout=args.timeout)

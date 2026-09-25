@@ -26,25 +26,12 @@ struct ota_service_diagnostics {
 bool ota_service_is_lead(void);
 void ota_feedback_state(enum ota_state state);
 void ota_feedback_application_led(int action); /* 0 off, 1 on, 2 toggle */
-int ota_service_set_role(bool lead);
-int ota_service_stage_begin(const struct ota_manifest *);
-int ota_service_stage_data(uint32_t offset, const uint8_t *, size_t);
-int ota_service_stage_end(void);
-int ota_service_start(uint64_t campaign, const uint8_t identities[][8], size_t count);
-int ota_service_commit(uint64_t campaign);
-int ota_service_abort(uint64_t campaign);
-/* A new nonzero token refreshes an idle inventory; repeats poll the same scan.
- * Zero preserves legacy cached discovery. Discovery reserves the idle service. */
-int ota_service_discover(uint64_t campaign);
-int ota_service_reconcile(uint64_t campaign, const uint8_t identities[][8],
-                          size_t count, const uint8_t expected_hash[32]);
+/* Read-only status request from the existing CDC line-rate callback. */
+void ota_console_request_status(void);
 /* Snapshot functions are safe from USB/ThingSet threads. */
 void ota_service_local(struct ota_observation *);
 /* Identity and boot/network state from the same worker publication. */
 void ota_service_snapshot(struct ota_observation *, struct ota_service_diagnostics *);
-int ota_service_target(size_t index, struct ota_observation *, bool *is_lead,
-                       uint64_t *last_seen_ms);
-size_t ota_service_target_count(void);
 const char *ota_service_phase(void);
 const char *ota_state_name(enum ota_state);
 uint32_t ota_service_pass(void);

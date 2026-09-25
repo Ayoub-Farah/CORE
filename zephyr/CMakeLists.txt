@@ -70,7 +70,9 @@ get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
 list(APPEND ZEPHYR_EXTRA_MODULES ${PARENT_DIR}/third_party/thingset-zephyr-sdk)
 
 # Looking for app.conf file
-FILELIST(EXTRA_APP_CONF_FILE ${PARENT_DIR}/src conf)
+if(NOT OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+  FILELIST(EXTRA_APP_CONF_FILE ${PARENT_DIR}/src conf)
+endif()
 # Add app.conf path to zephyr variables
 set(EXTRA_CONF_FILE ${EXTRA_APP_CONF_FILE})
 
@@ -80,18 +82,22 @@ CONFLIB(EXTRA_LIB_CONF_FILE ${PARENT_DIR}/owntech/lib/${BUILD_ENV_NAME} conf)
 # Add app.conf path to zephyr variables
 list(APPEND EXTRA_CONF_FILE ${EXTRA_LIB_CONF_FILE})
 if(DEFINED OWNTECH_BUILD_PROFILE)
-  if(NOT OWNTECH_BUILD_PROFILE STREQUAL "ota" AND NOT OWNTECH_BUILD_PROFILE STREQUAL "ota_recovery")
+  if(NOT OWNTECH_BUILD_PROFILE MATCHES "^(ota_receiver|ota_lead|ota_recovery)$")
     message(FATAL_ERROR "Unknown OwnTech build profile")
   endif()
   list(APPEND EXTRA_CONF_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/${OWNTECH_BUILD_PROFILE}.conf)
 endif()
 
 # Looking for app.overlay file
-FILELIST(EXTRA_OVERLAY_APP_FILE ${PARENT_DIR}/src overlay)
+if(NOT OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+  FILELIST(EXTRA_OVERLAY_APP_FILE ${PARENT_DIR}/src overlay)
+endif()
 # Add app.overlay path to zephyr variables
 set(EXTRA_DTC_OVERLAY_FILE ${EXTRA_OVERLAY_APP_FILE})
-if(OWNTECH_BUILD_PROFILE STREQUAL "ota")
+if(OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
   list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_usb.overlay)
+elseif(OWNTECH_BUILD_PROFILE STREQUAL "ota_receiver")
+  list(APPEND EXTRA_DTC_OVERLAY_FILE ${CMAKE_CURRENT_SOURCE_DIR}/profiles/ota_receiver.overlay)
 endif()
 
 # Check for third party modules
@@ -126,7 +132,7 @@ project(owntech_power_api)
 
 # OTA identity is refreshed before every PlatformIO invocation, including when
 # CMake configuration is cached. Editing main.cpp changes the reported build ID.
-if(OWNTECH_BUILD_PROFILE STREQUAL "ota")
+if(OWNTECH_BUILD_PROFILE MATCHES "^(ota_receiver|ota_lead)$")
   include(${CMAKE_CURRENT_SOURCE_DIR}/ota_identity.cmake)
   # The default generated include directory precedes project include paths.
   # Discard only our old non-OTA header so cached configuration cannot hide
@@ -156,6 +162,8 @@ if(OWNTECH_BUILD_PROFILE STREQUAL "ota_recovery")
   endif()
   target_sources(app PRIVATE ../owntech/recovery/main.cpp ../owntech/recovery/recovery_core.cpp)
   target_include_directories(app PRIVATE ${OWNTECH_RECOVERY_CONFIG_DIR} ../owntech/recovery)
+elseif(OWNTECH_BUILD_PROFILE STREQUAL "ota_lead")
+  target_sources(app PRIVATE ../owntech/lead/main.cpp)
 else()
   target_sources(app PRIVATE ../src/main.cpp)
 endif()

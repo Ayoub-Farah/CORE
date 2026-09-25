@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from test_pc_artifact import artifact
+from ota_artifact import inspect_image
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
@@ -74,9 +75,10 @@ class BuildTests(unittest.TestCase):
             build = project / ".pio" / "build" / "USB_LEAD"
             build.mkdir(parents=True)
             image = build / "firmware.mcuboot.bin"
-            image.write_bytes(artifact())
+            image.write_bytes(artifact(compact=True))
+            image.with_suffix(".json").write_text(json.dumps(inspect_image(image.read_bytes(), build_id="B")))
             connection = SimpleNamespace(connect=lambda: object(), transport=None, serial_number="test-usb",
-                                         last_info={"service": "owntech-ota", "protocol": 1}, reconnect=lambda: None)
+                                         last_info={"service": "owntech-ota", "protocol": 2}, reconnect=lambda: None)
             original_cwd = Path.cwd()
             try:
                 os.chdir(project)
@@ -101,8 +103,8 @@ class BuildTests(unittest.TestCase):
     def test_standalone_reuses_validated_build_id_without_overwriting_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "firmware.mcuboot.bin"
-            image.write_bytes(artifact())
-            _, created = prepare_manifest(image, build_id="compiled-build-B")
+            image.write_bytes(artifact(compact=True))
+            _, created = prepare_manifest(image, build_id="compiled-build-B", image_class="receiver")
             manifest_path = image.with_suffix(".json")
             original = manifest_path.read_bytes()
             _, reused = prepare_manifest(image)
@@ -111,7 +113,7 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(CampaignError, "contradicts build_id"):
                 prepare_manifest(image, build_id="wrong-build-A")
             self.assertEqual(manifest_path.read_bytes(), original)
-            image.write_bytes(artifact(body_size=129))
+            image.write_bytes(artifact(body_size=129, compact=True))
             with self.assertRaisesRegex(CampaignError, "contradicts"):
                 prepare_manifest(image)
             self.assertEqual(manifest_path.read_bytes(), original)
@@ -132,7 +134,12 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(target, env.Alias("mcuboot-image"))
             image = build / "firmware.mcuboot.bin"
             image.write_bytes(artifact())
-            with redirect_stdout(io.StringIO()):
+            (build / "CMakeCache.txt").write_text("PYTHON_EXECUTABLE:FILEPATH=" + sys.executable + "\n")
+            def sign_compact(args, **kwargs):
+                self.assertNotIn("--pad", args)
+                self.assertTrue(args[-2].endswith("firmware.bin"))
+                Path(args[-1]).write_bytes(artifact(compact=True))
+            with redirect_stdout(io.StringIO()), patch("ota_pio.subprocess.run", side_effect=sign_compact):
                 self.assertEqual(post([], [image], env), 0)
             manifest = json.loads(image.with_suffix(".json").read_text())
             self.assertEqual(manifest["build_id"], "build-test")
@@ -140,7 +147,7 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(manifest["artifact_size"], 227328)
             self.assertLess(manifest["useful_size"], 221184)
             self.assertTrue(manifest["signature"]["signing_key"].endswith("root-rsa-2048.pem"))
-            snapshot = env.project / ".pio" / "ota-artifacts" / "USB_LEAD" / image.name
+            snapshot = env.project / "ota-artifacts" / "USB_LEAD" / image.name
             self.assertNotIn(build, snapshot.parents)
             self.assertEqual(snapshot.read_bytes(), image.read_bytes())
             self.assertEqual(snapshot.with_suffix(".json").read_bytes(), image.with_suffix(".json").read_bytes())
@@ -227,10 +234,8 @@ class BuildTests(unittest.TestCase):
         for filename, action_name, corrupt in (
                 ("pre_target_ota.py", "ota_init", False),
                 ("pre_target_usb_lead.py", "ota_init", False),
-                ("pre_target_usb_lead.py", "lead_update", False),
                 ("pre_target_ota.py", "upload", False),
                 ("pre_target_ota.py", "ota_init", True),
-                ("pre_target_usb_lead.py", "lead_update", True),
                 ("pre_target_ota.py", "upload", True)):
             with self.subTest(hook=filename, action=action_name, corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
                 project = Path(directory)
@@ -249,7 +254,7 @@ sys.path.insert(0, str(root / "owntech/scripts"))
 sys.path.insert(0, str(root / "owntech/tools"))
 project = Path.cwd()
 env = DefaultEnvironment(tools=[], PROJECT_DIR=str(project), BUILD_DIR=str(project / "build"),
-                  PIOENV="USB_LEAD", PROGNAME="program", OWNTECH_OTA_VERSION="1.2.3+4",
+                  PIOENV="TEST_USB", PROGNAME="program", OWNTECH_OTA_VERSION="1.2.3+4",
                   OWNTECH_OTA_BUILD_ID="build-test")
 env.AddMethod(lambda self, key, default=None: default, "GetProjectOption")
 env.AddMethod(lambda self: {}, "BoardConfig")
@@ -267,7 +272,7 @@ def usb_stub(args):
     assert image.read_bytes() == (project / "input.bin").read_bytes()
     manifest = json.loads(image.with_suffix(".json").read_text())
     assert manifest["build_id"] == "build-test"
-    assert (project / ".pio/ota-artifacts/USB_LEAD" / image.name).read_bytes() == image.read_bytes()
+    assert (project / "ota-artifacts/TEST_USB" / image.name).read_bytes() == image.read_bytes()
     with (project / "order.txt").open("a") as output:
         output.write("verified USB action\\n")
     return 0
@@ -303,6 +308,24 @@ if REQUESTED == "upload":
                     self.assertIn("OTA artifact checked", diagnostic)
                     self.assertEqual((project / "order.txt").read_text(), "signed\nverified USB action\n")
                 self.assertFalse((project / "build/program.mcuboot.bin").exists())
+
+    def test_fleet_task_builds_receiver_and_never_invokes_lead_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Environment(Path(directory) / "build", ROOT)
+            script = ModuleType("SCons.Script")
+            script.COMMAND_LINE_TARGETS = ["lead_update"]
+            with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
+                runpy.run_path(str(ROOT / "owntech/scripts/pre_target_usb_lead.py"),
+                               init_globals={"env": env, "Import": lambda _: None})
+            task = env.tasks["lead_update"]
+            self.assertEqual(task["dependencies"], [])
+            with patch("subprocess.run") as build, patch("lead_update.main", return_value=0) as campaign:
+                self.assertEqual(task["actions"][0]([], [], env), 0)
+            args = build.call_args.args[0]
+            self.assertEqual(args[-4:], ["-e", "OTA", "-t", "mcuboot-image"])
+            self.assertNotIn("upload", args)
+            self.assertEqual(campaign.call_args.args[0][:2],
+                             ["--image", str(ROOT / "ota-artifacts/OTA/firmware.can.bin")])
 
     def test_ota_identity_hook_is_required_instead_of_silent_manual_fallback(self):
         from ota_pio import artifact_options

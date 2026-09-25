@@ -125,14 +125,20 @@ class IdentityTest(unittest.TestCase):
         env["BUILD_FLAGS"] = "-DCLI_OVERRIDE=1"
         self.assertNotEqual(before, generate_for_environment(env)["build_id"])
 
-    def test_environments_and_deployment_settings_share_identity(self):
+    def test_variants_have_distinct_identity_and_lead_ignores_user_main(self):
         ota = FakeEnv(self.root)
         lead = FakeEnv(self.root, "USB_LEAD")
         lead.options.update(upload_port="COM42", monitor_speed=9600,
                             custom_ota_expected_count=9, custom_ota_lead_serial="serial",
                             upload_protocol="custom", targets=["usb-lead-update"])
         self.put("src/app.ini", "[env:USB_LEAD]\ncustom_ota_expected_count=9\n")
-        self.assertEqual(generate_for_environment(ota), generate_for_environment(lead))
+        self.put("owntech/lead/main.cpp", "int main() { return 0; }\n")
+        self.assertNotEqual(generate_for_environment(ota)["build_id"], generate_for_environment(lead)["build_id"])
+        before = generate_for_environment(lead)["build_id"]
+        self.put("src/main.cpp", "int receiver_changed = 1;\n")
+        self.assertEqual(before, generate_for_environment(lead)["build_id"])
+        self.put("owntech/lead/main.cpp", "int main() { return 1; }\n")
+        self.assertNotEqual(before, generate_for_environment(lead)["build_id"])
         # A library source difference is significant even when names match.
         self.put("owntech/lib/USB_LEAD/control/src/loop.cpp", "int gain = 2;\n")
         self.assertNotEqual(generate_for_environment(ota)["build_id"],

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-#include "OtaService.h"
+#include "OtaLeadService.h"
 #include <zephyr/mgmt/mcumgr/mgmt/mgmt.h>
 #include <zephyr/mgmt/mcumgr/mgmt/handlers.h>
 #include <zephyr/mgmt/mcumgr/mgmt/callbacks.h>
@@ -17,7 +17,7 @@ struct Request {
     uint64_t campaign=0;
     uint32_t index=UINT32_MAX, offset=UINT32_MAX, protocol=0;
     ota_manifest manifest{};
-    zcbor_string data{}, artifact_hash{}, image_hash{}, version{}, build{}, role{};
+    zcbor_string data{}, artifact_hash{}, image_hash{}, version{}, build{}, role{}, image_class{};
     uint8_t targets[OTA_MAX_TARGETS][8]{};
     size_t count=0;
 };
@@ -62,6 +62,7 @@ static bool decode(smp_streamer *ctxt,Request &r)
         FIELD("version",zcbor_tstr_decode,&r.version),
         FIELD("build_id",zcbor_tstr_decode,&r.build),
         FIELD("role",zcbor_tstr_decode,&r.role),
+        FIELD("image_class",zcbor_tstr_decode,&r.image_class),
         FIELD("data",zcbor_bstr_decode,&r.data),
         FIELD("targets",targets_decode,&r),
     };
@@ -102,11 +103,11 @@ static bool events(zcbor_state_t *z,const ota_observation &o)
 static bool row(zcbor_state_t *z,const ota_observation &o,bool lead,uint64_t seen)
 {
     char id[17];identity_text(o.identity.eui,id);
-    bool compatible=o.identity.protocol_version==OTA_PROTOCOL_VERSION &&
+    bool compatible=o.identity.protocol_version==OTA_PROTOCOL_VERSION && o.identity.image_class==OTA_IMAGE_RECEIVER &&
         o.identity.hardware_id==CONFIG_OWNTECH_OTA_HARDWARE_ID && o.identity.layout_id==CONFIG_OWNTECH_OTA_LAYOUT_ID &&
         o.identity.bootloader_id==CONFIG_OWNTECH_OTA_BOOTLOADER_ID;
     return zcbor_map_start_encode(z,32) && text(z,"identity",id) && number(z,"address",o.identity.address) &&
-        text(z,"role",lead?"lead":"follower") && text(z,"state",ota_state_name(o.status.state)) &&
+        text(z,"role",lead?"lead":"follower") && text(z,"image_class",o.identity.image_class==OTA_IMAGE_LEAD?"lead":"receiver") && text(z,"state",ota_state_name(o.status.state)) &&
         text(z,"version",o.active_version) && text(z,"build_id",o.active_build_id) &&
         bytes(z,"mcuboot_image_hash",o.active_mcuboot_image_hash,32) &&
         number(z,"offset",o.status.offset) && number(z,"image_size",o.status.image_size) &&
@@ -125,9 +126,12 @@ static bool status(zcbor_state_t *z,uint32_t index,bool discovery=false)
     /* A rescan replaces the previous table. Expose pages only once complete,
      * so an old page count cannot address a partially rebuilt inventory. */
     size_t count=discovery && !strcmp(d.phase,"DISCOVERING")?0:ota_service_target_count();
+    uint64_t source_campaign;uint32_t source_offset,source_length;
+    ota_service_source_request(&source_campaign,&source_offset,&source_length);
     if(!text(z,"phase",d.phase) || !text(z,"state",d.phase) || !health(z,d) ||
        !number(z,"campaign",ota_service_campaign()) || !number(z,"pass",ota_service_pass()) ||
        !number(z,"offset",ota_service_stage_offset()) || !number(z,"target_count",count) ||
+       !number(z,"source_campaign",source_campaign) || !number(z,"source_offset",source_offset) || !number(z,"source_length",source_length) ||
        !zcbor_tstr_put_lit(z,"targets") || !zcbor_list_start_encode(z,1)) return false;
     if(count) {
         ota_observation o{};bool lead;uint64_t seen;
@@ -144,14 +148,14 @@ static int handle(smp_streamer *ctxt,int command)
         ota_observation o{};ota_service_diagnostics d{};ota_service_snapshot(&o,&d);
         char id[17];identity_text(o.identity.eui,id);
         ok=text(z,"service","owntech-ota") && number(z,"protocol",OTA_PROTOCOL_VERSION) &&
-            text(z,"identity",id) && text(z,"role",d.is_lead?"lead":"follower") &&
+            text(z,"identity",id) && text(z,"role",d.is_lead?"lead":"follower") && text(z,"image_class","lead") &&
             text(z,"version",o.active_version) && text(z,"build_id",o.active_build_id) &&
             bytes(z,"mcuboot_image_hash",o.active_mcuboot_image_hash,32) &&
             boolean(z,"available",d.healthy&&!d.busy&&o.identity.slot_available) &&
             boolean(z,"active_confirmed",o.identity.active_confirmed) && boolean(z,"slot_available",o.identity.slot_available) &&
             number(z,"slot_size",o.identity.usable_slot_size) && number(z,"useful_capacity",o.identity.usable_image_size) &&
             number(z,"hardware_id",o.identity.hardware_id) && number(z,"layout_id",o.identity.layout_id) &&
-            number(z,"bootloader_id",o.identity.bootloader_id) && text(z,"upload","stage_data") &&
+            number(z,"bootloader_id",o.identity.bootloader_id) && text(z,"upload","pc_source") &&
             text(z,"phase",d.phase) && health(z,d);break;
     }
     case 1:
@@ -162,18 +166,22 @@ static int handle(smp_streamer *ctxt,int command)
     case 2:
         rc=ota_service_discover(r.campaign);ok=status(z,r.index,true);break;
     case 3:
-        if(!r.campaign || r.protocol!=OTA_PROTOCOL_VERSION || r.artifact_hash.len!=32 || r.image_hash.len!=32 ||
+        if(!r.campaign || r.protocol!=OTA_PROTOCOL_VERSION || r.image_class.len!=8 || memcmp(r.image_class.value,"receiver",8) ||
+           r.manifest.image_size!=r.manifest.image_content_size || r.artifact_hash.len!=32 || r.image_hash.len!=32 ||
            !r.version.len || r.version.len>=32 || !r.build.len || r.build.len>=32 ||
            memchr(r.version.value,0,r.version.len) || memchr(r.build.value,0,r.build.len)) {rc=OTA_ERR_ARGUMENT;break;}
         r.manifest.campaign_id=r.campaign;r.manifest.protocol_version=r.protocol;
+        r.manifest.image_class=OTA_IMAGE_RECEIVER;
         memcpy(r.manifest.artifact_sha256,r.artifact_hash.value,32);memcpy(r.manifest.mcuboot_image_hash,r.image_hash.value,32);
         memcpy(r.manifest.version,r.version.value,r.version.len);memcpy(r.manifest.build_id,r.build.value,r.build.len);
         rc=ota_service_stage_begin(&r.manifest);ok=text(z,"state","ACCEPTED");break;
     case 4:
         if(r.offset==UINT32_MAX || !r.data.len || r.data.len>OTA_MAX_PAYLOAD) {rc=OTA_ERR_ARGUMENT;break;}
-        rc=ota_service_stage_data(r.offset,r.data.value,r.data.len);
+        rc=ota_service_source_data(r.campaign,r.offset,r.data.value,r.data.len);
         ok=number(z,"offset",ota_service_stage_offset());break;
-    case 5: rc=ota_service_stage_end();ok=text(z,"state","ACCEPTED");break;
+    case 5:
+        rc=!r.campaign || r.campaign!=ota_service_campaign()?OTA_ERR_CONFLICT:ota_service_stage_end();
+        ok=text(z,"state","ACCEPTED");break;
     case 6: rc=ota_service_start(r.campaign,r.targets,r.count);ok=text(z,"state","ACCEPTED");break;
     case 7: ok=status(z,r.index);break;
     case 8: rc=ota_service_commit(r.campaign);ok=text(z,"state","ACCEPTED");break;

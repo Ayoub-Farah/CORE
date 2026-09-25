@@ -1,0 +1,4 @@
+/* Control and RS485 retain their higher interrupt priorities. */
+&fdcan2 {
+	interrupts = <86 2>, <87 2>;
+};

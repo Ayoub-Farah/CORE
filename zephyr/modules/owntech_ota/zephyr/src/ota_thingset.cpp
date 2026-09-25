@@ -11,7 +11,7 @@
 /* Application range, separate from Control and SDK legacy DFU. Wire fields are
  * explicit little endian, versioned, and independent of C struct padding. */
 enum { GROUP=0x0D, COMMAND=0x100, PARAM=0x101, STATUS=0x102, RELEASE=0x103, RELEASE_PARAM=0x104 };
-static uint8_t command_buffer[224], status_buffer[240], release_buffer[40];
+static uint8_t command_buffer[224], status_buffer[240], release_buffer[48];
 static THINGSET_DEFINE_BYTES(command_value, command_buffer, 0);
 static THINGSET_DEFINE_BYTES(status_value, status_buffer, 0);
 static THINGSET_DEFINE_BYTES(release_value, release_buffer, 0);
@@ -32,20 +32,22 @@ struct Reader {
     uint64_t u64() { auto v=sys_get_le64(p);p+=8;return v; }
     void bytes(void *v,size_t n) { memcpy(v,p,n);p+=n; }
 };
-static constexpr size_t COMMAND_LENGTH=188, STATUS_LENGTH=173+4+OTA_EVENT_COUNT*5;
-static_assert(COMMAND_LENGTH==1+8+1+(8+5*4+1+4*32)+8+1+3*4,"Command wire layout");
-static_assert(STATUS_LENGTH==237 && STATUS_LENGTH<256,"Status wire layout");
+static constexpr size_t COMMAND_LENGTH=189, STATUS_LENGTH=174+4+OTA_EVENT_COUNT*5;
+static_assert(COMMAND_LENGTH==1+8+1+(8+5*4+2+4*32)+8+1+3*4,"Command wire layout");
+static_assert(STATUS_LENGTH==238 && STATUS_LENGTH<256,"Status wire layout");
+#ifdef CONFIG_OWNTECH_OTA_LEAD
 static void put_manifest(Wire &w,const ota_manifest &m)
 {
     w.u64(m.campaign_id); w.u32(m.image_size); w.u32(m.image_content_size);
-    w.u32(m.hardware_id);w.u32(m.layout_id);w.u32(m.bootloader_id);w.u8(m.protocol_version);
+    w.u32(m.hardware_id);w.u32(m.layout_id);w.u32(m.bootloader_id);w.u8(m.protocol_version);w.u8(m.image_class);
     w.bytes(m.artifact_sha256,32);w.bytes(m.mcuboot_image_hash,32);
     w.bytes(m.version,32);w.bytes(m.build_id,32);
 }
+#endif
 static void get_manifest(Reader &r,ota_manifest &m)
 {
     m.campaign_id=r.u64();m.image_size=r.u32();m.image_content_size=r.u32();
-    m.hardware_id=r.u32();m.layout_id=r.u32();m.bootloader_id=r.u32();m.protocol_version=r.u8();
+    m.hardware_id=r.u32();m.layout_id=r.u32();m.bootloader_id=r.u32();m.protocol_version=r.u8();m.image_class=r.u8();
     r.bytes(m.artifact_sha256,32);r.bytes(m.mcuboot_image_hash,32);
     r.bytes(m.version,32);r.bytes(m.build_id,32);
 }
@@ -69,10 +71,10 @@ static int32_t receive_command()
 }
 static int32_t release_maintenance()
 {
-    if(release_value.num_bytes!=40) return OTA_ERR_FORMAT;
+    if(release_value.num_bytes!=48) return OTA_ERR_FORMAT;
     uint8_t source=0,route=0;
     if(thingset_can_get_request_source(&source,&route) || route) return OTA_ERR_IDENTITY;
-    return ota_runtime_release(release_buffer,release_buffer+8,source);
+    return ota_runtime_release(release_buffer,release_buffer+16,sys_get_le64(release_buffer+8),source);
 }
 static void status_callback(thingset_callback_reason why)
 {
@@ -81,7 +83,7 @@ static void status_callback(thingset_callback_reason why)
     w.u8(OTA_PROTOCOL_VERSION);w.bytes(o.identity.eui,8);w.u8(o.identity.address);
     w.u32(o.identity.usable_slot_size);w.u32(o.identity.usable_image_size);
     w.u32(o.identity.hardware_id);w.u32(o.identity.layout_id);w.u32(o.identity.bootloader_id);
-    w.u8(o.identity.active_confirmed);w.u8(o.identity.slot_available);
+    w.u8(o.identity.active_confirmed);w.u8(o.identity.slot_available);w.u8(o.identity.image_class);
     w.u64(o.status.campaign_id);w.u32(o.status.pass_id);w.u32(o.status.offset);
     w.u32(o.status.image_size);w.u32(o.status.commit_id);w.u8(o.status.state);
     w.u32((uint32_t)o.status.error);w.u16(o.status.queue_depth);
@@ -101,6 +103,8 @@ THINGSET_ADD_ITEM_BYTES(GROUP,STATUS,"rStatus",&status_value,THINGSET_ANY_R,0);
 THINGSET_ADD_FN_INT32(GROUP,RELEASE,"xRelease",&release_maintenance,THINGSET_ANY_RW);
 THINGSET_ADD_ITEM_BYTES(RELEASE,RELEASE_PARAM,"bResult",&release_value,THINGSET_ANY_RW,0);
 
+/* Receiver has no request client or response-copy buffer. */
+#ifdef CONFIG_OWNTECH_OTA_LEAD
 static K_SEM_DEFINE(response_ready,0,1);
 static K_MUTEX_DEFINE(request_lock);
 static uint8_t response_data[256];
@@ -171,7 +175,7 @@ extern "C" int ota_network_status(uint8_t address,ota_observation *o)
         r.bytes(o->identity.eui,8);o->identity.address=r.u8();
         o->identity.usable_slot_size=r.u32();o->identity.usable_image_size=r.u32();
         o->identity.hardware_id=r.u32();o->identity.layout_id=r.u32();o->identity.bootloader_id=r.u32();
-        o->identity.active_confirmed=r.u8();o->identity.slot_available=r.u8();
+        o->identity.active_confirmed=r.u8();o->identity.slot_available=r.u8();o->identity.image_class=r.u8();
         o->status.campaign_id=r.u64();o->status.pass_id=r.u32();o->status.offset=r.u32();
         o->status.image_size=r.u32();o->status.commit_id=r.u32();o->status.state=(ota_state)r.u8();
         o->status.error=(int32_t)r.u32();o->status.queue_depth=r.u16();
@@ -195,22 +199,24 @@ extern "C" int ota_network_status(uint8_t address,ota_observation *o)
         }
         if(orders!=((1U<<(count+1))-2)) rc=OTA_ERR_FORMAT;
         if(o->identity.protocol_version!=OTA_PROTOCOL_VERSION || o->identity.address!=address ||
-           o->status.state>OTA_SUCCEEDED || !memchr(o->active_version,0,32) ||
+           (o->identity.image_class!=OTA_IMAGE_RECEIVER && o->identity.image_class!=OTA_IMAGE_LEAD) ||
+           o->status.state>OTA_COMMIT_INTENT || !memchr(o->active_version,0,32) ||
            !memchr(o->active_build_id,0,32)) rc=OTA_ERR_FORMAT;
-        const size_t boolean_offsets[]={30,31,63,64,65,170,171,172};
+        const size_t boolean_offsets[]={30,31,64,65,66,171,172,173};
         for(size_t i:boolean_offsets) if(response_data[4+i]>1) rc=OTA_ERR_FORMAT;
     }
     k_mutex_unlock(&request_lock);return rc;
 }
-extern "C" int ota_network_release(uint8_t address,const uint8_t identity[8],const uint8_t hash[32])
+extern "C" int ota_network_release(uint8_t address,const uint8_t identity[8],const uint8_t hash[32],uint64_t campaign)
 {
     if(thingset_can_announce_address(K_MSEC(100))) return OTA_ERR_TRANSPORT;
-    uint8_t packet[47]={THINGSET_BIN_EXEC,0x19,RELEASE>>8,RELEASE&255,0x81,0x58,40};
-    memcpy(packet+7,identity,8);memcpy(packet+15,hash,32);
+    uint8_t packet[55]={THINGSET_BIN_EXEC,0x19,RELEASE>>8,RELEASE&255,0x81,0x58,48};
+    memcpy(packet+7,identity,8);sys_put_le64(campaign,packet+15);memcpy(packet+23,hash,32);
     k_mutex_lock(&request_lock,K_FOREVER);
     int rc=request(address,packet,sizeof(packet));if(!rc) rc=exec_result();
     k_mutex_unlock(&request_lock);return rc;
 }
+ #endif /* CONFIG_OWNTECH_OTA_LEAD */
 extern "C" int ota_network_init(void)
 {
     thingset_can_set_addr_claim_rx_callback(ota_runtime_claim);

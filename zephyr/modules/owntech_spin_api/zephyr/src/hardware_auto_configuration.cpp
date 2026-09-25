@@ -152,8 +152,14 @@ void reboot_bootloader_task(struct k_work* work)
     return;
 #endif
 #ifdef CONFIG_OWNTECH_OTA
+    /* The application callback may wait for supervision; never invoke it with
+     * interrupts locked. It inhibits future starts and verifies stopped outputs. */
+    if (ota_service_busy() || ota_safety_inhibited()) return;
+    if (ota_safety_enter()) return;
     unsigned int ota_key = irq_lock();
-    if (ota_service_busy() || ota_safety_inhibited()) { irq_unlock(ota_key); return; }
+    /* A campaign admitted during the safety callback keeps the board inhibited
+     * and owns the next action. A baud change cannot interrupt its writer. */
+    if (ota_service_busy()) { irq_unlock(ota_key); return; }
 #endif
 	bootmode_set(BOOT_MODE_TYPE_BOOTLOADER);
 	sys_reboot(SYS_REBOOT_WARM);
@@ -170,6 +176,9 @@ K_WORK_DEFINE(reboot_bootloader_work, reboot_bootloader_task);
  */
 void _cdc_rate_callback(const struct device* dev, uint32_t rate)
 {
+#ifdef CONFIG_OWNTECH_OTA
+    if (rate == 2400) ota_console_request_status();
+#endif
 	if (rate == 1200
 #ifdef CONFIG_OWNTECH_OTA
         && !ota_service_busy() && !ota_safety_inhibited()

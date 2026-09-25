@@ -9,6 +9,9 @@ enum ota_slot_owner { OTA_SLOT_NONE, OTA_SLOT_USB, OTA_SLOT_PARTICIPANT, OTA_SLO
 /* Existing NVS owner only. Reserved keys 0x0500 (role), 0x0501 (maintenance),
  * 0x0502 (campaign journal), 0x0503 (frozen coordinator journal). */
 struct ota_storage_journal {
+    uint16_t format_version;
+    uint8_t protocol_version;
+    uint8_t image_class;
     uint64_t campaign_id;
     uint32_t commit_id;
     uint32_t image_size;
@@ -31,7 +34,7 @@ int ota_storage_persist_role(bool lead);
 /* Bind the prepared campaign to its stable Lead identity before the first
  * stage/prepare. The next journal persists it before any erase. */
 int ota_storage_expect_lead(const uint8_t eui[8]);
-/* Copy worker-owned event history into the next durable state transition. */
+/* Retain diagnostic event history in RAM; v2 local records omit fleet history. */
 void ota_storage_set_events(uint32_t mask, const uint32_t event_ms[12], const uint8_t order[12]);
 void ota_storage_hooks(struct ota_participant_hooks *hooks);
 void ota_storage_boot_identity(struct ota_identity *identity);
@@ -44,8 +47,8 @@ int ota_storage_read(uint32_t offset, uint8_t *data, size_t length);
 void ota_storage_abort(void);
 int ota_storage_persist_campaign(const struct ota_manifest *, const struct ota_target *,
                                 size_t count, uint32_t commit_id, enum ota_state);
-/* OTA2 restores stable EUIs and is_lead only; refresh all other target identity
- * fields through discovery. Deployed OTA1 records remain readable for recovery. */
+/* V2 restores stable receiver EUIs; refresh other fields through discovery.
+ * Legacy OTA1/OTA2 records require explicit recovery, never implicit adoption. */
 int ota_storage_load_campaign(struct ota_manifest *, struct ota_target *, size_t *count,
                              uint32_t *commit_id);
 /* Only after every frozen identity passed postboot validation. Never clears a

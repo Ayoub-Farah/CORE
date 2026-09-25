@@ -1,53 +1,47 @@
-"""PlatformIO Project Task: existing MCUboot build, then one USB/CAN campaign."""
+"""Install the dedicated Lead, or build OTA and distribute only to receivers."""
 from pathlib import Path
+import subprocess
 import sys
-
 from SCons.Script import COMMAND_LINE_TARGETS
 
 Import("env")
 sys.path.insert(0, str(Path(env.subst("$PROJECT_DIR")) / "owntech" / "scripts"))
+from ota_pio import (connection_options, provision_action, register_artifact_validation,
+                     register_usb_init)
 
-# The framework only creates its signing builder when this target is present.
-# Reuse that builder and its current key; never invoke install_bootloader.
-if "lead_update" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE_TARGETS:
+if "upload" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE_TARGETS:
     COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
-
-
-from ota_pio import artifact_options, connection_options, mcumgr_path, register_artifact_validation, register_usb_init
-
 register_usb_init(env)
+register_artifact_validation(env)
+if "upload" in COMMAND_LINE_TARGETS:
+    env.Depends(env.Alias("upload"), env.Alias("mcuboot-image"))
+env.Replace(UPLOADCMD=provision_action)
 
 
 def lead_update_action(source, target, env):
     project = Path(env.subst("$PROJECT_DIR"))
+    # This nested build is a different environment and never runs an upload.
+    subprocess.run([sys.executable, "-m", "platformio", "run", "-d", str(project),
+                    "-e", "OTA", "-t", "mcuboot-image"], check=True)
     sys.path.insert(0, str(project / "owntech" / "tools"))
     from lead_update import main
-    _, profile_path, version, build_id = artifact_options(env)
-    image = Path(env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin"))
-    args = ["--image", str(image), "--profile", str(profile_path), "--version", version]
-    if build_id:
-        args.extend(["--build-id", build_id])
-    args.extend(connection_options(env))
-    options = {"custom_ota_expected_count": "--expected-count",
-               "custom_ota_timeout": "--timeout", "custom_ota_bootstrap_image": "--bootstrap-image"}
-    for option, flag in options.items():
+    image = project / "ota-artifacts" / "OTA" / "firmware.can.bin"
+    args = ["--image", str(image)] + connection_options(env)
+    for option, flag in (("custom_ota_expected_count", "--expected-count"),
+                         ("custom_ota_timeout", "--timeout")):
         value = env.GetProjectOption(option, "")
         if value:
             args.extend([flag, str(value)])
     ids = env.GetProjectOption("custom_ota_expected_ids", "")
     for value in ids.replace(",", " ").split():
         args.extend(["--expected-id", value])
-    if str(env.GetProjectOption("custom_ota_receiver_absent", "false")).lower() in ("true", "1", "yes"):
-        args.extend(["--receiver-absent", "--mcumgr", mcumgr_path(env)])
     return main(args)
 
 
-register_artifact_validation(env)
 env.AddCustomTarget(
-    name="lead_update",
-    dependencies=env.Alias("mcuboot-image"),
-    actions=[env.VerboseAction(lead_update_action, "Updating the frozen USB/CAN fleet")],
-    title="Update Lead and CAN fleet",
-    description="Build/sign, probe, stage exact image, broadcast, validate and verify every reboot",
+    name="lead_update", dependencies=[],
+    actions=[env.VerboseAction(lead_update_action, "Updating CAN receiver boards")],
+    title="Update CAN receiver boards",
+    description="Build OTA receiver, serve bounded PC blocks, verify the frozen fleet; never flash the Lead",
     always_build=True,
 )

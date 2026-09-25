@@ -1,7 +1,7 @@
 """Deterministic application identity, independent of deployment and Git state.
 
 PlatformIO installs dependencies before running pre scripts. Hash their sources
-under a canonical library path, so OTA and USB_LEAD describe the same application.
+under a canonical library path; the receiver and dedicated Lead have distinct inputs.
 The signed image's SHA-256 remains the authority for the exact distributed bytes.
 """
 
@@ -13,7 +13,7 @@ import re
 import shlex
 
 
-SCHEMA = 1
+SCHEMA = 2
 _VERSION = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:\+([0-9]+))?\Z")
 _SKIP_DIRS = {".git", ".hg", ".svn", ".pio", ".github", "__pycache__",
               "build", "docs", "doc", "tests", "test", "samples"}
@@ -195,7 +195,9 @@ def generate_for_environment(env):
         if package.metadata.name.startswith(("framework-", "toolchain-"))
         or package.metadata.name in {"tool-cmake", "tool-dtc", "tool-ninja"}
     }
-    roots = [("src", Path(env.subst("$PROJECT_SRC_DIR"))),
+    image_class = "lead" if env["PIOENV"] == "USB_LEAD" else "receiver"
+    application = project_dir / "owntech/lead" if image_class == "lead" else Path(env.subst("$PROJECT_SRC_DIR"))
+    roots = [("application/" + image_class, application),
              ("include", Path(env.subst("$PROJECT_INCLUDE_DIR"))),
              ("zephyr", project_dir / "zephyr"),
              ("third_party", project_dir / "third_party")]
@@ -211,7 +213,9 @@ def generate_for_environment(env):
                                           ("library.json", "library.properties", "src")):
                 roots.append(("private_libraries/" + directory.name, directory))
     settings = effective_settings(options, board_build, packages, project_dir)
+    settings["image_class"] = image_class
     identity = fingerprint(project_dir, version, settings, roots)
+    identity["image_class"] = image_class
     configuration = fingerprint(project_dir, version, settings, roots, configuration_only=True)
     environment = env["PIOENV"]
     if not environment or Path(environment).name != environment or environment in {".", ".."}:
@@ -237,6 +241,7 @@ def generate_for_environment(env):
     write_identity(output_dir, identity)
     env["OWNTECH_OTA_VERSION"] = identity["version"]
     env["OWNTECH_OTA_BUILD_ID"] = identity["build_id"]
+    env["OWNTECH_OTA_IMAGE_CLASS"] = image_class
     env["OWNTECH_OTA_IDENTITY_FILE"] = str(output_dir / "identity.json")
     env["OWNTECH_OTA_IDENTITY_DIR"] = str(durable_dir)
     return identity

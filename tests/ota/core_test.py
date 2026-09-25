@@ -16,16 +16,22 @@ OTA = ROOT / "zephyr/modules/owntech_ota/zephyr"
 
 
 class CoreTests(unittest.TestCase):
-    def compile_and_run(self, storage=False, short_enums=False):
+    def compile_and_run(self, storage=False, short_enums=False, gate=None):
         compiler = shutil.which("clang++") or shutil.which("g++")
         self.assertIsNotNone(compiler, "C++ compiler required (LLVM clang++ on Windows)")
         name = "storage" if storage else "core"
         symbol = "ota_storage_test_run" if storage else "ota_test_run"
+        if gate:
+            symbol = "ota_storage_gate_test_run"
         with tempfile.TemporaryDirectory(prefix="owntech-ota-") as tmp:
             output = Path(tmp) / (name + (".dll" if os.name == "nt" else ""))
             args = [compiler, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror"]
             if short_enums:
                 args += ["-fshort-enums"]
+            if gate == "unqualified":
+                args += ["-DCONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=0"]
+            elif gate == "lead":
+                args += ["-DCONFIG_OWNTECH_OTA_LEAD=1"]
             includes = [OTA / "public_api", OTA / "src"]
             sources = [OTA / "src/ota_protocol.c"]
             if storage:
@@ -63,6 +69,12 @@ class CoreTests(unittest.TestCase):
 
     def test_storage_with_arm_enum_layout(self):
         self.compile_and_run(storage=True, short_enums=True)
+
+    def test_unqualified_storage_refuses_before_erase(self):
+        self.compile_and_run(storage=True, gate="unqualified")
+
+    def test_lead_never_stages_receiver_in_boot_slot(self):
+        self.compile_and_run(storage=True, gate="lead")
 
 
 if __name__ == "__main__":

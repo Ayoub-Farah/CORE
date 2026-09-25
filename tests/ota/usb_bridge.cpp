@@ -47,7 +47,7 @@ extern "C" size_t ota_service_target_count(void) { return target_count; }
 static void observation(ota_observation *o,size_t index)
 {
     memset(o,0,sizeof(*o));memcpy(o->identity.eui,ids[index],8);
-    o->identity.address=index+1;o->identity.protocol_version=1;
+    o->identity.address=index+1;o->identity.protocol_version=OTA_PROTOCOL_VERSION;o->identity.image_class=OTA_IMAGE_RECEIVER;
     o->identity.hardware_id=CONFIG_OWNTECH_OTA_HARDWARE_ID;
     o->identity.layout_id=CONFIG_OWNTECH_OTA_LAYOUT_ID;
     o->identity.bootloader_id=CONFIG_OWNTECH_OTA_BOOTLOADER_ID;
@@ -74,10 +74,11 @@ extern "C" void ota_service_local(ota_observation *o) { observation(o,0); }
 extern "C" void ota_service_snapshot(ota_observation *o,ota_service_diagnostics *d)
 {
     observation(o,0);
+    memset(o->identity.eui,0xff,8);o->identity.image_class=OTA_IMAGE_LEAD;
     *d={phase,health_error,local_health,ota_service_healthy(),can_ready,false,lead_role};
 }
 extern "C" int ota_service_target(size_t i,ota_observation *o,bool *lead,uint64_t *seen)
-{ if(i>=target_count)return OTA_ERR_ARGUMENT;observation(o,i);*lead=i==0;*seen=123456;return 0; }
+{ if(i>=target_count)return OTA_ERR_ARGUMENT;observation(o,i);*lead=false;*seen=123456;return 0; }
 extern "C" int ota_service_discover(uint64_t campaign) { discovery_token=campaign;return 0; }
 extern "C" int ota_service_stage_begin(const ota_manifest *m)
 {
@@ -85,16 +86,27 @@ extern "C" int ota_service_stage_begin(const ota_manifest *m)
     if(!m->image_size || !m->image_content_size || m->image_content_size>m->image_size ||
        m->hardware_id!=CONFIG_OWNTECH_OTA_HARDWARE_ID || m->layout_id!=CONFIG_OWNTECH_OTA_LAYOUT_ID ||
        m->bootloader_id!=CONFIG_OWNTECH_OTA_BOOTLOADER_ID)return OTA_ERR_ARGUMENT;
-    stored=*m;accepted=0;phase="STAGING";return 0;
+    stored=*m;accepted=0;phase="SOURCE_OPEN";return 0;
 }
 extern "C" int ota_service_stage_data(uint32_t offset,const uint8_t *,size_t n)
 { if(offset!=accepted || n>stored.image_size-accepted)return OTA_ERR_OFFSET;accepted+=n;return 0; }
+extern "C" void ota_service_source_request(uint64_t *campaign,uint32_t *offset,uint32_t *length)
+{
+    *campaign=stored.campaign_id;*offset=accepted;
+    *length=!strcmp(phase,"CAN_TRANSFER")?stored.image_size-accepted:0;
+    if(*length>OTA_MAX_PAYLOAD)*length=OTA_MAX_PAYLOAD;
+}
+extern "C" int ota_service_source_data(uint64_t campaign,uint32_t offset,const uint8_t *data,size_t n)
+{
+    if(campaign!=stored.campaign_id||strcmp(phase,"CAN_TRANSFER"))return OTA_ERR_CONFLICT;
+    int rc=ota_service_stage_data(offset,data,n);if(!rc&&accepted==stored.image_size)phase="ALL_VALIDATED";return rc;
+}
 extern "C" int ota_service_stage_end(void)
-{ if(accepted!=stored.image_size)return OTA_ERR_INCOMPLETE;staged=true;phase="STAGED";return 0; }
+{ staged=true;phase="SOURCE_READY";return 0; }
 extern "C" int ota_service_start(uint64_t campaign,const uint8_t targets[][8],size_t n)
 {
     if(!staged || campaign!=stored.campaign_id || !n)return OTA_ERR_STATE;
-    memcpy(ids,targets,n*8);target_count=n;phase="ALL_VALIDATED";return 0;
+    memcpy(ids,targets,n*8);target_count=n;phase="CAN_TRANSFER";return 0;
 }
 extern "C" int ota_service_commit(uint64_t campaign)
 {

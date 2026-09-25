@@ -8,7 +8,7 @@ static bool same_manifest(const ota_manifest &a, const ota_manifest &b)
     return a.campaign_id == b.campaign_id && a.image_size == b.image_size &&
         a.image_content_size == b.image_content_size && a.hardware_id == b.hardware_id &&
         a.layout_id == b.layout_id && a.bootloader_id == b.bootloader_id &&
-        a.protocol_version == b.protocol_version &&
+        a.protocol_version == b.protocol_version && a.image_class == b.image_class &&
         !memcmp(a.artifact_sha256, b.artifact_sha256, 32) &&
         !memcmp(a.mcuboot_image_hash, b.mcuboot_image_hash, 32) &&
         !memcmp(a.version, b.version, sizeof(a.version)) &&
@@ -24,7 +24,9 @@ static int journal(ota_participant *p, ota_state state, uint32_t commit = 0)
 static int fail(ota_participant *p, int error)
 {
     p->status.error = error;
-    (void)journal(p, OTA_FAILED, p->status.commit_id);
+    /* Keep the durable intention/arm result if commit has begun. Replacing it
+     * with FAILED would hide a power cut or partial trailer programming. */
+    if (!p->commit_attempted) (void)journal(p, OTA_FAILED, p->status.commit_id);
     p->status.state = OTA_FAILED;
     if (p->hooks.close) p->hooks.close(p->hooks.context);
     return error;
@@ -43,7 +45,7 @@ int ota_participant_prepare(ota_participant *p, const ota_manifest *m,
                             const uint8_t eui[8], uint8_t address, bool adopt)
 {
     if (!p || !m || !eui || !m->campaign_id || !address || address >= 254 ||
-        !m->image_size || !m->image_content_size || m->image_content_size > m->image_size)
+        !m->image_size || !m->image_content_size)
         return OTA_ERR_ARGUMENT;
     uint8_t nonzero = 0; for (size_t i = 0; i < 8; ++i) nonzero |= eui[i];
     if (!nonzero) return OTA_ERR_IDENTITY;
@@ -53,14 +55,14 @@ int ota_participant_prepare(ota_participant *p, const ota_manifest *m,
         return p->status.error ? p->status.error : OTA_OK;
     }
     if (p->status.state != OTA_IDLE && p->status.state != OTA_SUCCEEDED) return OTA_ERR_STATE;
-    if (m->protocol_version != OTA_PROTOCOL_VERSION || m->hardware_id != p->identity.hardware_id ||
+    if (adopt || m->image_size != m->image_content_size ||
+        m->image_class != OTA_IMAGE_RECEIVER || p->identity.image_class != OTA_IMAGE_RECEIVER ||
+        m->protocol_version != OTA_PROTOCOL_VERSION || m->hardware_id != p->identity.hardware_id ||
         m->layout_id != p->identity.layout_id || m->bootloader_id != p->identity.bootloader_id)
         return OTA_ERR_COMPATIBILITY;
     if (m->image_size > p->identity.usable_slot_size ||
         m->image_content_size > p->identity.usable_image_size) return OTA_ERR_CAPACITY;
-    /* The staged Lead may already be pending. Its storage hook verifies exact
-     * owner/manifest equality and adopts read-only without this erase gate. */
-    if (!adopt && (!p->identity.active_confirmed || !p->identity.slot_available)) return OTA_ERR_STATE;
+    if (!p->identity.active_confirmed || !p->identity.slot_available) return OTA_ERR_STATE;
     /* A successfully reconciled previous campaign may start again. Never
      * restore a partial writer from journal offsets. */
     p->status = {};
@@ -126,6 +128,9 @@ int ota_participant_commit(ota_participant *p, uint64_t id, uint32_t commit)
         (p->status.error ? p->status.error : OTA_OK) : OTA_ERR_CONFLICT;
     if (p->status.state != OTA_VALID || !p->status.validated || !p->status.flash_complete) return OTA_ERR_STATE;
     p->commit_attempted = true; p->status.commit_id = commit;
+    if (journal(p, OTA_COMMIT_INTENT, commit)) return fail(p, OTA_ERR_JOURNAL);
+    if (!p->hooks.arm || p->hooks.arm(p->hooks.context, &p->manifest, commit))
+        return fail(p, OTA_ERR_STORAGE);
     if (journal(p, OTA_COMMITTED, commit)) return fail(p, OTA_ERR_JOURNAL);
     return OTA_OK;
 }
@@ -133,8 +138,8 @@ int ota_participant_abort(ota_participant *p, uint64_t id)
 {
     if (!campaign(p, id)) return OTA_ERR_CONFLICT;
     if (p->status.state == OTA_ABORTED) return OTA_OK;
-    /* Once a reboot timer exists, abort cannot promise cancellation. */
-    if (p->reboot_scheduled) return OTA_ERR_STATE;
+    /* An interrupted arm may have programmed boot magic. ABORT cannot cancel it. */
+    if (p->commit_attempted || p->reboot_scheduled) return OTA_ERR_STATE;
     if (p->hooks.close) p->hooks.close(p->hooks.context);
     if (journal(p, OTA_ABORTED, p->status.commit_id)) return fail(p, OTA_ERR_JOURNAL);
     return OTA_OK;

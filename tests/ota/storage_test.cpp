@@ -1,5 +1,8 @@
 /* Actual ota_storage.cpp with fake Zephyr/NVS boundaries, including reset RAM. */
 #define CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE 900
+#ifndef CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED
+#define CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED 1
+#endif
 #define CONFIG_OWNTECH_OTA_HARDWARE_ID 1
 #define CONFIG_OWNTECH_OTA_LAYOUT_ID 2
 #define CONFIG_OWNTECH_OTA_BOOTLOADER_ID 3
@@ -15,7 +18,9 @@ struct nv { uint16_t key; size_t len; unsigned sequence; uint8_t data[1536]; };
 static nv records[2][64];
 static unsigned nv_sector, nv_sequence, nv_used[2], nv_gc_count;
 static bool nv_gc_marker;
-static unsigned erased, flushed_count, scheduled, checked, nvs_writes;
+static unsigned erased, flushed_count, scheduled, checked, nvs_writes, armed;
+static unsigned programmed_end;
+static bool arm_fail;
 static bool confirmed = true, inhibited = true, safety_fail, write_fail, nvs_fail, hash_fail;
 static int swap = BOOT_SWAP_TYPE_NONE;
 int flash_area_open(unsigned id, const flash_area **p) { if (id > 1) return -1; *p = &areas[id]; return 0; }
@@ -26,7 +31,7 @@ int flash_area_erase(const flash_area *a, uint32_t off, size_t n)
 {
     marker m = {}; if (!inhibited || load(MAINTENANCE_KEY, m) || m.value != 1) return -1;
     if (a->id != 1 || off || n != 1024) return -1;
-    memset(flash[1], 0xff, 1024); ++erased; return 0;
+    memset(flash[1], 0xff, 1024); programmed_end=0; ++erased; return 0;
 }
 int flash_img_init_id(flash_img_context *w, uint8_t id)
 { *w = {}; return flash_area_open(id, &w->flash_area); }
@@ -36,9 +41,11 @@ int flash_img_buffered_write(flash_img_context *w, const uint8_t *data, size_t n
     while (n) {
         size_t take = 512 - w->pending; if (take > n) take = n;
         memcpy(w->buf + w->pending, data, take); w->pending += take; data += take; n -= take;
-        if (w->pending == 512) { memcpy(flash[1] + w->written, w->buf, 512); w->written += 512; w->pending = 0; }
+        if (w->pending == 512) { memcpy(flash[1] + w->written, w->buf, 512); w->written += 512; w->pending = 0; programmed_end=w->written; }
     }
     if (final) {
+        /* stream_flash programs an aligned padded buffer, including FF ECC. */
+        if (w->pending) { memset(flash[1]+w->written,0xff,512); programmed_end=w->written+512; }
         memcpy(flash[1] + w->written, w->buf, w->pending); w->written += w->pending; w->pending = 0;
         w->flash_area = nullptr; ++flushed_count;
     }
@@ -50,10 +57,18 @@ int flash_img_check(flash_img_context *, const struct flash_img_check *check, ui
     ++checked;
     /* Model the SHA contract by checking all exact artifact bytes. Hash
      * implementation is Zephyr's existing SHA256, not a new OTA primitive. */
-    return hash_fail || id != 1 || check->clen != 1024 || memcmp(flash[1], expected_artifact, 1024) ? -1 : 0;
+    return hash_fail || id != 1 || check->clen != 200 || memcmp(flash[1], expected_artifact, 200) ? -1 : 0;
 }
 bool boot_is_img_confirmed() { return confirmed; }
 int mcuboot_swap_type() { return swap; }
+int boot_request_upgrade(int mode)
+{
+    local_record record = {}; ota_storage_journal j = {};
+    if (mode != BOOT_UPGRADE_TEST || load(JOURNAL_KEY,record,LOCAL_MAGIC) || decode_local(record,j) ||
+        j.state != OTA_COMMIT_INTENT || !j.commit_id || !inhibited || writer_open) return -1;
+    ++armed; if (arm_fail) return -1;
+    swap = BOOT_SWAP_TYPE_TEST; flash[1][1008] = 0x77; return 0;
+}
 int k_work_schedule(k_work_delayable *, uint32_t) { ++scheduled; return 0; }
 void sys_reboot(int) {}
 extern "C" int ota_safety_enter() { inhibited = true; return safety_fail ? -1 : 0; }
@@ -125,7 +140,7 @@ static void reset_nv()
 static void reset_ram()
 {
     writer = {}; current_manifest = {}; current_journal = {}; owner = OTA_SLOT_NONE;
-    initialized = recovery = maintenance = writer_open = flushed = staged = reboot_queued = false;
+    initialized = recovery = maintenance = writer_open = flushed = staged = reboot_queued = journal_corrupt = false;
     accepted = reboot_commit = 0; terminal_error = 0; inhibited = true;
     memset(expected_lead_eui,0,8);
     event_mask=0;memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
@@ -138,193 +153,177 @@ static int init_service()
 }
 static ota_manifest artifact()
 {
-    ota_manifest m = {}; m.campaign_id = 42; m.image_size = 1024; m.image_content_size = 200;
-    m.hardware_id = 1; m.layout_id = 2; m.bootloader_id = 3; m.protocol_version = 1;
+    ota_manifest m = {}; m.campaign_id = 42; m.image_size = 200; m.image_content_size = 200;
+    m.hardware_id = 1; m.layout_id = 2; m.bootloader_id = 3; m.protocol_version = OTA_PROTOCOL_VERSION;
+    m.image_class = OTA_IMAGE_RECEIVER;
     memcpy(m.version,"1.2.3",6);memcpy(m.build_id,"test-build",11);
     memset(m.mcuboot_image_hash, 0xbb, 32);
     memset(expected_artifact, 0xff, sizeof(expected_artifact));
     memset(expected_artifact, 0, 32); uint8_t *b = expected_artifact;
-    b[0]=0x3d;b[1]=0xb8;b[2]=0xf3;b[3]=0x96;b[8]=32;b[12]=128;
+    b[0]=0x3d;b[1]=0xb8;b[2]=0xf3;b[3]=0x96;b[8]=32;b[10]=16;b[12]=112;
+    b[144]=0x08;b[145]=0x69;b[146]=16;b[147]=0;
+    b[148]=0xa0;b[149]=0;b[150]=8;b[151]=0;memcpy(b+152,"receiver",8);
     b[160]=0x07;b[161]=0x69;b[162]=40;b[163]=0;
     b[164]=0x10;b[165]=0;b[166]=32;b[167]=0;memcpy(b+168,m.mcuboot_image_hash,32);
-    const uint8_t magic[16]={0x77,0xc2,0x95,0xf3,0x60,0xd2,0xef,0x7f,0x35,0x52,0x50,0x0f,0x2c,0xb6,0x79,0x80};
-    memcpy(b+1008,magic,16); memcpy(flash[0], b, 1024);
+    memcpy(flash[0], b, 1024);
     return m;
 }
 static int upload(const ota_manifest &m)
 {
     int rc=ota_storage_stage_begin(&m); if(rc) return rc;
-    for (uint32_t pos=0;pos<1024;pos+=256) { rc=ota_storage_stage_append(pos,expected_artifact+pos,256); if(rc) return rc; }
+    rc=ota_storage_stage_append(0,expected_artifact,200); if(rc) return rc;
     return ota_storage_stage_end(&m);
 }
 static int journal_gc_regressions()
 {
-    reset_nv(); reset_ram(); ota_manifest m=artifact(); m.campaign_id=0xfedcba9876543210ULL;
-    CHECK(!init_service());
-    uint8_t calibration[1200], readback[1200];
+    reset_nv(); reset_ram(); ota_manifest m=artifact(); CHECK(!init_service());
+    uint8_t calibration[1500], readback[1500];
     for(size_t i=0;i<sizeof(calibration);++i) calibration[i]=(uint8_t)(i*37+9);
-    const uint16_t version=1;
-    CHECK(nvs_storage_write(0x0100,&version,sizeof(version))==sizeof(version));
     CHECK(nvs_storage_write(0x0201,calibration,512)==512);
-    CHECK(!ota_storage_persist_role(true));
     CHECK(!upload(m));
-    ota_target targets[OTA_MAX_TARGETS]={}; targets[0].is_lead=true;
-    for(size_t i=0;i<OTA_MAX_TARGETS;++i) {
-        targets[i].identity.eui[0]=0xa5;targets[i].identity.eui[7]=(uint8_t)(i+1);
-        targets[i].identity.address=(uint8_t)(i+5);
-    }
-    /* Reproduce the hardware failure: the original growth-only reservation
-     * admits 824 B, VALID is durable, but COMMITTED needs another 832 B while
-     * GC must preserve that VALID record. The prior value survives ENOSPC. */
-    CHECK(nvs_storage_get_free_space()>=832);
-    legacy_fleet_record legacy={};legacy.magic=JOURNAL_MAGIC;legacy.length=sizeof(legacy);
-    legacy.manifest=m;memcpy(legacy.targets,targets,sizeof(targets));
-    legacy.count=2;legacy.commit_id=77;legacy.state=OTA_VALID;
-    CHECK(!store(FLEET_KEY,legacy));
-    legacy.state=OTA_COMMITTED;
-    legacy.crc=ota_crc32(reinterpret_cast<const uint8_t *>(&legacy),offsetof(legacy_fleet_record,crc));
-    CHECK(nvs_storage_write(FLEET_KEY,&legacy,sizeof(legacy))==-ENOSPC);
-    CHECK(store(FLEET_KEY,legacy)==OTA_ERR_JOURNAL);
-    legacy_fleet_record previous={};CHECK(!load(FLEET_KEY,previous)&&previous.state==OTA_VALID);
+    ota_target targets[OTA_MAX_TARGETS]={};
+    for(size_t i=0;i<OTA_MAX_TARGETS;++i) targets[i].identity.eui[7]=(uint8_t)(i+1);
     ota_manifest restored={};ota_target restored_targets[OTA_MAX_TARGETS]={};
     size_t count=OTA_MAX_TARGETS;uint32_t commit=0;
-    CHECK(!ota_storage_load_campaign(&restored,restored_targets,&count,&commit));
-    CHECK(count==2&&commit==77&&equal_manifest(restored,m));
-    CHECK(restored_targets[0].is_lead&&restored_targets[1].identity.address==6);
-    /* Migration may only use currently free bytes; it never counts the 520 B
-     * shrink before the compact replacement itself has been committed. */
-    CHECK(!reserve_journal_space(OTA_SLOT_USB));
-    CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_COMMITTED));
-    uint8_t first=0;CHECK(nvs_storage_read(FLEET_KEY,&first,1)==304);
     unsigned gc_before=nv_gc_count;
     for(unsigned i=0;i<80;++i) {
-        CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,78+i,
-              i%2?OTA_REBOOTING:OTA_COMMITTED));
+        CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,78+i,i%2?OTA_REBOOTING:OTA_COMMITTED));
         CHECK(!save_journal(&m,i%2?OTA_REBOOTING:OTA_COMMITTED,78+i));
         count=OTA_MAX_TARGETS;CHECK(!ota_storage_load_campaign(&restored,restored_targets,&count,&commit));
         CHECK(count==OTA_MAX_TARGETS&&commit==78+i&&equal_manifest(restored,m));
-        CHECK(restored_targets[0].is_lead&&!restored_targets[1].is_lead);
         for(size_t j=0;j<count;++j)
-            CHECK(!memcmp(restored_targets[j].identity.eui,targets[j].identity.eui,8)&&
-                  !restored_targets[j].identity.address);
+            CHECK(!restored_targets[j].is_lead && !memcmp(restored_targets[j].identity.eui,targets[j].identity.eui,8)&&!restored_targets[j].identity.address);
     }
     CHECK(nv_gc_count>gc_before+10);
     CHECK(nvs_storage_read(0x0201,readback,512)==512&&!memcmp(readback,calibration,512));
-    CHECK(nvs_storage_read(0x0100,&commit,sizeof(commit))==2&&(commit&0xffff)==version);
-    /* A valid CRC cannot hide a malformed compact roster; damaged bytes also
-     * fail loading. These are read-only failures, without migration writes. */
     fleet_record compact={};CHECK(!load(FLEET_KEY,compact,FLEET_MAGIC));
     compact.eui[1][0]^=1;CHECK(nvs_storage_write(FLEET_KEY,&compact,sizeof(compact))==sizeof(compact));
     count=OTA_MAX_TARGETS;CHECK(ota_storage_load_campaign(&restored,restored_targets,&count,&commit)==OTA_ERR_JOURNAL);
     memcpy(compact.eui[1],compact.eui[0],8);CHECK(!store(FLEET_KEY,compact));
     CHECK(ota_storage_load_campaign(&restored,restored_targets,&count,&commit)==OTA_ERR_JOURNAL);
-    /* No version key yet: the 16 B implicit first-write allocation must also
-     * fit. Free space equals growth+overwrite+GC, so omitting VERSION would
-     * admit this campaign incorrectly. Rejection must precede any mutation. */
+    targets[0].is_lead=true;
+    CHECK(ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_COMMITTED)==OTA_ERR_IDENTITY);
+    /* A receiver cannot inherit even a valid dedicated Lead's fleet record. */
+    reset_nv();reset_ram();CHECK(!init_service());targets[0].is_lead=false;
+    CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_PREPARING));
+    reset_ram();unsigned before_class_check=nvs_writes;
+    CHECK(ota_storage_init()==OTA_ERR_JOURNAL&&ota_storage_recovery_required());
+    CHECK(nvs_writes==before_class_check&&!load(FLEET_KEY,compact,FLEET_MAGIC));
     reset_nv();reset_ram();CHECK(!init_service());
-    CHECK(nvs_storage_write(0x0201,calibration,1120)==1120);
-    unsigned erase_before=erased, writes_before=nvs_writes;
-    CHECK(nvs_storage_get_free_space()==24+248+312+312+8);
+    CHECK(nvs_storage_write(0x0201,calibration,1500)==1500);
+    unsigned erase_before=erased,writes_before=nvs_writes;
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
     CHECK(erased==erase_before&&nvs_writes==writes_before);
-    /* Enough final live-data space, but no room to replace the largest
-     * journal. Reject before marker, erase or calibration changes. */
-    reset_nv();reset_ram();CHECK(!init_service());
-    CHECK(nvs_storage_write(0x0201,calibration,1200)==1200);
-    erase_before=erased;writes_before=nvs_writes;
-    CHECK(nvs_storage_get_free_space()>24+248+312);
-    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
-    CHECK(erased==erase_before&&nvs_writes==writes_before);
-    CHECK(nvs_storage_read(MAINTENANCE_KEY,&first,1)==-ENOENT);
-    CHECK(nvs_storage_read(0x0201,readback,sizeof(readback))==sizeof(readback)&&
-          !memcmp(readback,calibration,sizeof(readback)));
-    /* Migration must likewise fail closed when old OTA1 data cannot coexist
-     * with OTA2; successful replacement must not be assumed by preflight. */
-    reset_nv();reset_ram();CHECK(!init_service());
-    CHECK(nvs_storage_write(0x0201,calibration,800)==800);
-    CHECK(!save_marker(MAINTENANCE_KEY,false));CHECK(!save_journal(&m,OTA_SUCCEEDED,77));
-    legacy.state=OTA_SUCCEEDED;CHECK(!store(FLEET_KEY,legacy));
-    erase_before=erased;writes_before=nvs_writes;
-    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL&&erased==erase_before&&nvs_writes==writes_before);
-    CHECK(nvs_storage_read(FLEET_KEY,&first,1)==sizeof(legacy));
-    CHECK(nvs_storage_read(0x0201,readback,800)==800&&!memcmp(readback,calibration,800));
+    CHECK(nvs_storage_read(0x0201,readback,1500)==1500&&!memcmp(readback,calibration,1500));
+    /* Legacy bytes remain untouched for explicit recovery, never a v2 campaign. */
+    reset_nv();reset_ram();uint8_t old[240]={};write32(old,JOURNAL_MAGIC);
+    CHECK(nvs_storage_write(JOURNAL_KEY,old,sizeof(old))==sizeof(old));
+    CHECK(ota_storage_init()==OTA_ERR_JOURNAL&&ota_storage_recovery_required());
+    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE&&erased==erase_before);
+    CHECK(ota_storage_release_maintenance(m.mcuboot_image_hash)==OTA_ERR_STATE);
+    CHECK(nvs_storage_read(JOURNAL_KEY,readback,sizeof(readback))==sizeof(old)&&!memcmp(old,readback,sizeof(old)));
     return 0;
 }
 extern "C" int ota_storage_test_run()
 {
     reset_nv(); reset_ram(); ota_manifest m=artifact();
     const uint8_t calibration[4]={1,2,3,4}; CHECK(nvs_storage_write(0x0201,calibration,4)==4);
-    CHECK(!init_service() && inhibited); /* health has not released RAM gate */
-    bool lead=true; CHECK(!ota_storage_load_role(&lead) && !lead); CHECK(!ota_storage_persist_role(true));
+    CHECK(!init_service() && inhibited);
+    bool lead=true; CHECK(!ota_storage_load_role(&lead) && !lead);
+    ota_identity identity={};ota_storage_boot_identity(&identity);
+    CHECK(identity.protocol_version==2&&identity.image_class==OTA_IMAGE_RECEIVER);
     confirmed=false; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased); confirmed=true;
     swap=BOOT_SWAP_TYPE_TEST; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased);
     swap=BOOT_SWAP_TYPE_REVERT; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased); swap=BOOT_SWAP_TYPE_NONE;
-    CHECK(!ota_storage_stage_begin(&m) && erased==1 && inhibited);
+    ota_manifest bad=m;bad.image_size=1024;
+    CHECK(ota_storage_stage_begin(&bad)==OTA_ERR_CAPACITY&&!erased);
+    bad=m;bad.image_class=OTA_IMAGE_LEAD;
+    CHECK(ota_storage_stage_begin(&bad)==OTA_ERR_COMPATIBILITY&&!erased);
+    bad=m;bad.protocol_version=1;
+    CHECK(ota_storage_stage_begin(&bad)==OTA_ERR_COMPATIBILITY&&!erased);
+    flash[1][1008]=0x77;
+    CHECK(!ota_storage_stage_begin(&m) && erased==1 && inhibited&&flash[1][1008]==0xff);
     CHECK(!ota_storage_stage_begin(&m) && erased==1);
-    CHECK(ota_storage_persist_role(false)==OTA_ERR_STATE);
-    CHECK(!ota_storage_stage_append(0,expected_artifact,256));
-    CHECK(!ota_storage_stage_append(0,expected_artifact,256)); /* buffered retry */
-    uint8_t bad[256];memcpy(bad,expected_artifact,256);bad[0]^=1;
-    CHECK(ota_storage_stage_append(0,bad,256)==OTA_ERR_CONFLICT);
-    CHECK(!ota_storage_stage_append(256,expected_artifact+256,256));
-    CHECK(!ota_storage_stage_append(0,expected_artifact,256)); /* committed retry */
-    CHECK(ota_storage_stage_append(0,bad,256)==OTA_ERR_CONFLICT);
+    CHECK(!ota_storage_stage_append(0,expected_artifact,100));
+    CHECK(!ota_storage_stage_append(0,expected_artifact,100));
+    uint8_t wrong[100];memcpy(wrong,expected_artifact,100);wrong[0]^=1;
+    CHECK(ota_storage_stage_append(0,wrong,100)==OTA_ERR_CONFLICT);
     CHECK(ota_storage_stage_end(&m)==OTA_ERR_INCOMPLETE && !flushed_count);
-    CHECK(!ota_storage_stage_append(512,expected_artifact+512,256));
-    CHECK(!ota_storage_stage_append(768,expected_artifact+768,256));
+    CHECK(!ota_storage_stage_append(100,expected_artifact+100,100));
+    CHECK(ota_storage_stage_append(200,expected_artifact,1)==OTA_ERR_OFFSET);
     CHECK(!ota_storage_stage_end(&m) && flushed_count==1 && checked==1);
     CHECK(!ota_storage_stage_end(&m) && flushed_count==1 && checked==1);
-    uint8_t readback[1024];CHECK(!ota_storage_read(0,readback,1024) && !memcmp(readback,expected_artifact,1024));
-    /* Active image already equals target, but stage still erased and wrote all bytes. */
-    CHECK(!memcmp(flash[0],flash[1],1024) && erased==1);
-    swap=BOOT_SWAP_TYPE_TEST; ota_participant_hooks hooks;ota_storage_hooks(&hooks);
-    CHECK(!hooks.prepare(nullptr,&m,true) && ota_storage_owner()==OTA_SLOT_LEAD && erased==1);
-    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE);
-    CHECK(!hooks.validate(nullptr,&m));
-    uint32_t timestamps[12]={100,200};uint8_t order[12]={1,2};
-    ota_storage_set_events(3,timestamps,order);
-    CHECK(!hooks.journal(nullptr,&m,OTA_REBOOTING,77));
-    CHECK(!hooks.schedule_reboot(nullptr,77,1000));CHECK(!hooks.schedule_reboot(nullptr,77,2000)&&scheduled==1);
-    CHECK(hooks.schedule_reboot(nullptr,78,1000)==OTA_ERR_CONFLICT);
-    ota_target targets[OTA_MAX_TARGETS]={}; targets[0].is_lead=true;
-    for (size_t i=0;i<OTA_MAX_TARGETS;++i) targets[i].identity.eui[7]=(uint8_t)(i+1);
-    CHECK(!ota_storage_persist_campaign(&m,targets,OTA_MAX_TARGETS,77,OTA_REBOOTING));
-    CHECK(sizeof(fleet_record)==304); ota_manifest loaded;size_t count=OTA_MAX_TARGETS;uint32_t commit;
-    CHECK(!ota_storage_load_campaign(&loaded,targets,&count,&commit)&&count==OTA_MAX_TARGETS&&commit==77);
-    CHECK(equal_manifest(loaded,m) && targets[0].is_lead && !targets[1].is_lead);
-    for(size_t i=0;i<count;++i) CHECK(targets[i].identity.eui[7]==i+1 && !targets[i].identity.address);
-    uint8_t existing[4];CHECK(nvs_storage_read(0x0201,existing,4)==4&&!memcmp(existing,calibration,4));
-    reset_ram();CHECK(!init_service()&&ota_storage_recovery_required()&&inhibited);
+    CHECK(!armed && swap==BOOT_SWAP_TYPE_NONE && flash[1][1008]==0xff);
+    CHECK(programmed_end==512&&programmed_end<=CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE);
+    for(size_t i=200;i<1024;++i) CHECK(flash[1][i]==0xff);
+    ota_participant_hooks hooks;ota_storage_hooks(&hooks);
+    CHECK(hooks.prepare(nullptr,&m,true)==OTA_ERR_COMPATIBILITY);
+    CHECK(hooks.arm(nullptr,&m,77)==OTA_ERR_STATE&&!armed);
+    reset_ram(); CHECK(!init_service()&&ota_storage_recovery_required()&&!writer_open&&!armed);
     ota_storage_journal restored;CHECK(!ota_storage_get_journal(&restored));
-    CHECK(restored.campaign_id==m.campaign_id&&restored.image_size==m.image_size&&restored.event_mask==3);
-    CHECK(restored.event_ms[1]==200&&restored.event_order[1]==2&&!memcmp(restored.version,m.version,32));
-    CHECK(!memcmp(restored.build_id,m.build_id,32));
+    CHECK(restored.format_version==2&&restored.state==OTA_VALID&&restored.image_size==200&&!restored.event_mask);
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE);
-    CHECK(ota_storage_release_maintenance(m.mcuboot_image_hash)==OTA_ERR_STATE);swap=BOOT_SWAP_TYPE_NONE;
-    uint8_t hash[32];CHECK(!ota_storage_active_hash(hash)&&!memcmp(hash,m.mcuboot_image_hash,32));
-    CHECK(!ota_storage_release_maintenance(hash)&&!ota_storage_maintenance()&&!inhibited);
-    CHECK(!ota_storage_get_journal(&restored)&&restored.state==OTA_SUCCEEDED&&restored.campaign_id==m.campaign_id);
-    CHECK(!ota_storage_load_role(&lead)&&lead);
-    ++m.campaign_id;CHECK(!upload(m)&&erased==2);ota_storage_abort();CHECK(ota_storage_recovery_required());
-
-    /* Power-safe preconditions precede erase, and journal failure fails closed. */
+    uint8_t hash[32];CHECK(!ota_storage_active_hash(hash));
+    CHECK(!ota_storage_release_maintenance(hash));
+    CHECK(!ota_storage_maintenance()&&!inhibited);
+    ++m.campaign_id;CHECK(!hooks.prepare(nullptr,&m,false));
+    CHECK(!hooks.append(nullptr,0,expected_artifact,200));CHECK(!hooks.flush(nullptr));
+    CHECK(!hooks.validate(nullptr,&m));CHECK(!hooks.journal(nullptr,&m,OTA_VALID,0));
+    CHECK(!armed&&flash[1][1008]==0xff);
+    CHECK(!hooks.journal(nullptr,&m,OTA_COMMIT_INTENT,77));
+    flash[1][1008]=0x33;unsigned erase_before_arm=erased;
+    CHECK(hooks.arm(nullptr,&m,77)==OTA_ERR_STORAGE&&!armed&&erased==erase_before_arm);
+    flash[1][1008]=0xff;
+    CHECK(!hooks.arm(nullptr,&m,77)&&armed==1&&swap==BOOT_SWAP_TYPE_TEST);
+    CHECK(!hooks.journal(nullptr,&m,OTA_COMMITTED,77));
+    ota_storage_abort();CHECK(!ota_storage_get_journal(&restored)&&restored.state==OTA_COMMITTED);
+    reset_ram();CHECK(!init_service()&&ota_storage_recovery_required()&&inhibited);
+    CHECK(!ota_storage_get_journal(&restored)&&restored.commit_id==77&&restored.state==OTA_COMMITTED);
+    CHECK(ota_storage_release_maintenance(hash)==OTA_ERR_STATE);swap=BOOT_SWAP_TYPE_NONE;
+    CHECK(!ota_storage_release_maintenance(hash));
+    uint8_t existing[4];CHECK(nvs_storage_read(0x0201,existing,4)==4&&!memcmp(existing,calibration,4));
     reset_nv();reset_ram();CHECK(!init_service());
     unsigned erase_before=erased;nvs_fail=true;CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL);
     CHECK(erased==erase_before&&inhibited&&ota_storage_recovery_required());nvs_fail=false;
-    reset_nv();reset_ram();CHECK(!init_service());
-    CHECK(!ota_storage_stage_begin(&m));write_fail=true;
-    CHECK(ota_storage_stage_append(0,expected_artifact,256)==OTA_ERR_STORAGE&&ota_storage_recovery_required());write_fail=false;
+    reset_nv();reset_ram();CHECK(!init_service());CHECK(!ota_storage_stage_begin(&m));write_fail=true;
+    CHECK(ota_storage_stage_append(0,expected_artifact,200)==OTA_ERR_STORAGE&&ota_storage_recovery_required());write_fail=false;
     reset_nv();reset_ram();CHECK(!init_service());hash_fail=true;
     CHECK(upload(m)==OTA_ERR_IMAGE&&ota_storage_recovery_required());hash_fail=false;
-    reset_nv();reset_ram();CHECK(!init_service());expected_artifact[1008]^=1;
-    CHECK(upload(m)==OTA_ERR_FORMAT&&ota_storage_recovery_required());expected_artifact[1008]^=1;
+    reset_nv();reset_ram();CHECK(!init_service());CHECK(!ota_storage_stage_begin(&m));
+    CHECK(!ota_storage_stage_append(0,expected_artifact,200));flash[1][1008]=0x77;
+    CHECK(ota_storage_stage_end(&m)==OTA_ERR_IMAGE&&ota_storage_recovery_required());
     reset_nv();reset_ram();CHECK(!init_service());m.mcuboot_image_hash[0]^=1;
     CHECK(upload(m)==OTA_ERR_IMAGE&&ota_storage_recovery_required());m.mcuboot_image_hash[0]^=1;
-    reset_nv();reset_ram();CHECK(!init_service());
-    uint8_t metadata[1400]={};
-    CHECK(nvs_storage_write(0x0301,metadata,sizeof(metadata))==sizeof(metadata));erase_before=erased;
-    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_JOURNAL&&erased==erase_before);
+    reset_nv();reset_ram();CHECK(!init_service());expected_artifact[148]=0xa1;
+    CHECK(upload(m)==OTA_ERR_COMPATIBILITY&&ota_storage_recovery_required());expected_artifact[148]=0xa0;
+    reset_nv();reset_ram();CHECK(!init_service());expected_artifact[152]='x';
+    CHECK(upload(m)==OTA_ERR_COMPATIBILITY&&ota_storage_recovery_required());expected_artifact[152]='r';
+    reset_nv();reset_ram();CHECK(!init_service());m=artifact();
+    expected_artifact[10]=28;expected_artifact[12]=100;
+    expected_artifact[132]=0x08;expected_artifact[133]=0x69;expected_artifact[134]=28;expected_artifact[135]=0;
+    expected_artifact[136]=0xa0;expected_artifact[137]=0;expected_artifact[138]=8;expected_artifact[139]=0;
+    memcpy(expected_artifact+140,"receiver",8); /* Second class TLV remains at148. */
+    CHECK(upload(m)==OTA_ERR_FORMAT&&ota_storage_recovery_required());m=artifact();
     return journal_gc_regressions();
+}
+extern "C" int ota_storage_gate_test_run()
+{
+    reset_nv(); reset_ram(); ota_manifest m=artifact(); CHECK(!init_service());
+    unsigned erase_before=erased, writes_before=nvs_writes;
+    CHECK(ota_storage_stage_begin(&m)==OTA_ERR_COMPATIBILITY);
+    ota_participant_hooks hooks;ota_storage_hooks(&hooks);
+    CHECK(hooks.prepare(nullptr,&m,false)==OTA_ERR_COMPATIBILITY);
+    CHECK(hooks.arm(nullptr,&m,77)==OTA_ERR_STATE);
+    CHECK(erased==erase_before&&nvs_writes==writes_before&&!armed&&!writer_open);
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    ota_target target{};target.identity.eui[7]=2;
+    CHECK(!ota_storage_persist_campaign(&m,&target,1,77,OTA_PREPARING));
+    reset_ram();CHECK(!init_service());
+    fleet_record corrupt{};CHECK(!load(FLEET_KEY,corrupt,FLEET_MAGIC));
+    corrupt.manifest[157]=0;CHECK(!store(FLEET_KEY,corrupt));
+    reset_ram();CHECK(ota_storage_init()==OTA_ERR_JOURNAL);
+#endif
+    return 0;
 }
 #ifndef OWNTECH_FREESTANDING_TEST
 #include <stdio.h>

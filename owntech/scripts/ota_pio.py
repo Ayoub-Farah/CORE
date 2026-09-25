@@ -2,7 +2,19 @@
 import json
 from pathlib import Path
 import platform
+import subprocess
+import shlex
 import sys
+
+
+def signing_python(build):
+    """Reuse the interpreter selected by the existing Zephyr signing builder."""
+    for line in (Path(build) / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        if line.startswith("PYTHON_EXECUTABLE:FILEPATH="):
+            executable = Path(line.split("=", 1)[1])
+            if executable.is_file():
+                return str(executable)
+    raise ValueError("Zephyr signing Python is missing from its configured CMake cache")
 
 def artifact_options(env):
     """Resolve existing signing provenance identically for builds and campaigns."""
@@ -43,28 +55,55 @@ def artifact_options(env):
 
 
 def artifact_post_action(source, target, env):
-    """Fail the ordinary build if its exact signed artifact cannot be staged."""
+    """Validate USB bytes and sign a distinct compact artifact from the raw binary."""
     try:
         profile, _, version, build_id = artifact_options(env)
-        from ota_artifact import inspect_image
+        from ota_artifact import inspect_image, inspect_usb_image
         image = Path(env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin"))
         artifact = image.read_bytes()
-        manifest = inspect_image(artifact, profile, version, build_id)
+        image_class = env.get("OWNTECH_OTA_IMAGE_CLASS", "receiver")
+        manifest = inspect_usb_image(artifact, profile, version, build_id, image_class,
+                                     require_class=env.subst("$PIOENV") in ("OTA", "USB_LEAD"))
         manifest["filename"] = image.name
         content = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         image.with_suffix(".json").write_text(content, encoding="utf-8")
         environment = env.subst("$PIOENV")
         if not environment or "$" in environment or Path(environment).name != environment or environment in (".", ".."):
             raise ValueError("cannot resolve a safe PlatformIO environment for the OTA snapshot")
-        snapshots = Path(env.subst("$PROJECT_DIR")) / ".pio" / "ota-artifacts" / environment
+        snapshots = Path(env.subst("$PROJECT_DIR")) / "ota-artifacts" / environment
         snapshots.mkdir(parents=True, exist_ok=True)
         # Copy the bytes already inspected, never reread a concurrently changed
         # build output. This directory survives PlatformIO clean_build_dir().
         (snapshots / image.name).write_bytes(artifact)
         (snapshots / image.with_suffix(".json").name).write_text(content, encoding="utf-8")
+        if environment in ("OTA", "USB_LEAD"):
+            # Never truncate a padded file: use the same imgtool/key and raw
+            # application source, but deliberately omit --pad for CAN v2.
+            framework = Path(env.PioPlatform().get_package_dir("framework-zephyr"))
+            imgtool = framework / "_pio/bootloader/mcuboot/scripts/imgtool.py"
+            compact = Path(env.subst("$BUILD_DIR/${PROGNAME}.can.bin"))
+            raw = Path(env.subst("$BUILD_DIR/${PROGNAME}.bin"))
+            extra = shlex.split(env.BoardConfig().get("build.zephyr.bootloader.imgtool_extra_cmds", ""))
+            if not extra:
+                extra = ["--custom-tlv", "0xA0", image_class]
+            if any(arg in ("--pad", "--confirm") for arg in extra):
+                raise ValueError("compact signing forbids activation/padding options")
+            subprocess.run([signing_python(image.parent), str(imgtool), "sign", "--key", profile["signing_key"], *extra,
+                            "--header-size", str(profile["header_size"]), "--align", "8",
+                            "--version", version, "--slot-size", str(profile["slot_size"]),
+                            str(raw), str(compact)], check=True)
+            compact_data = compact.read_bytes()
+            compact_manifest = inspect_image(compact_data, profile, version, build_id, image_class)
+            if compact_manifest["mcuboot_image_hash"] != manifest["mcuboot_image_hash"]:
+                raise ValueError("USB and CAN artifacts do not describe the same application")
+            compact_manifest["filename"] = compact.name
+            compact_json = json.dumps(compact_manifest, indent=2, sort_keys=True) + "\n"
+            compact.with_suffix(".json").write_text(compact_json, encoding="utf-8")
+            (snapshots / compact.name).write_bytes(compact_data)
+            (snapshots / compact.with_suffix(".json").name).write_text(compact_json, encoding="utf-8")
         print("OTA artifact checked: %d useful / %d transmitted bytes" % (manifest["useful_size"], manifest["artifact_size"]))
         return 0
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         print("OTA artifact rejected: %s" % error)
         return 1
 
@@ -95,6 +134,7 @@ def provision_action(source, target, env, legacy_console=False):
     _, profile_path, version, build_id = artifact_options(env)
     args = ["--image", env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin"),
             "--profile", str(profile_path), "--version", version, "--build-id", build_id,
+            "--image-class", env.get("OWNTECH_OTA_IMAGE_CLASS", "receiver"),
             "--mcumgr", mcumgr_path(env)] + connection_options(env)
     timeout = env.GetProjectOption("custom_ota_timeout", "")
     if timeout:

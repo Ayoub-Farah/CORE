@@ -23,37 +23,31 @@ extern "C" void ota_safety_restore(bool);
 
 namespace {
 constexpr uint16_t ROLE_KEY = 0x0500, MAINTENANCE_KEY = 0x0501, JOURNAL_KEY = 0x0502, FLEET_KEY = 0x0503;
-constexpr uint32_t JOURNAL_MAGIC = 0x3141544f; /* OTA1 */
-constexpr uint32_t FLEET_MAGIC = 0x3241544f; /* OTA2: fixed-width compact fleet */
+constexpr uint32_t JOURNAL_MAGIC = 0x3141544f; /* OTA1 maintenance/role markers remain compatible. */
+constexpr uint32_t LOCAL_MAGIC = 0x324c544f; /* OTL2: fixed-width compact local journal. */
+constexpr uint32_t FLEET_MAGIC = 0x3341544f; /* OTA3: protocol v2, receiver targets only. */
 struct marker { uint32_t magic; uint32_t value; uint32_t crc; };
-struct local_record { uint32_t magic; ota_storage_journal journal; uint32_t crc; };
-/* Preserve the deployed OTA1 layout for recovery. New records only retain
- * stable EUIs; addresses and availability must be rediscovered after reboot. */
-struct legacy_fleet_record {
+struct local_record {
     uint32_t magic;
-    uint32_t length;
-    ota_manifest manifest;
-    ota_target targets[OTA_MAX_TARGETS];
-    uint32_t commit_id;
-    uint32_t count;
-    enum ota_state state;
+    uint16_t version, length;
+    uint8_t payload[156];
     uint32_t crc;
 };
 struct fleet_record {
     uint32_t magic;
     uint32_t length;
-    uint8_t manifest[157];
+    uint8_t manifest[158];
     uint8_t eui[OTA_MAX_TARGETS][8];
     uint8_t count;
-    uint8_t lead_index;
+    uint8_t reserved;
     uint8_t state;
     uint32_t commit_id;
     uint32_t crc;
 };
-static_assert(sizeof(legacy_fleet_record) == 824 && offsetof(legacy_fleet_record, crc) == 820,
-              "OTA1 fleet recovery requires its deployed layout");
-static_assert(sizeof(fleet_record) == 304 && offsetof(fleet_record, crc) == 300,
-              "OTA2 fleet is a fixed-width record without padding");
+static_assert(sizeof(local_record) == 168 && offsetof(local_record, crc) == 164,
+              "Local journal must not depend on ARM enum/alignment flags");
+static_assert(sizeof(fleet_record) == 308 && offsetof(fleet_record, crc) == 304,
+              "Fleet journal must not depend on ARM enum/alignment flags");
 K_MUTEX_DEFINE(slot_mutex);
 struct lock {
     lock() { k_mutex_lock(&slot_mutex, K_FOREVER); }
@@ -63,7 +57,7 @@ flash_img_context writer;
 ota_manifest current_manifest;
 ota_storage_journal current_journal;
 ota_slot_owner owner = OTA_SLOT_NONE;
-bool initialized, recovery, maintenance, writer_open, flushed, staged, reboot_queued;
+bool initialized, recovery, maintenance, writer_open, flushed, staged, reboot_queued, journal_corrupt;
 uint32_t accepted, reboot_commit;
 uint8_t expected_lead_eui[8];
 uint32_t event_mask, event_ms[12];
@@ -73,7 +67,7 @@ int terminal_error;
 uint16_t read16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
 void write32(uint8_t *p, uint32_t value)
 { for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(value >> (8 * i)); }
-void encode_manifest(uint8_t out[157], const ota_manifest &m)
+void encode_manifest(uint8_t out[158], const ota_manifest &m)
 {
     write32(out, (uint32_t)m.campaign_id); write32(out + 4, (uint32_t)(m.campaign_id >> 32));
     write32(out + 8, m.image_size); write32(out + 12, m.image_content_size);
@@ -81,8 +75,9 @@ void encode_manifest(uint8_t out[157], const ota_manifest &m)
     out[28] = m.protocol_version;
     memcpy(out + 29, m.artifact_sha256, 32); memcpy(out + 61, m.mcuboot_image_hash, 32);
     memcpy(out + 93, m.version, 32); memcpy(out + 125, m.build_id, 32);
+    out[157] = m.image_class;
 }
-void decode_manifest(ota_manifest &m, const uint8_t in[157])
+void decode_manifest(ota_manifest &m, const uint8_t in[158])
 {
     m = {};
     m.campaign_id = (uint64_t)ota_read_le32(in) | ((uint64_t)ota_read_le32(in + 4) << 32);
@@ -91,11 +86,28 @@ void decode_manifest(ota_manifest &m, const uint8_t in[157])
     m.bootloader_id = ota_read_le32(in + 24); m.protocol_version = in[28];
     memcpy(m.artifact_sha256, in + 29, 32); memcpy(m.mcuboot_image_hash, in + 61, 32);
     memcpy(m.version, in + 93, 32); memcpy(m.build_id, in + 125, 32);
+    m.image_class = in[157];
+}
+bool valid_fleet(const fleet_record &record)
+{
+    if (record.length != sizeof(record) || !record.count || record.count > OTA_MAX_TARGETS ||
+        !record.commit_id || record.reserved || record.state > OTA_SUCCEEDED) return false;
+    ota_manifest m; decode_manifest(m, record.manifest);
+    if (m.protocol_version != OTA_PROTOCOL_VERSION || m.image_class != OTA_IMAGE_RECEIVER ||
+        !m.campaign_id || !m.image_size || m.image_size != m.image_content_size ||
+        m.image_size > CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE) return false;
+    for (size_t i = 0; i < record.count; ++i) {
+        uint8_t nonzero = 0; for (size_t k = 0; k < 8; ++k) nonzero |= record.eui[i][k];
+        if (!nonzero) return false;
+        for (size_t j = 0; j < i; ++j) if (!memcmp(record.eui[i], record.eui[j], 8)) return false;
+    }
+    return true;
 }
 bool equal_manifest(const ota_manifest &a, const ota_manifest &b)
 {
     return a.campaign_id == b.campaign_id && a.image_size == b.image_size &&
         a.image_content_size == b.image_content_size && a.protocol_version == b.protocol_version &&
+        a.image_class == b.image_class &&
         a.hardware_id == b.hardware_id && a.layout_id == b.layout_id && a.bootloader_id == b.bootloader_id &&
         !memcmp(a.artifact_sha256, b.artifact_sha256, 32) && !memcmp(a.mcuboot_image_hash, b.mcuboot_image_hash, 32) &&
         !memcmp(a.version, b.version, sizeof(a.version)) && !memcmp(a.build_id, b.build_id, sizeof(a.build_id));
@@ -119,22 +131,48 @@ template<typename T> int load(uint16_t key, T &record, uint32_t magic = JOURNAL_
 }
 int save_marker(uint16_t key, bool value)
 { marker m = {JOURNAL_MAGIC, value ? 1U : 0U, 0}; return store(key, m); }
+void encode_local(local_record &record, const ota_storage_journal &j)
+{
+    record = {}; record.magic = LOCAL_MAGIC; record.version = 2; record.length = sizeof(record);
+    uint8_t *p = record.payload;
+    write32(p, (uint32_t)j.campaign_id); write32(p + 4, (uint32_t)(j.campaign_id >> 32));
+    write32(p + 8, j.commit_id); write32(p + 12, j.image_size);
+    p[16] = (uint8_t)j.state; p[17] = j.protocol_version; p[18] = j.image_class;
+    memcpy(p + 20, j.lead_eui, 8); memcpy(p + 28, j.artifact_sha256, 32);
+    memcpy(p + 60, j.mcuboot_image_hash, 32);
+    memcpy(p + 92, j.version, 32); memcpy(p + 124, j.build_id, 32);
+}
+int decode_local(const local_record &record, ota_storage_journal &j)
+{
+    const uint8_t *p = record.payload;
+    if (record.version != 2 || record.length != sizeof(record) || p[16] > OTA_COMMIT_INTENT ||
+        p[17] != OTA_PROTOCOL_VERSION || p[18] != OTA_IMAGE_RECEIVER || p[19]) return OTA_ERR_JOURNAL;
+    j = {}; j.format_version = record.version;
+    j.campaign_id = (uint64_t)ota_read_le32(p) | ((uint64_t)ota_read_le32(p + 4) << 32);
+    j.commit_id = ota_read_le32(p + 8); j.image_size = ota_read_le32(p + 12);
+    j.state = (ota_state)p[16]; j.protocol_version = p[17]; j.image_class = p[18];
+    memcpy(j.lead_eui, p + 20, 8); memcpy(j.artifact_sha256, p + 28, 32);
+    memcpy(j.mcuboot_image_hash, p + 60, 32);
+    memcpy(j.version, p + 92, 32); memcpy(j.build_id, p + 124, 32);
+    uint8_t nonzero = 0; for (size_t i = 0; i < 8; ++i) nonzero |= j.lead_eui[i];
+    return j.campaign_id && j.image_size && j.image_size <= CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE &&
+        nonzero ? OTA_OK : OTA_ERR_JOURNAL;
+}
 int save_journal(const ota_manifest *m, ota_state state, uint32_t commit)
 {
-    local_record record = {};
-    record.magic = JOURNAL_MAGIC; record.journal.campaign_id = m->campaign_id;
-    record.journal.commit_id = commit; record.journal.state = state;
-    record.journal.image_size = m->image_size;
-    memcpy(record.journal.lead_eui, expected_lead_eui, 8);
-    memcpy(record.journal.artifact_sha256, m->artifact_sha256, 32);
-    memcpy(record.journal.mcuboot_image_hash, m->mcuboot_image_hash, 32);
-    memcpy(record.journal.version, m->version, OTA_IDENTITY_TEXT_SIZE);
-    memcpy(record.journal.build_id, m->build_id, OTA_IDENTITY_TEXT_SIZE);
-    record.journal.event_mask = event_mask;
-    memcpy(record.journal.event_ms, event_ms, sizeof(event_ms));
-    memcpy(record.journal.event_order, event_order, sizeof(event_order));
+    ota_storage_journal next = {};
+    next.format_version = 2; next.protocol_version = m->protocol_version; next.image_class = m->image_class;
+    next.campaign_id = m->campaign_id; next.commit_id = commit; next.state = state; next.image_size = m->image_size;
+    memcpy(next.lead_eui, expected_lead_eui, 8);
+    memcpy(next.artifact_sha256, m->artifact_sha256, 32);
+    memcpy(next.mcuboot_image_hash, m->mcuboot_image_hash, 32);
+    memcpy(next.version, m->version, OTA_IDENTITY_TEXT_SIZE);
+    memcpy(next.build_id, m->build_id, OTA_IDENTITY_TEXT_SIZE);
+    next.event_mask = event_mask; memcpy(next.event_ms, event_ms, sizeof(event_ms));
+    memcpy(next.event_order, event_order, sizeof(event_order));
+    local_record record; encode_local(record, next);
     int rc = store(JOURNAL_KEY, record);
-    if (!rc) current_journal = record.journal;
+    if (!rc) current_journal = next;
     return rc;
 }
 bool boot_available() { return boot_is_img_confirmed() && mcuboot_swap_type() == BOOT_SWAP_TYPE_NONE; }
@@ -151,8 +189,9 @@ int reserve_journal_space(ota_slot_owner desired)
     size_t needed = 8 + 16, overwrite = 0;
     const uint16_t keys[] = {MAINTENANCE_KEY, JOURNAL_KEY, FLEET_KEY};
     const size_t sizes[] = {sizeof(marker), sizeof(local_record), sizeof(fleet_record)};
-    unsigned count = desired == OTA_SLOT_USB ? 3 : 2;
-    for (unsigned i = 0; i < count; ++i) {
+    unsigned first = desired == OTA_SLOT_LEAD ? 2 : 0;
+    unsigned count = desired == OTA_SLOT_PARTICIPANT ? 2 : 3;
+    for (unsigned i = first; i < count; ++i) {
         uint8_t first;
         int old_size = nvs_storage_read(keys[i], &first, sizeof(first));
         if (old_size < 0 && old_size != -ENOENT) return OTA_ERR_JOURNAL;
@@ -178,7 +217,8 @@ int storage_failure(int rc)
 }
 /* Structural validation is deliberately separate from signature authority.
  * MCUboot checks the image signature with its installed key at boot. */
-int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, uint8_t hash[32])
+int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, uint8_t hash[32],
+               uint8_t expected_class = 0)
 {
     uint8_t header[32], info[4];
     if (bound < sizeof(header) || bound > area->fa_size || flash_area_read(area, 0, header, sizeof(header)))
@@ -188,6 +228,7 @@ int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, ui
     /* This prototype does not implement encrypted/compressed/RAM-load images. */
     if (hsize < 32 || hsize > bound || size > bound - hsize || ota_read_le32(header + 16)) return OTA_ERR_FORMAT;
     uint32_t pos = hsize + size;
+    bool class_found = false;
     if (protected_size) {
         if (protected_size < 4 || protected_size > bound - pos || flash_area_read(area, pos, info, 4) ||
             read16(info) != 0x6908 || read16(info + 2) != protected_size) return OTA_ERR_FORMAT;
@@ -195,10 +236,20 @@ int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, ui
         while (pos < end) {
             if (end - pos < 4 || flash_area_read(area, pos, info, 4)) return OTA_ERR_FORMAT;
             uint32_t len = read16(info + 2); pos += 4;
-            if (len > end - pos) return OTA_ERR_FORMAT;
+            if (len > end - pos || info[1]) return OTA_ERR_FORMAT;
+            if (info[0] == 0xa0) {
+                uint8_t value[8];
+                if (class_found || (len != 8 && len != 4) || flash_area_read(area, pos, value, len))
+                    return OTA_ERR_FORMAT;
+                uint8_t actual = len == 8 && !memcmp(value, "receiver", 8) ? OTA_IMAGE_RECEIVER :
+                    len == 4 && !memcmp(value, "lead", 4) ? OTA_IMAGE_LEAD : 0;
+                if (!actual || (expected_class && expected_class != actual)) return OTA_ERR_COMPATIBILITY;
+                class_found = true;
+            }
             pos += len;
         }
     }
+    if (expected_class && !class_found) return OTA_ERR_COMPATIBILITY;
     if (bound - pos < 4 || flash_area_read(area, pos, info, 4) || read16(info) != 0x6907) return OTA_ERR_FORMAT;
     uint32_t total = read16(info + 2);
     if (total < 4 || total > bound - pos) return OTA_ERR_FORMAT;
@@ -207,6 +258,7 @@ int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, ui
         if (end - pos < 4 || flash_area_read(area, pos, info, 4)) return OTA_ERR_FORMAT;
         uint32_t len = read16(info + 2); pos += 4;
         if (len > end - pos || info[1]) return OTA_ERR_FORMAT;
+        if (info[0] == 0xa0) return OTA_ERR_FORMAT; /* Class must be covered by the signature. */
         if (info[0] == 0x10) {
             if (len != 32 || found || flash_area_read(area, pos, hash, 32)) return OTA_ERR_FORMAT;
             found = true;
@@ -217,6 +269,17 @@ int image_info(const flash_area *area, uint32_t bound, uint32_t *content_end, ui
     *content_end = end;
     return OTA_OK;
 }
+int erased_range(const flash_area *area, uint32_t offset)
+{
+    uint8_t block[128];
+    while (offset < area->fa_size) {
+        size_t n = area->fa_size - offset; if (n > sizeof(block)) n = sizeof(block);
+        if (flash_area_read(area, offset, block, n)) return OTA_ERR_STORAGE;
+        for (size_t i = 0; i < n; ++i) if (block[i] != 0xff) return OTA_ERR_IMAGE;
+        offset += n;
+    }
+    return OTA_OK;
+}
 int validate(const ota_manifest *m)
 {
     if (writer_open || !flushed || accepted != m->image_size) return OTA_ERR_INCOMPLETE;
@@ -225,34 +288,36 @@ int validate(const ota_manifest *m)
     const flash_area *area;
     if (flash_area_open(OTA_SECONDARY, &area)) return OTA_ERR_STORAGE;
     uint8_t hash[32]; uint32_t content = 0;
-    int rc = image_info(area, m->image_content_size, &content, hash);
+    int rc = image_info(area, m->image_content_size, &content, hash, m->image_class);
     if (!rc && (content != m->image_content_size || content > CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE ||
                 memcmp(hash, m->mcuboot_image_hash, 32))) rc = OTA_ERR_IMAGE;
-    static const uint8_t magic[16] = {0x77,0xc2,0x95,0xf3,0x60,0xd2,0xef,0x7f,0x35,0x52,0x50,0x0f,0x2c,0xb6,0x79,0x80};
-    /* Existing imgtool --pad without --confirm: padding is FF followed by boot
-     * magic. Do not edit trailer or infer non-pending state from this check. */
-    if (!rc && (m->image_size != area->fa_size || m->image_size < content + sizeof(magic))) rc = OTA_ERR_FORMAT;
-    uint8_t block[128];
-    for (uint32_t pos = content; !rc && pos < m->image_size - sizeof(magic);) {
-        size_t n = m->image_size - sizeof(magic) - pos; if (n > sizeof(block)) n = sizeof(block);
-        if (flash_area_read(area, pos, block, n)) { rc = OTA_ERR_STORAGE; break; }
-        for (size_t i = 0; i < n; ++i) if (block[i] != 0xff) { rc = OTA_ERR_FORMAT; break; }
-        pos += n;
-    }
-    if (!rc && (flash_area_read(area, m->image_size - sizeof(magic), block, sizeof(magic)) ||
-                memcmp(block, magic, sizeof(magic)))) rc = OTA_ERR_FORMAT;
+    if (!rc && m->image_size != content) rc = OTA_ERR_FORMAT;
+    /* flash_img may pad its final write buffer, but the useful bound is below
+     * every trailer word. begin/append never program those erased ECC cells. */
+    if (!rc) rc = erased_range(area, m->image_size);
     flash_area_close(area);
     return rc;
 }
 int begin(const ota_manifest *m, ota_slot_owner desired)
 {
     if (!initialized || recovery || owner != OTA_SLOT_NONE || !m || !m->campaign_id) return OTA_ERR_STATE;
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    /* A dedicated Lead must never stage receiver firmware into a boot slot. */
+    return OTA_ERR_COMPATIBILITY;
+#endif
+#if !defined(CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED) || !CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED
+    /* Installed bootloader geometry/algorithm must be qualified explicitly. */
+    return OTA_ERR_COMPATIBILITY;
+#endif
     uint8_t lead_nonzero = 0; for (size_t i = 0; i < 8; ++i) lead_nonzero |= expected_lead_eui[i];
     if (!lead_nonzero) return OTA_ERR_IDENTITY;
     if (!m->image_content_size || m->image_content_size > CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE ||
-        m->image_content_size > m->image_size ||
-        m->image_size != FIXED_PARTITION_SIZE(slot1_partition)) return OTA_ERR_CAPACITY;
-    if (m->protocol_version != OTA_PROTOCOL_VERSION || m->hardware_id != CONFIG_OWNTECH_OTA_HARDWARE_ID ||
+        m->image_content_size != m->image_size ||
+        m->image_size > FIXED_PARTITION_SIZE(slot1_partition) ||
+        ((m->image_size + sizeof(writer.buf) - 1) / sizeof(writer.buf)) * sizeof(writer.buf) >
+            CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE) return OTA_ERR_CAPACITY;
+    if (m->image_class != OTA_IMAGE_RECEIVER || m->protocol_version != OTA_PROTOCOL_VERSION ||
+        m->hardware_id != CONFIG_OWNTECH_OTA_HARDWARE_ID ||
         m->layout_id != CONFIG_OWNTECH_OTA_LAYOUT_ID || m->bootloader_id != CONFIG_OWNTECH_OTA_BOOTLOADER_ID)
         return OTA_ERR_COMPATIBILITY;
     /* This check is inside the same mutex as ownership and the first erase. */
@@ -267,7 +332,9 @@ int begin(const ota_manifest *m, ota_slot_owner desired)
      * explicit, and flash_img only writes the exact sequential artifact. */
     const flash_area *area;
     if (flash_area_open(OTA_SECONDARY, &area)) return storage_failure(OTA_ERR_STORAGE);
-    int rc = flash_area_erase(area, 0, area->fa_size); flash_area_close(area);
+    int rc = flash_area_erase(area, 0, area->fa_size);
+    if (!rc) rc = erased_range(area, 0);
+    flash_area_close(area);
     if (rc || flash_img_init_id(&writer, OTA_SECONDARY)) return storage_failure(OTA_ERR_STORAGE);
     writer_open = true;
     return OTA_OK;
@@ -315,11 +382,7 @@ K_WORK_DELAYABLE_DEFINE(reboot_timer, reboot_work);
 int hook_prepare(void *, const ota_manifest *m, bool adopt)
 {
     lock guard;
-    if (adopt) {
-        if (owner != OTA_SLOT_USB || !staged || writer_open || !equal_manifest(current_manifest, *m))
-            return OTA_ERR_CONFLICT;
-        owner = OTA_SLOT_LEAD; return OTA_OK;
-    }
+    if (adopt) return OTA_ERR_COMPATIBILITY;
     return begin(m, OTA_SLOT_PARTICIPANT);
 }
 int hook_append(void *, uint32_t offset, const uint8_t *data, size_t n)
@@ -329,6 +392,25 @@ int hook_validate(void *, const ota_manifest *m)
 { lock guard; return equal_manifest(current_manifest, *m) ? validate(m) : OTA_ERR_CONFLICT; }
 int hook_journal(void *, const ota_manifest *m, ota_state state, uint32_t commit)
 { lock guard; return save_journal(m, state, commit); }
+int hook_arm(void *, const ota_manifest *m, uint32_t commit)
+{
+    lock guard;
+    if (owner != OTA_SLOT_PARTICIPANT || writer_open || !flushed || !maintenance ||
+        !ota_safety_inhibited() || !equal_manifest(current_manifest, *m) ||
+        current_journal.state != OTA_COMMIT_INTENT || !commit || current_journal.commit_id != commit ||
+        !boot_available()) return OTA_ERR_STATE;
+    /* Persisted intention precedes the first trailer write. boot_request_upgrade
+     * owns trailer geometry; a partial write remains maintenance/recovery. */
+    const flash_area *area;
+    if (flash_area_open(OTA_SECONDARY, &area)) return OTA_ERR_STORAGE;
+    int rc = erased_range(area, m->image_size); flash_area_close(area);
+    /* MCUboot's boot_set_next may erase a secondary with bad magic. Refuse a
+     * changed trailer here instead of invoking that destructive recovery path. */
+    if (rc) return OTA_ERR_STORAGE;
+    if (boot_request_upgrade(BOOT_UPGRADE_TEST) || mcuboot_swap_type() != BOOT_SWAP_TYPE_TEST)
+        return OTA_ERR_STORAGE;
+    return OTA_OK;
+}
 int hook_reboot(void *, uint32_t commit, uint32_t delay)
 {
     lock guard;
@@ -355,15 +437,34 @@ int ota_storage_init(void)
      * releases that RAM gate later, even when no persisted campaign exists. */
     if (maintenance) ota_safety_restore(true);
     local_record record = {};
-    int jr = load(JOURNAL_KEY, record);
+    int jr = load(JOURNAL_KEY, record, LOCAL_MAGIC);
     if (!jr) {
-        current_journal = record.journal; memcpy(expected_lead_eui, record.journal.lead_eui, 8);
-        event_mask = record.journal.event_mask; memcpy(event_ms, record.journal.event_ms, sizeof(event_ms));
-        memcpy(event_order, record.journal.event_order, sizeof(event_order));
+        jr = decode_local(record, current_journal);
+        if (!jr) {
+            memcpy(expected_lead_eui, current_journal.lead_eui, 8);
+            if (current_journal.state != OTA_SUCCEEDED) maintenance = recovery = true;
+        }
     }
-    if ((rc && rc != -ENOENT) || (jr && jr != -ENOENT)) {
-        maintenance = recovery = true; ota_safety_restore(true); return OTA_ERR_JOURNAL;
+    uint32_t fleet_header[2] = {};
+    int fleet_size = nvs_storage_read(FLEET_KEY, fleet_header, sizeof(fleet_header));
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    bool invalid_fleet = fleet_size >= 0 && fleet_header[0] != FLEET_MAGIC;
+    if (fleet_size >= 0 && !invalid_fleet) {
+        fleet_record fleet = {};
+        invalid_fleet = load(FLEET_KEY, fleet, FLEET_MAGIC) || !valid_fleet(fleet);
     }
+#else
+    /* A receiver never owns a fleet journal. Preserve a stale Lead/legacy
+     * record for explicit recovery, without allocating or decoding its roster. */
+    bool invalid_fleet = fleet_size >= 0;
+#endif
+    /* No implicit ABI migration: preserve all old/corrupt bytes for the
+     * explicit recovery utility. They can never identify a v2 campaign. */
+    if ((rc && rc != -ENOENT) || (jr && jr != -ENOENT) || invalid_fleet ||
+        (fleet_size < 0 && fleet_size != -ENOENT)) {
+        maintenance = recovery = journal_corrupt = true; ota_safety_restore(true); return OTA_ERR_JOURNAL;
+    }
+    if (maintenance) ota_safety_restore(true);
     return OTA_OK;
 }
 bool ota_storage_recovery_required(void) { lock guard; return recovery; }
@@ -404,12 +505,17 @@ void ota_storage_set_events(uint32_t mask, const uint32_t timestamps[12], const 
 void ota_storage_hooks(ota_participant_hooks *hooks)
 {
     *hooks = {nullptr, hook_prepare, hook_append, hook_flush, hook_validate,
-              hook_journal, hook_reboot, hook_close};
+              hook_journal, hook_reboot, hook_close, hook_arm};
 }
 void ota_storage_boot_identity(ota_identity *id)
 {
     lock guard;
     id->protocol_version = OTA_PROTOCOL_VERSION; id->usable_slot_size = FIXED_PARTITION_SIZE(slot1_partition);
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    id->image_class = OTA_IMAGE_LEAD;
+#else
+    id->image_class = OTA_IMAGE_RECEIVER;
+#endif
     id->usable_image_size = CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE;
     id->hardware_id = CONFIG_OWNTECH_OTA_HARDWARE_ID; id->layout_id = CONFIG_OWNTECH_OTA_LAYOUT_ID;
     id->bootloader_id = CONFIG_OWNTECH_OTA_BOOTLOADER_ID;
@@ -455,26 +561,30 @@ int ota_storage_read(uint32_t offset, uint8_t *data, size_t n)
 void ota_storage_abort(void)
 {
     lock guard; close_writer(); recovery = maintenance;
-    if (current_manifest.campaign_id) (void)save_journal(&current_manifest, OTA_ABORTED, current_journal.commit_id);
+    /* Preserve commit evidence if any trailer write may have happened. */
+    if (current_manifest.campaign_id && !current_journal.commit_id)
+        (void)save_journal(&current_manifest, OTA_ABORTED, 0);
 }
 int ota_storage_persist_campaign(const ota_manifest *m, const ota_target *targets,
                                 size_t count, uint32_t commit, ota_state state)
 {
     if (!m || !targets || !count || count > OTA_MAX_TARGETS || !commit) return OTA_ERR_ARGUMENT;
     lock guard;
+    if (m->protocol_version != OTA_PROTOCOL_VERSION || m->image_class != OTA_IMAGE_RECEIVER ||
+        !m->campaign_id || !m->image_size || m->image_size != m->image_content_size ||
+        m->image_size > CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE) return OTA_ERR_COMPATIBILITY;
+    if (reserve_journal_space(OTA_SLOT_LEAD)) return OTA_ERR_JOURNAL;
     fleet_record record = {}; record.magic = FLEET_MAGIC; record.length = sizeof(record);
     encode_manifest(record.manifest, *m);
-    unsigned leads = 0;
     for (size_t i = 0; i < count; ++i) {
+        if (targets[i].is_lead) return OTA_ERR_IDENTITY;
         uint8_t nonzero = 0;
         for (size_t k = 0; k < 8; ++k) nonzero |= targets[i].identity.eui[k];
         if (!nonzero) return OTA_ERR_IDENTITY;
         for (size_t j = 0; j < i; ++j)
             if (!memcmp(targets[i].identity.eui, record.eui[j], 8)) return OTA_ERR_IDENTITY;
         memcpy(record.eui[i], targets[i].identity.eui, 8);
-        if (targets[i].is_lead) { ++leads; record.lead_index = (uint8_t)i; }
     }
-    if (leads != 1) return OTA_ERR_IDENTITY;
     record.count = (uint8_t)count; record.commit_id = commit; record.state = (uint8_t)state;
     return store(FLEET_KEY, record);
 }
@@ -485,32 +595,15 @@ int ota_storage_load_campaign(ota_manifest *m, ota_target *targets, size_t *coun
     uint32_t header[2] = {};
     int rc = nvs_storage_read(FLEET_KEY, header, sizeof(header));
     if (rc < 0) return rc == -ENOENT ? rc : OTA_ERR_JOURNAL;
-    if (rc == static_cast<int>(sizeof(legacy_fleet_record)) && header[0] == JOURNAL_MAGIC) {
-        legacy_fleet_record record = {}; rc = load(FLEET_KEY, record);
-        if (rc) return rc;
-        if (record.length != sizeof(record) || !record.count || record.count > OTA_MAX_TARGETS ||
-            record.count > *count || !record.commit_id) return OTA_ERR_JOURNAL;
-        *m = record.manifest; *count = record.count; *commit = record.commit_id;
-        memcpy(targets, record.targets, record.count * sizeof(*targets)); return OTA_OK;
-    }
     if (rc != static_cast<int>(sizeof(fleet_record)) || header[0] != FLEET_MAGIC) return OTA_ERR_JOURNAL;
     fleet_record record = {}; rc = load(FLEET_KEY, record, FLEET_MAGIC);
     if (rc) return rc;
-    if (record.length != sizeof(record) || !record.count || record.count > OTA_MAX_TARGETS ||
-        record.count > *count || !record.commit_id || record.lead_index >= record.count ||
-        record.state > OTA_SUCCEEDED) return OTA_ERR_JOURNAL;
-    for (size_t i = 0; i < record.count; ++i) {
-        uint8_t nonzero = 0;
-        for (size_t k = 0; k < 8; ++k) nonzero |= record.eui[i][k];
-        if (!nonzero) return OTA_ERR_JOURNAL;
-        for (size_t j = 0; j < i; ++j)
-            if (!memcmp(record.eui[i], record.eui[j], 8)) return OTA_ERR_JOURNAL;
-    }
+    if (!valid_fleet(record) || record.count > *count) return OTA_ERR_JOURNAL;
     decode_manifest(*m, record.manifest); *count = record.count; *commit = record.commit_id;
     memset(targets, 0, record.count * sizeof(*targets));
     for (size_t i = 0; i < record.count; ++i) {
         memcpy(targets[i].identity.eui, record.eui[i], 8);
-        targets[i].is_lead = i == record.lead_index;
+        targets[i].identity.image_class = OTA_IMAGE_RECEIVER;
     }
     return OTA_OK;
 }
@@ -518,17 +611,15 @@ int ota_storage_release_maintenance(const uint8_t expected_hash[32])
 {
     lock guard;
     uint8_t active[32];
-    if (!expected_hash || writer_open || reboot_queued || !boot_available() ||
+    if (!expected_hash || journal_corrupt || writer_open || reboot_queued || !boot_available() ||
         ota_storage_active_hash(active) || memcmp(active, expected_hash, 32)) return OTA_ERR_STATE;
     /* Retain complete campaign provenance and result across a subsequent boot.
      * The independent inhibition marker is cleared only after this succeeds. */
-    local_record record = {}; record.magic = JOURNAL_MAGIC; record.journal = current_journal;
-    record.journal.state = OTA_SUCCEEDED; record.journal.event_mask = event_mask;
-    memcpy(record.journal.event_ms, event_ms, sizeof(event_ms));
-    memcpy(record.journal.event_order, event_order, sizeof(event_order));
-    if (store(JOURNAL_KEY, record)) return OTA_ERR_JOURNAL;
+    ota_storage_journal next = current_journal; next.state = OTA_SUCCEEDED;
+    local_record record; encode_local(record, next);
+    if (current_journal.campaign_id && store(JOURNAL_KEY, record)) return OTA_ERR_JOURNAL;
     if (save_marker(MAINTENANCE_KEY, false)) return OTA_ERR_JOURNAL;
-    current_journal = record.journal;
+    current_journal = next;
     maintenance = recovery = false; owner = OTA_SLOT_NONE; ota_safety_restore(false);
     return OTA_OK;
 }

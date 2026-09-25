@@ -1,6 +1,6 @@
 """PlatformIO wizard registration and process arguments, without board access."""
 import configparser
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import io
 import os
 from pathlib import Path
@@ -93,23 +93,102 @@ class PlatformIOGuiTests(unittest.TestCase):
             env = Environment(Path(directory), "OTA")
             with patch("ota_pio.platform.system", return_value="Windows"), \
                     patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
-                    patch("ota_gui_tasks.subprocess.run", return_value=SimpleNamespace(returncode=23)) as process:
+                    patch("ota_gui_tasks.subprocess.Popen", return_value=nullcontext(
+                        SimpleNamespace(stdout=iter(()), wait=lambda: 23))) as process, \
+                    redirect_stdout(io.StringIO()):
                 self.assertEqual(run_workflow(env, "to-ota"), 23)
-            process.assert_called_once_with(
-                [sys.executable, str(Path(directory) / "owntech/tools/ota_workflow.py"), "to-ota",
+            self.assertEqual(process.call_args.args, (
+                [sys.executable, "-u", str(Path(directory) / "owntech/tools/ota_workflow.py"), "to-ota",
                  "--project", directory, "--environment", "OTA", "--mcumgr", "C:/Tool folder/mcumgr.exe",
-                 "--pio-python", sys.executable], cwd=directory, check=False,
-                **({"creationflags": 0x08000000} if os.name == "nt" else {}))
+                 "--pio-python", sys.executable],))
+            options = process.call_args.kwargs
+            self.assertEqual(options["cwd"], directory)
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertEqual(options["stdout"], subprocess.PIPE)
+            self.assertEqual(options["stderr"], subprocess.STDOUT)
+            self.assertEqual(options["encoding"], "utf-8")
+            self.assertEqual(options["env"]["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(options["env"]["PYTHONUNBUFFERED"], "1")
+            if os.name == "nt":
+                self.assertEqual(options["creationflags"], 0x08000000)
             self.assertNotIn("--serial", process.call_args.args[0])
             self.assertNotIn("--expected-count", process.call_args.args[0])
 
     def test_process_start_error_fails_the_platformio_action(self):
-        env = Environment(ROOT, "USB")
-        with patch("ota_pio.platform.system", return_value="Windows"), \
-                patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
-                patch("ota_gui_tasks.subprocess.run", side_effect=OSError("start failed")), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(run_workflow(env, "status"), 1)
-        self.assertIn("start failed", output.getvalue())
+        with tempfile.TemporaryDirectory() as directory:
+            env = Environment(Path(directory), "USB")
+            with patch("ota_pio.platform.system", return_value="Windows"), \
+                    patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
+                    patch("ota_gui_tasks.subprocess.Popen", side_effect=OSError("start failed")), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(run_workflow(env, "status"), 1)
+            self.assertIn("start failed", output.getvalue())
+            logs = list((Path(directory) / "ota-artifacts/workflow-logs").glob("*.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertIn("start failed", logs[0].read_text(encoding="utf-8"))
+            self.assertIn(str(logs[0]), output.getvalue())
+
+    def test_real_hidden_child_output_and_errors_are_relayed_and_archived_as_utf8(self):
+        with tempfile.TemporaryDirectory(prefix="ota-console-relay-") as directory:
+            project = Path(directory)
+            script = project / "owntech/tools/ota_workflow.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("import sys\nprint('sortie: \\u00e9chec \\u03a9')\n"
+                              "print('erreur: \\u00e9tat \\u4e2d', file=sys.stderr)\nraise SystemExit(1)\n", encoding="utf-8")
+            env = Environment(project, "OTA")
+            for _ in range(2):
+                with patch("ota_gui_tasks.gui_python", return_value=sys.executable), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(run_workflow(env, "initialize"), 1)
+                text = output.getvalue()
+                self.assertIn("sortie: \u00e9chec \u03a9", text)
+                self.assertIn("erreur: \u00e9tat \u4e2d", text)
+                self.assertLess(text.index("OwnTech assistant log:"), text.index("sortie:"))
+                self.assertIn("exit code 1", text)
+            logs = list((project / "ota-artifacts/workflow-logs").glob("*.log"))
+            self.assertEqual(len(logs), 2)
+            for log in logs:
+                text = log.read_text(encoding="utf-8")
+                self.assertIn("sortie: \u00e9chec \u03a9", text)
+                self.assertIn("erreur: \u00e9tat \u4e2d", text)
+                self.assertIn("Process exit code: 1", text)
+
+    def test_silent_child_failure_still_reports_its_exit_code_and_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            env = Environment(project, "USB")
+            with patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
+                    patch("ota_gui_tasks.subprocess.Popen", return_value=nullcontext(
+                        SimpleNamespace(stdout=iter(()), wait=lambda: 9))), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(run_workflow(env, "status"), 9)
+            log, = (project / "ota-artifacts/workflow-logs").glob("*.log")
+            self.assertIn("exit code 9", output.getvalue())
+            self.assertIn(str(log), output.getvalue())
+            self.assertIn("Process exit code: 9", log.read_text(encoding="utf-8"))
+
+    def test_real_child_unicode_does_not_interrupt_ascii_or_cp1252_terminal_relay(self):
+        with tempfile.TemporaryDirectory(prefix="ota-console-encoding-") as directory:
+            project = Path(directory)
+            script = project / "owntech/tools/ota_workflow.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("import sys\nprint('d\u00e9tail \\u03a9 \\u4e2d')\n"
+                              "print('fin \\u03a9', file=sys.stderr)\nraise SystemExit(1)\n", encoding="utf-8")
+            env = Environment(project, "USB")
+            for encoding in ("ascii", "cp1252"):
+                with self.subTest(encoding=encoding):
+                    buffer = io.BytesIO()
+                    with io.TextIOWrapper(buffer, encoding=encoding, errors="strict") as terminal:
+                        with patch("ota_gui_tasks.gui_python", return_value=sys.executable), redirect_stdout(terminal):
+                            self.assertEqual(run_workflow(env, "status"), 1)
+                        terminal.flush()
+                        output = buffer.getvalue().decode(encoding)
+                    self.assertIn("\\u03a9", output)
+                    self.assertIn("\\u4e2d", output)
+                    self.assertIn("exit code 1", output)
+            logs = list((project / "ota-artifacts/workflow-logs").glob("*.log"))
+            self.assertEqual(len(logs), 2)
+            for log in logs:
+                contents = log.read_text(encoding="utf-8")
+                self.assertIn("d\u00e9tail \u03a9 \u4e2d", contents)
+                self.assertIn("fin \u03a9", contents)
 
     def test_gui_python_probes_dependencies_without_creating_a_tk_root(self):
         with patch("ota_gui_tasks.shutil.which", return_value=None), \

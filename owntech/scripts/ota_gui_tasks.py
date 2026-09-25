@@ -1,9 +1,11 @@
 """Pure PlatformIO-to-wizard bridge; importing it never opens a board or UI."""
 from pathlib import Path
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
 import sys
+import uuid
 
 
 GUI_ONLY_TARGETS = frozenset({
@@ -20,6 +22,19 @@ def isolate_gui_signatures(env, targets):
 
 def _hidden_process():
     return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def _console(message, *, end="\n"):
+    """Keep draining the child even when a terminal cannot encode its text."""
+    stream = sys.stdout
+    if stream is None:
+        return
+    text = str(message) + end
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    stream.write(text)
+    stream.flush()
 
 
 def gui_python():
@@ -67,17 +82,51 @@ def run_workflow(env, action):
     project = Path(env.subst("$PROJECT_DIR"))
     executable = gui_python()
     if not executable:
-        print("The OwnTech board assistant needs an installed desktop Python with Tcl/Tk "
-              "and pyserial. Enable Tcl/Tk in the Python installer and add pyserial to that "
-              "interpreter, then run this PlatformIO action again. No board action was sent.")
+        _console("The OwnTech board assistant needs an installed desktop Python with Tcl/Tk "
+                 "and pyserial. Enable Tcl/Tk in the Python installer and add pyserial to that "
+                 "interpreter, then run this PlatformIO action again. No board action was sent.")
         return 1
-    command = [executable, str(project / "owntech/tools/ota_workflow.py"), action,
+    command = [executable, "-u", str(project / "owntech/tools/ota_workflow.py"), action,
                "--project", str(project), "--environment", env.subst("$PIOENV"),
                "--mcumgr", mcumgr_path(env), "--pio-python", sys.executable]
+    directory = project / "ota-artifacts/workflow-logs"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / (stamp + "-" + uuid.uuid4().hex + ".log")
     try:
-        return subprocess.run(command, cwd=str(project), check=False, **_hidden_process()).returncode
+        directory.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8", newline="\n") as log:
+            log.write("OwnTech board assistant\nAction: %s\nEnvironment: %s\nPython: %s\n\n" %
+                      (action, env.subst("$PIOENV"), executable))
+            log.flush()
+            os.fsync(log.fileno())
+            _console("OwnTech assistant log: " + str(path))
+            child_env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+            try:
+                # CREATE_NO_WINDOW with implicit streams discards child output
+                # on Windows. Explicit pipes also keep nested build/provision
+                # failures visible in PlatformIO without opening a console.
+                with subprocess.Popen(command, cwd=str(project), env=child_env,
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                      errors="replace", bufsize=1, **_hidden_process()) as process:
+                    for line in process.stdout:
+                        log.write(line)
+                        log.flush()
+                        _console(line, end="")
+                    result = process.wait()
+            except OSError as error:
+                message = "Could not open the OwnTech board assistant: %s" % error
+                log.write(message + "\n")
+                _console(message)
+                result = 1
+            log.write("\nProcess exit code: %d\n" % result)
+            log.flush()
+            os.fsync(log.fileno())
+        if result:
+            _console("OwnTech assistant stopped (exit code %d). Details: %s" % (result, path))
+        return result
     except OSError as error:
-        print("Could not open the OwnTech board assistant: %s" % error)
+        _console("Could not save the OwnTech assistant log: %s" % error)
         return 1
 
 

@@ -134,6 +134,11 @@ operation folder when offered. If the assistant refuses a board or cannot
 verify a step, keep its report and resolve the reported problem before retrying.
 Do not repeatedly reset the board to force progress.
 
+If a task fails, read the specific error in the assistant window or the PlatformIO
+task output. A copy of the output is saved under **ota-artifacts/workflow-logs**;
+the task displays its exact location. Keep this log with the operation folder
+when asking for help.
+
 For another switch after a later OTA update, start a new operation using that
 board's current firmware and completed update history.
 

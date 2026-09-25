@@ -1,5 +1,5 @@
 """Post-sign inspection runs on ordinary builds before any upload action."""
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import io
 import hashlib
 import json
@@ -316,7 +316,7 @@ if REQUESTED == "upload":
 
     def test_fleet_task_opens_assistant_before_any_build_or_upload(self):
         with tempfile.TemporaryDirectory() as directory:
-            env = Environment(Path(directory) / "build", ROOT)
+            env = Environment(Path(directory) / "build", Path(directory))
             script = ModuleType("SCons.Script")
             script.COMMAND_LINE_TARGETS = ["lead_update"]
             with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
@@ -326,11 +326,12 @@ if REQUESTED == "upload":
             self.assertEqual(task["dependencies"], [])
             with patch("ota_pio.platform.system", return_value="Windows"), \
                     patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
-                    patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as wizard, \
-                    patch("lead_update.main") as campaign:
+                    patch("subprocess.Popen", return_value=nullcontext(
+                        SimpleNamespace(stdout=iter(()), wait=lambda: 0))) as wizard, \
+                    patch("lead_update.main") as campaign, redirect_stdout(io.StringIO()):
                 self.assertEqual(task["actions"][0]([], [], env), 0)
             args = wizard.call_args.args[0]
-            self.assertEqual(args[:3], [sys.executable, str(ROOT / "owntech/tools/ota_workflow.py"), "can-update"])
+            self.assertEqual(args[:4], [sys.executable, "-u", str(Path(directory) / "owntech/tools/ota_workflow.py"), "can-update"])
             self.assertNotIn("mcuboot-image", args)
             self.assertNotIn("upload", args)
             campaign.assert_not_called()

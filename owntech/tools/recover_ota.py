@@ -10,19 +10,20 @@ import tempfile
 
 from lead_update import CampaignError, Journal, identity, select_port
 from ota_artifact import inspect_usb_image
-from prepare_ota_recovery import _object, recovery_config, render_header, require
+from prepare_ota_recovery import _digest, _object, recovery_config, render_header, require
 from smp_transport import CommandError, ProtocolError, SerialSMP, TransportError
 from bootloader_upload import upload_image, UploadError
 
 
 def verify_inputs(config_path, image_path, manifest_path, target_identity, *, staged_lead_only=False,
-                  prepared_follower_only=False, compact_receiver_only=False):
+                  prepared_follower_only=False, compact_receiver_only=False, preprepare_receiver_only=False):
     config_path = Path(config_path)
     config_bytes = config_path.read_bytes()
     config = json.loads(config_bytes, object_pairs_hook=_object)
     require(isinstance(config, dict) and isinstance(config.get("journal_path"), str), "invalid recovery configuration")
     expected = recovery_config(config["journal_path"], staged_lead_only=staged_lead_only,
-                               prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only)
+                               prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only,
+                               preprepare_receiver_only=preprepare_receiver_only)
     header = render_header(expected)
     expected["header_sha256"] = hashlib.sha256(header).hexdigest()
     require(config == expected, "recovery configuration no longer matches its source journal and guards")
@@ -95,17 +96,25 @@ def verify_slots(state, original_hash, secondary_hash=None, primary=None, *, sec
 
 def recover(config_path, image_path, manifest_path, serial_number, target_identity, *, port=None,
             apply=False, after_revert=False, staged_lead_only=False, prepared_follower_only=False, compact_receiver_only=False,
+            preprepare_receiver_only=False, expected_secondary_hash=None,
             mcumgr=None, log_path=None, timeout=10, enumerate_ports=None,
             transport_factory=None, uploader=None):
     require(isinstance(serial_number, str) and serial_number, "an explicit stable USB serial is required")
     require(type(after_revert) is bool, "after-revert must be an explicit boolean mode")
-    require(not (compact_receiver_only and after_revert), "compact receiver repair is precommit only")
+    require(not ((compact_receiver_only or preprepare_receiver_only) and after_revert), "compact receiver repair is precommit only")
     require(not (prepared_follower_only and after_revert), "prepared-follower-only is incompatible with after-revert")
+    if expected_secondary_hash is not None:
+        require(preprepare_receiver_only is True,
+                "an explicit secondary hash is allowed only for preprepare-receiver-only recovery")
+        _digest(expected_secondary_hash, "expected secondary hash")
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
             and math.isfinite(timeout) and 0 < timeout <= 60, "SMP timeout must be within 0..60 seconds")
     config, target, image, data, config_hash = verify_inputs(config_path, image_path, manifest_path, target_identity,
                                                           staged_lead_only=staged_lead_only,
-                                                          prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only)
+                                                          prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only,
+                                                          preprepare_receiver_only=preprepare_receiver_only)
+    require(expected_secondary_hash != target["original_active_hash"],
+            "expected secondary hash must differ from the confirmed original primary")
     if apply:
         require(mcumgr is not None and Path(mcumgr).is_file(), "apply requires the existing mcumgr executable")
     if enumerate_ports is None:
@@ -130,6 +139,8 @@ def recover(config_path, image_path, manifest_path, serial_number, target_identi
         journal.emit("RECOVERY_INPUT", target_identity, apply=apply, after_revert=after_revert,
                      staged_lead_only=staged_lead_only,
                      prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only,
+                     preprepare_receiver_only=preprepare_receiver_only,
+                     expected_secondary_hash=expected_secondary_hash,
                      usb_serial=serial_number, port=device,
                      config_sha256=config_hash, source_journal_sha256=config["journal_sha256"],
                      original_active_hash=target["original_active_hash"],
@@ -154,17 +165,28 @@ def recover(config_path, image_path, manifest_path, serial_number, target_identi
         open_bootloader()
         initial = state("RECOVERY_INSPECT")
         has_secondary = 1 in _slots(initial)
-        secondary = None if prepared_follower_only or (compact_receiver_only and not has_secondary) else config["manifest"]["mcuboot_image_hash"]
+        secondary = None if prepared_follower_only or preprepare_receiver_only or (compact_receiver_only and not has_secondary) else config["manifest"]["mcuboot_image_hash"]
+        if preprepare_receiver_only:
+            secondary = expected_secondary_hash
         primary = verify_slots(initial, target["original_active_hash"], secondary,
-                               secondary_pending=False if compact_receiver_only else not after_revert)
+                               secondary_pending=False if compact_receiver_only or preprepare_receiver_only else not after_revert)
         if not apply:
             journal.emit("RECOVERY_INSPECTION_PASSED", target_identity)
             return {"result": "INSPECTED", "identity": target_identity, "usb_serial": serial_number,
                     "port": device, "log": str(log_path)}
 
-        if not prepared_follower_only and (not compact_receiver_only or has_secondary):
+        erase_secondary = (expected_secondary_hash is not None or
+                           (not prepared_follower_only and not preprepare_receiver_only and
+                            (not compact_receiver_only or has_secondary)))
+        if erase_secondary:
             check_port()
-            journal.emit("RECOVERY_ERASE_SECONDARY_REQUEST", target_identity, slot=1)
+            if expected_secondary_hash is not None:
+                # An unrelated old USB backup is authorized only by its exact
+                # explicitly supplied hash, freshly reread before the erase.
+                verify_slots(state("RECOVERY_BEFORE_ERASE"), target["original_active_hash"],
+                             expected_secondary_hash, primary, secondary_pending=False)
+            journal.emit("RECOVERY_ERASE_SECONDARY_REQUEST", target_identity, slot=1,
+                         expected_secondary_hash=secondary)
             transport._request(2, 1, 5, "erase recovery secondary slot", {"slot": 1})
             verify_slots(state("RECOVERY_AFTER_ERASE"), target["original_active_hash"], primary=primary)
         transport.close()
@@ -214,6 +236,8 @@ def main(argv=None):
     parser.add_argument("--mcumgr", type=Path)
     parser.add_argument("--log", type=Path)
     parser.add_argument("--timeout", type=float, default=10)
+    parser.add_argument("--expected-secondary-hash",
+                        help="preprepare recovery only: exact nonpending old secondary hash read during inspection")
     parser.add_argument("--after-revert", action="store_true",
                         help="inspect a completed revert: require the exact initial secondary to be nonpending; never initiate a revert")
     scope = parser.add_mutually_exclusive_group()
@@ -222,6 +246,8 @@ def main(argv=None):
     scope.add_argument("--prepared-follower-only", action="store_true",
                        help="require a prepared follower with an absent secondary; Lead and after-revert are forbidden")
     scope.add_argument("--compact-receiver-only", action="store_true", help="explicit precommit v2 receiver repair; never an armed image")
+    scope.add_argument("--preprepare-receiver-only", action="store_true",
+                       help="one failed v2 receiver before preparation; secondary absent unless its exact hash is supplied")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--inspect", action="store_true", help="read-only slot inspection (default)")
     mode.add_argument("--apply", action="store_true", help="erase only the proven secondary, upload recovery and reset once")
@@ -231,6 +257,8 @@ def main(argv=None):
                          port=args.port, apply=args.apply, after_revert=args.after_revert,
                          staged_lead_only=args.staged_lead_only,
                          prepared_follower_only=args.prepared_follower_only, compact_receiver_only=args.compact_receiver_only,
+                         preprepare_receiver_only=args.preprepare_receiver_only,
+                         expected_secondary_hash=args.expected_secondary_hash,
                          mcumgr=args.mcumgr, log_path=args.log, timeout=args.timeout)
     except (OSError, ValueError, CampaignError, UploadError) as error:
         print("Recovery stopped: %s" % error, file=sys.stderr)

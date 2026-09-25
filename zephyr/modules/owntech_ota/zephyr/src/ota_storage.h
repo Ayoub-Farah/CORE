@@ -28,6 +28,9 @@ struct ota_storage_journal {
 int ota_storage_init(void);
 bool ota_storage_recovery_required(void);
 bool ota_storage_maintenance(void);
+/* Build capability only; does not acquire storage, enter maintenance or write.
+ * A dedicated Lead never accepts receiver images into its boot slot. */
+bool ota_storage_receiver_qualified(void);
 enum ota_slot_owner ota_storage_owner(void);
 int ota_storage_load_role(bool *lead);
 int ota_storage_persist_role(bool lead);

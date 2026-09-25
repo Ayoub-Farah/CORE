@@ -49,6 +49,36 @@ confirmation, local/CAN health, maintenance and storage availability. Close
 Scope/console consumers during this check; saturated/interleaved console output
 does not count as a valid status response.
 
+The host retries a silent status request up to three times within the response
+timeout, without sending console bytes or resetting the board. A missing
+`OTAR2` response does not identify a legacy application or bootloader, and is
+not a reason to initialize a board with an existing campaign. Close other
+serial tools and retry **Check connected board**. A returned `FAILED` state is
+the campaign result, not a USB detection failure.
+
+Receiver status also reports `deferred_arm_qualified`, the compiled activation
+gate. An unqualified receiver now advertises unavailable and rejects PREPARE
+before reserving a campaign or writing a journal. Its confirmed USB application
+can still initialize, reporting `DISABLED_IN_RECEIVER_BUILD`. Generated artifact
+profiles record the effective `receiver_can_update_enabled` setting; the host
+rejects a candidate with that setting false before starting a campaign.
+
+For a dedicated LED/OTA test bench, the local `src/app.ini` can explicitly enable
+the path under `[env:OTA]` while preserving its profile arguments:
+
+```ini
+[env:OTA]
+board_build.zephyr.cmake_extra_args =
+    -DBUILD_ENV_NAME=OTA
+    -DOWNTECH_BUILD_PROFILE=ota_receiver
+    -DCONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=y
+```
+
+This enables a bench test; it does not provide the bootloader qualification
+evidence described in `ota-deferred-arm-qualification.md`. The shipped profile
+remains disabled. Changing only the future CAN artifact cannot enable the
+receiver already running: the first enabled receiver must be installed by USB.
+
 ## Two artifacts, two contracts
 
 Each OTA build checks the existing signed `firmware.mcuboot.bin` USB installation
@@ -68,30 +98,49 @@ do not claim cryptographic signature acceptance; the installed bootloader
 remains responsible for signature verification.
 
 Snapshots are written under `ota-artifacts/OTA/` and `ota-artifacts/USB_LEAD/`,
-outside PlatformIO's build-clean directories. Campaign logs go to
-`ota-journals/`. These generated directories are Git-ignored: archive the exact
+outside PlatformIO's build-clean directories. The assistant archives campaigns
+under `ota-artifacts/operations/`; direct CLI logs default to `ota-journals/`.
+These generated directories are Git-ignored: archive the exact
 artifacts, manifests, configuration, map and journal before another build.
 
 ## Distribute only to receiver boards
 
-Install the dedicated Lead first. Configure `custom_ota_expected_ids` as the
-receiver EUI-64 list, or `custom_ota_expected_count` as the receiver count.
-**Neither includes the Lead.** All expected boards must be discovered, compatible
-and available; an absent or unexpected identity cannot be silently removed.
-The local `src/app.ini` list inherited from v1 is preserved for operator review;
-remove the dedicated Lead's EUI explicitly before starting a v2 campaign.
+Install the dedicated Lead first, then connect it by USB. The **Update CAN
+receiver boards** task opens the assistant, including when launched from the
+terminal. If several boards are connected by USB, select the Lead in the board
+dialog. Enter the number of receivers to update, **excluding the Lead**.
+The assistant selects the USB board and receiver count interactively; it does
+not read `custom_ota_serial`, `custom_ota_expected_ids` or
+`custom_ota_expected_count` from `src/app.ini` for this task.
 
 ```sh
 pio run -e USB_LEAD -t lead_update
-# Or distribute a previously archived exact artifact:
-python owntech/tools/lead_update.py --image ota-artifacts/OTA/firmware.can.bin \
-  --serial LEAD_USB_SERIAL --expected-count 2
 ```
 
-The task is named **Update CAN receiver boards**. It explicitly builds the
+Discovery must find exactly that count, and every receiver must be compatible
+and available. The assistant freezes the discovered identities for the campaign.
+To require specific receiver EUIs before starting, use the direct CLI with
+`--expected-id` once per receiver. The CLI also takes its selection from explicit
+arguments, rather than `src/app.ini`:
+
+```sh
+# Distribute a previously built or archived exact artifact:
+python owntech/tools/lead_update.py --image ota-artifacts/OTA/firmware.can.bin \
+  --manifest ota-artifacts/OTA/firmware.can.json --serial LEAD_USB_SERIAL \
+  --expected-id RECEIVER_EUI_1 --expected-id RECEIVER_EUI_2
+```
+
+Alternatively, use `--expected-count 2` when a receiver count is sufficient.
+The expected IDs and count always exclude the Lead. With exact IDs, an absent
+or unexpected receiver causes discovery to fail before the campaign starts.
+
+The assistant explicitly builds the
 `OTA` environment and distributes its compact receiver artifact. It does not
 upload to, reset, or replace the Lead. The previous `--receiver-absent` campaign
 bootstrap is refused; install the Lead in its separate USB workflow.
+The assistant saves its campaign log and firmware under
+`ota-artifacts/operations/`; direct CLI logs default to `ota-journals/` unless
+`--journal` selects another path.
 
 `stage_begin` binds the v2 receiver manifest and campaign to a PC source;
 `stage_end` changes `SOURCE_OPEN` to `SOURCE_READY` without writing a Lead slot.
@@ -114,6 +163,46 @@ python owntech/tools/lead_update.py --serial LEAD_USB_SERIAL \
 ```
 
 ## Recovery and acceptance still requiring the bench
+
+Older receivers could turn a refusal before preparation into `FAILED/-7` and
+persist a v2 journal without entering maintenance. The explicit
+`--preprepare-receiver-only` repair covers that case separately from compact
+transfer recovery. It requires exactly one receiver, frozen original/candidate
+hashes and identity, zero accepted bytes/pass, the preparation-entry event only,
+and no validation/commit proof. The secondary must be absent at USB inspection,
+or match an explicitly supplied `--expected-secondary-hash` from a previous
+read-only inspection. That option accepts only an inactive, unconfirmed,
+nonpending old backup; the exact slots are reread immediately before erasure.
+The helper
+requires a matching FAILED or ABORTED journal with zero commit ID, no fleet journal, and
+absent or valid-false maintenance. Corrupt records, true maintenance, an unexpected
+secondary, and postcommit states remain refused. Its distinct durable marker
+permits resuming interrupted cleanup of only the OTA keys.
+The old client sends ABORT after a transfer error; its receiver can retain the
+original error in the USB display even after persisting ABORTED. Both terminal
+states are therefore covered by the same no-transfer proof.
+
+```sh
+python owntech/tools/prepare_ota_recovery.py --journal PATH_TO_FAILED_CAMPAIGN \
+  --preprepare-receiver-only --output-dir .pio/ota-preprepare-recovery-config
+# Set custom_ota_recovery_config = .pio/ota-preprepare-recovery-config
+# under [env:OTA_RECOVERY] in the local src/app.ini, then:
+pio run -e OTA_RECOVERY -t mcuboot-image
+# Enter the receiver's existing bootloader using BOOT + RESET.
+python owntech/tools/recover_ota.py --preprepare-receiver-only --inspect \
+  --config .pio/ota-preprepare-recovery-config/owntech_ota_recovery_config.json \
+  --image ota-artifacts/OTA_RECOVERY/firmware.mcuboot.bin \
+  --manifest ota-artifacts/OTA_RECOVERY/firmware.mcuboot.json \
+  --serial RECEIVER_USB_SERIAL --identity RECEIVER_EUI
+```
+
+After inspection succeeds, `--apply --mcumgr PATH` installs the scoped helper.
+Wait for `RECOVERED rc=0` with the expected EUI and confirmation. The helper keeps
+outputs inhibited; it is not the receiver application. Enter the bootloader
+again, verify the exact confirmed helper in primary and the original receiver
+nonpending in secondary, then install the intended receiver using the explicit
+USB bootloader provisioning path. Verify its hash, local health, confirmation
+and activation gate before returning to `lead_update`.
 
 Keep the journal after any interruption. A failed transfer retains maintenance;
 do not interpret `ABORT` as proof that an already armed image was disarmed.

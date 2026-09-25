@@ -61,6 +61,18 @@ class ProvisionTests(unittest.TestCase):
         self.info.update(phase="WAITING_CAN", local_healthy=True, healthy=False,
                          can_ready=False, available=False, error=0)
 
+    def test_can_disabled_firmware_is_initialized_without_claiming_can_readiness(self):
+        self.info.update(deferred_arm_qualified=False, local_healthy=True, healthy=True,
+                         can_ready=True, maintenance=False, slot_available=False, available=False, error=0)
+        for phase in ("IDLE", "WAITING_CAN"):
+            self.info.update(phase=phase, healthy=phase == "IDLE", can_ready=phase == "IDLE")
+            result = self.run_provision()
+            self.assertEqual(result["can_status"], "DISABLED_IN_RECEIVER_BUILD")
+            self.connection.bootstrap.assert_not_called()
+        self.info.update(phase="IDLE", healthy=True, can_ready=True, maintenance=True)
+        with self.assertRaisesRegex(CampaignError, "coherent local health"):
+            self.run_provision()
+
     def use_wire_connection(self, lines_by_port):
         """Exercise the real probe stack with deterministic serial reads/time."""
         now = [0.0]

@@ -138,6 +138,13 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn("reset", commands)
         self.assertNotIn("abort", commands)
 
+    def test_disabled_candidate_refuses_before_any_device_request(self):
+        client = self.client()
+        client.manifest = dict(MANIFEST, profile=dict(MANIFEST["profile"], receiver_can_update_enabled=False))
+        with self.assertRaisesRegex(CampaignError, "CAN updates disabled"):
+            client.run()
+        self.assertEqual(self.transport.calls, [])
+
     def test_unavailable_receiver_reports_identity_fault_and_never_stages(self):
         original = self.transport.request
         def request(command, payload):

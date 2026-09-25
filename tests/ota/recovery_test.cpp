@@ -93,6 +93,13 @@ void init_compact(Fixture &f)
     memcpy(p+28,f.config.lead_eui,8);memcpy(p+36,f.config.artifact_hash,32);
     memcpy(p+68,f.config.image_hash,32);checksum(p,164);
 }
+void init_preprepare(Fixture &f,bool absent=false)
+{
+    init_compact(f);f.config.preprepare_receiver_only=true;
+    auto journal=find(f,0x502);journal->bytes[24]=9;checksum(journal->bytes,164);
+    auto maint=find(f,0x501);put32(maint->bytes+4,0);checksum(maint->bytes,8);
+    if(absent) maint->size=-1;
+}
 bool clean(Fixture &f)
 {for(uint16_t key=0x501;key<=0x504;key++) {auto r=find(f,key);if(r && r->size!=-1) return false;}return true;}
 bool preserved(Fixture &f,const uint8_t role[12])
@@ -286,6 +293,63 @@ extern "C" int ota_recovery_test_run()
     CHECK(find(f,0x504)->bytes[4]==4);mutations=f.mutations;
     f.config.artifact_hash[0]^=1;
     CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER&&f.mutations==mutations);
+
+    /* A legacy refusal before preparation has its own terminal-state policy.
+     * No other compact state gains permission to omit maintenance. */
+    for(unsigned state=9;state<=10;state++) for(unsigned absent=0;absent<2;absent++) {
+        init_preprepare(f,absent!=0);memcpy(original_role,find(f,0x500)->bytes,12);
+        find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,164);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERED);
+        CHECK(f.confirmed&&clean(f)&&preserved(f,original_role));
+        mutations=f.mutations;
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_ALREADY_DONE&&f.mutations==mutations);
+        for(unsigned cut=1;cut<=6;cut++) {
+            init_preprepare(f,absent!=0);memcpy(original_role,find(f,0x500)->bytes,12);f.cut=cut;
+            find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,164);
+            CHECK(ota_recovery_run(f.config,io(f))<0);CHECK(preserved(f,original_role));
+            f.cut=0;int rc=ota_recovery_run(f.config,io(f));
+            CHECK(rc==OTA_RECOVERED||rc==OTA_RECOVERY_ALREADY_DONE);
+            CHECK(f.confirmed&&clean(f)&&preserved(f,original_role));
+        }
+    }
+    for(unsigned state=0;state<=14;state++) if(state!=9 && state!=10) {
+        init_preprepare(f);find(f,0x502)->bytes[24]=uint8_t(state);checksum(find(f,0x502)->bytes,164);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    }
+    for(unsigned offset:compact_bad_fields) {
+        init_preprepare(f);find(f,0x502)->bytes[offset]^=1;checksum(find(f,0x502)->bytes,164);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    }
+    for(unsigned value=1;value<=2;value++) {
+        init_preprepare(f);put32(find(f,0x501)->bytes+4,value);checksum(find(f,0x501)->bytes,8);
+        CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MAINTENANCE&&!f.mutations);
+    }
+    init_preprepare(f);find(f,0x501)->bytes[8]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MAINTENANCE&&!f.mutations);
+    init_preprepare(f);find(f,0x501)->size=11;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MAINTENANCE&&!f.mutations);
+    init_preprepare(f);f.config.preprepare_receiver_only=false;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MAINTENANCE&&!f.mutations);
+    init_preprepare(f);f.config.compact_receiver_only=false;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_CONFIG&&!f.mutations);
+    init_preprepare(f);f.config.board_count=2;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_CONFIG&&!f.mutations);
+    init_preprepare(f);f.eui[0]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_IDENTITY&&!f.mutations);
+    init_preprepare(f);f.backup[0]^=1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_BACKUP&&!f.mutations);
+    init_preprepare(f);add(f,0x503,308);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_FLEET&&!f.mutations);
+    init_preprepare(f);add(f,0x504,64);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER&&!f.mutations);
+    init_preprepare(f);find(f,0x502)->size=-1;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_JOURNAL&&!f.mutations);
+    init_preprepare(f);f.cut=1;CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_STORAGE);f.cut=0;
+    CHECK(find(f,0x504)->bytes[4]==5);mutations=f.mutations;
+    f.config.preprepare_receiver_only=false;
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MARKER&&f.mutations==mutations);
+    f.config.preprepare_receiver_only=true;put32(find(f,0x501)->bytes+4,1);checksum(find(f,0x501)->bytes,8);
+    CHECK(ota_recovery_run(f.config,io(f))==OTA_RECOVERY_MAINTENANCE&&f.mutations==mutations);
     return 0;
 }
 #ifndef OWNTECH_FREESTANDING_TEST

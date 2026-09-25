@@ -7,7 +7,7 @@ static thingset_can_context fake_can{1,1,1,0};
 static thingset_can_state_callback_t state_callback;
 static void *state_arg;
 static uint64_t now;
-static bool confirmed,inhibited,maintenance,recovery;
+static bool confirmed,inhibited,maintenance,recovery,qualified;
 static int health_result,confirms,prepares,appends,arms,last_wait;
 static ota_storage_journal journal;
 static uint8_t active_hash[32];
@@ -29,6 +29,7 @@ extern "C" int ota_network_init(){return 0;}
 int ota_storage_init(){return 0;}
 bool ota_storage_recovery_required(){return recovery;}
 bool ota_storage_maintenance(){return maintenance;}
+bool ota_storage_receiver_qualified(){return qualified;}
 int ota_storage_active_hash(uint8_t *hash){memcpy(hash,active_hash,32);return 0;}
 int ota_storage_get_journal(ota_storage_journal *j){*j=journal;return 0;}
 void ota_storage_set_events(uint32_t,const uint32_t *,const uint8_t *){}
@@ -37,7 +38,7 @@ void ota_storage_boot_identity(ota_identity *id)
     id->protocol_version=OTA_PROTOCOL_VERSION;id->image_class=OTA_IMAGE_RECEIVER;
     id->hardware_id=1;id->layout_id=2;id->bootloader_id=3;
     id->usable_slot_size=4096;id->usable_image_size=3072;
-    id->active_confirmed=confirmed;id->slot_available=!maintenance;
+    id->active_confirmed=confirmed;id->slot_available=qualified&&!maintenance;
 }
 int ota_storage_expect_lead(const uint8_t *id){memcpy(journal.lead_eui,id,8);return 0;}
 int ota_storage_release_maintenance(const uint8_t *hash)
@@ -66,7 +67,7 @@ static void reset()
     accepted_campaign=0;accepted_manifest={};service_error=0;event_mask=next_event_order=0;
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
     ota_queue.head=ota_queue.count=0;
-    now=0;fake_can={1,1,1,0};confirmed=true;inhibited=true;maintenance=recovery=false;
+    now=0;fake_can={1,1,1,0};confirmed=qualified=true;inhibited=true;maintenance=recovery=false;
     health_result=confirms=prepares=appends=arms=last_wait=0;journal={};memset(active_hash,0x55,32);
 }
 static ota_command command()
@@ -81,6 +82,18 @@ static ota_command command()
 }
 static int test_receiver()
 {
+    /* A healthy but unqualified image refuses the command synchronously. It
+     * does not bind a campaign, claim storage, publish a fictitious erase, or
+     * leave a journal that will require recovery after the next boot. */
+    reset();qualified=false;initialize_runtime();auto refused=command();
+    ota_runtime_claim(refused.lead_eui,2);
+    CHECK(ota_service_healthy()&&!local_snapshot.identity.slot_available);
+    for(unsigned retry=0;retry<3;retry++) {
+        CHECK(ota_runtime_command(&refused,2)==OTA_ERR_COMPATIBILITY);
+        CHECK(!ota_service_busy()&&!accepted_campaign&&!lead_bound&&!ota_queue.count);
+        CHECK(!prepares&&!maintenance&&!inhibited&&!journal.campaign_id&&!event_mask);
+        CHECK(participant.status.state==OTA_IDLE&&!participant.status.error&&!ota_service_error());
+    }
     /* A foreign claim against our provisional address is normal arbitration,
      * not an identity failure. The SDK selects a free address before ready. */
     reset();fake_can.ready=0;initialize_runtime();

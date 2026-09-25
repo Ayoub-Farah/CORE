@@ -144,6 +144,26 @@ class IdentityTest(unittest.TestCase):
         self.assertNotEqual(generate_for_environment(ota)["build_id"],
                             generate_for_environment(lead)["build_id"])
 
+    def test_deferred_arm_override_reconfigures_receiver_and_preserves_profile(self):
+        env = FakeEnv(self.root)
+        env.options["board_build.zephyr.cmake_extra_args"] = [
+            "-DBUILD_ENV_NAME=OTA", "-DOWNTECH_BUILD_PROFILE=ota_receiver"]
+        original = generate_for_environment(env)["build_id"]
+        cache = self.root / ".pio/build/OTA/CMakeCache.txt"
+        cache.write_text("guard disabled")
+        option = "-DCONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=y"
+        env.options["board_build.zephyr.cmake_extra_args"].append(option)
+        enabled = generate_for_environment(env)["build_id"]
+        self.assertNotEqual(original, enabled)
+        self.assertFalse(cache.exists())
+        args = shlex.split(env.board_updates["build.zephyr.cmake_extra_args"])
+        for required in ("-DBUILD_ENV_NAME=OTA", "-DOWNTECH_BUILD_PROFILE=ota_receiver", option):
+            self.assertIn(required, args)
+        cache.write_text("guard enabled")
+        env.options["board_build.zephyr.cmake_extra_args"].remove(option)
+        self.assertEqual(original, generate_for_environment(env)["build_id"])
+        self.assertFalse(cache.exists())
+
     def test_ignored_outputs_git_docs_and_line_endings_do_not_change_identity(self):
         env = FakeEnv(self.root)
         before = generate_for_environment(env)

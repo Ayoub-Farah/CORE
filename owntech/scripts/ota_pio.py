@@ -47,11 +47,18 @@ def artifact_options(env):
         if not key or (not Path(key).is_absolute() and not Path(key).is_file()):
             key = str(framework / "_pio" / "bootloader" / "mcuboot" / "root-rsa-2048.pem")
         profile = dict(DEFAULT_PROFILE, signing_key=str(Path(key).resolve()))
-        profile_path = build / "ota-profile.json"
-        content = json.dumps(profile, indent=2) + "\n"
-        build.mkdir(parents=True, exist_ok=True)
-        if not profile_path.is_file() or profile_path.read_text(encoding="utf-8") != content:
-            profile_path.write_text(content, encoding="utf-8")
+    # Record the actual compiled gate, separately from evidence about the
+    # installed bootloader. A test build enabling it is not qualification.
+    config = build / "zephyr" / ".config"
+    if env.get("OWNTECH_OTA_IMAGE_CLASS", "receiver") == "receiver" and config.is_file():
+        settings = config.read_text(encoding="utf-8").splitlines()
+        profile = dict(profile, receiver_can_update_enabled=
+                       "CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=y" in settings)
+    profile_path = build / "ota-profile.json"
+    content = json.dumps(profile, indent=2) + "\n"
+    build.mkdir(parents=True, exist_ok=True)
+    if not profile_path.is_file() or profile_path.read_text(encoding="utf-8") != content:
+        profile_path.write_text(content, encoding="utf-8")
     return profile, profile_path, version, build_id
 
 

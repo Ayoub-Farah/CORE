@@ -10,10 +10,11 @@ struct node {
     unsigned prepared, writes, flushes, validations, reboots, arms;
     bool bad_flush, bad_write, bad_arm;
     int rejected_journal_state;
+    int prepare_error;
     ota_state durable;
 };
 static int prepare(void *v, const ota_manifest *, bool adopt)
-{ node *n = (node *)v; if (!adopt) { ++n->prepared; memset(n->bytes, 0, sizeof(n->bytes)); } return 0; }
+{ node *n = (node *)v; if (!adopt) { ++n->prepared; memset(n->bytes, 0, sizeof(n->bytes)); } return n->prepare_error; }
 static int append(void *v, uint32_t offset, const uint8_t *data, size_t len)
 { node *n = (node *)v; if (n->bad_write) return -1; memcpy(n->bytes + offset, data, len); ++n->writes; return 0; }
 static int flush(void *v) { node *n = (node *)v; ++n->flushes; return n->bad_flush ? -1 : 0; }
@@ -117,9 +118,37 @@ static int participant_test()
     CHECK(ota_participant_finalize(&n.p, 42) == OTA_ERR_STORAGE);
     CHECK(ota_participant_finalize(&n.p, 42) == OTA_ERR_STORAGE && n.flushes == 1);
     CHECK(!n.p.status.flash_complete && !n.p.status.validated);
+    const int prepare_errors[] = { OTA_ERR_SAFETY, OTA_ERR_JOURNAL, OTA_ERR_STORAGE,
+                                  OTA_ERR_STATE, OTA_ERR_CAPACITY, OTA_ERR_COMPATIBILITY, 1 };
+    for (int error : prepare_errors) {
+        init_node(&n, 1); n.prepare_error = error;
+        int expected = error < 0 ? error : OTA_ERR_STORAGE;
+        CHECK(ota_participant_prepare(&n.p, &m, eui, 1, false) == expected);
+        CHECK(n.p.status.state == OTA_FAILED && n.p.status.error == expected);
+        CHECK(n.p.status.offset == 0 && !n.writes && !n.arms);
+        CHECK(ota_participant_prepare(&n.p, &m, eui, 1, false) == expected && n.prepared == 1);
+        CHECK(ota_participant_begin_pass(&n.p, 42, 1, 0) == OTA_ERR_STATE);
+        /* The PC's failed-campaign cleanup persists ABORTED; the failure
+         * diagnosis survives and can still drive a FAILED live phase. */
+        CHECK(ota_participant_abort(&n.p, 42) == OTA_OK);
+        CHECK(n.durable == OTA_ABORTED && n.p.status.state == OTA_ABORTED);
+        CHECK(n.p.status.error == expected && n.p.status.commit_id == 0);
+        CHECK(n.p.status.offset == 0 && !n.writes && !n.arms);
+    }
+    init_node(&n, 1); n.p.hooks.prepare = nullptr;
+    CHECK(ota_participant_prepare(&n.p, &m, eui, 1, false) == OTA_ERR_STORAGE);
+    CHECK(n.p.status.state == OTA_FAILED && !n.prepared);
     init_node(&n, 1); n.p.identity.slot_available = false;
+    ota_participant before_refusal = n.p;
     CHECK(ota_participant_prepare(&n.p, &m, eui, 1, true) == OTA_ERR_COMPATIBILITY);
     CHECK(ota_participant_prepare(&n.p, &m, eui, 1, false) == OTA_ERR_STATE);
+    CHECK(!memcmp(&n.p, &before_refusal, sizeof(n.p)) && !n.prepared && n.durable == OTA_IDLE);
+    /* Unavailable firmware must not replace a completed durable campaign with
+     * a spurious failed attempt, including when the Lead retries PREPARE. */
+    n.p.status.state = n.durable = OTA_SUCCEEDED; n.p.status.campaign_id = 21;
+    before_refusal = n.p;
+    CHECK(ota_participant_prepare(&n.p, &m, eui, 1, false) == OTA_ERR_STATE);
+    CHECK(!memcmp(&n.p, &before_refusal, sizeof(n.p)) && !n.prepared && n.durable == OTA_SUCCEEDED);
     init_node(&n, 1); wrong = m; wrong.image_class = OTA_IMAGE_LEAD;
     CHECK(ota_participant_prepare(&n.p, &wrong, eui, 1, false) == OTA_ERR_COMPATIBILITY);
     wrong = m; wrong.image_size = 1024;

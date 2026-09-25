@@ -69,6 +69,28 @@ class Environment:
 
 
 class BuildTests(unittest.TestCase):
+    def test_manifest_records_effective_receiver_gate_without_claiming_qualification(self):
+        from ota_pio import artifact_options
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            build = project / "build"
+            config = build / "zephyr/.config"
+            config.parent.mkdir(parents=True)
+            env = Environment(build, project)
+            for enabled in (False, True):
+                config.write_text("CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=y\n" if enabled
+                                  else "# CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED is not set\n")
+                profile, path, _, _ = artifact_options(env)
+                self.assertIs(profile["receiver_can_update_enabled"], enabled)
+                self.assertTrue(profile["bootloader_qualification"].startswith("unqualified:"))
+                self.assertEqual(json.loads(path.read_text()), profile)
+                image = project / "firmware.can.bin"
+                image.write_bytes(artifact(compact=True))
+                manifest = inspect_image(image.read_bytes(), profile, build_id="B")
+                image.with_suffix(".json").write_text(json.dumps(manifest))
+                _, restored = prepare_manifest(image)
+                self.assertIs(restored["profile"]["receiver_can_update_enabled"], enabled)
+
     def test_default_journal_survives_removal_of_build_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)

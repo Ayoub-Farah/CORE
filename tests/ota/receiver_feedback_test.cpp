@@ -27,11 +27,13 @@ static ota_observation source;
 static ota_service_diagnostics diagnostic={"WAITING_CAN",0,true,false,false,false,false};
 static char fifo[768];
 static unsigned fifo_calls;
+static bool qualified;
 static int fifo_capacity=768;
 int uart_fifo_fill(const device *,const uint8_t *p,int n)
 {++fifo_calls;assert(n>0&&n<768);memcpy(fifo,p,MIN(n,fifo_capacity));return MIN(n,fifo_capacity);}
 extern "C" void ota_service_snapshot(ota_observation *o,ota_service_diagnostics *d){*o=source;*d=diagnostic;}
 extern "C" bool ota_safety_inhibited(){return false;}
+extern "C" bool ota_storage_receiver_qualified(){return qualified;}
 int main()
 {
     source.identity.hardware_id=0xffffffff;source.identity.layout_id=0xffffffff;
@@ -44,12 +46,16 @@ int main()
     assert(strstr(fifo,"\"image_class\":\"receiver\""));
     assert(strstr(fifo,"\"identity\":\"ab00000000000000\""));
     assert(strstr(fifo,"\"available\":false"));
+    assert(strstr(fifo,"\"deferred_arm_qualified\":false"));
     assert(strstr(fifo,"\"mcuboot_image_hash\":\"5a5a"));
     status_work(nullptr);assert(fifo_calls==1); /* Bounded request rate. */
     host_now=300;fifo_capacity=0;status_work(nullptr);
     assert(fifo_calls==2&&host_now==300); /* Full console cannot block or retry internally. */
     host_now=600;fifo_capacity=768;diagnostic.healthy=diagnostic.can_ready=true;
+    status_work(nullptr);assert(strstr(fifo,"\"available\":false"));
+    host_now=900;qualified=source.identity.slot_available=true;
     status_work(nullptr);assert(strstr(fifo,"\"available\":true"));
+    assert(strstr(fifo,"\"deferred_arm_qualified\":true"));
     ota_feedback_application_led(1);assert(led_requests==1&&led_writes==0);
     feedback(nullptr);assert(last_led==1&&led_timers==0);
     ota_feedback_application_led(2);feedback(nullptr);assert(last_led==0&&led_timers==0);

@@ -20,6 +20,8 @@ struct OtaRecoveryConfig {
     /* Protocol v2 receiver journal, before any commit intention or arm. */
     bool compact_receiver_only;
     uint8_t artifact_hash[32];
+    /* A single compact receiver refused before maintenance/slot preparation. */
+    bool preprepare_receiver_only;
 };
 struct OtaRecoveryIO {
     void *context;

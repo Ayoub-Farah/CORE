@@ -42,6 +42,17 @@ def _verify_image(info, manifest):
 
 def _provision_readiness(info):
     """Local initialization may finish before a CAN peer joins the bus."""
+    if info.get("image_class") == "receiver" and info.get("deferred_arm_qualified") is False:
+        phase = info.get("phase")
+        if phase not in ("IDLE", "WAITING_CAN"):
+            return None
+        expected = {"local_healthy": True, "active_confirmed": True, "maintenance": False,
+                    "slot_available": False, "available": False, "error": 0,
+                    "healthy": phase == "IDLE", "can_ready": phase == "IDLE"}
+        if any(type(info.get(field)) is not type(value) or info[field] != value
+               for field, value in expected.items()):
+            raise CampaignError("CAN-disabled receiver lacks coherent local health and idle state")
+        return "DISABLED_IN_RECEIVER_BUILD"
     if info.get("phase") == "WAITING_CAN":
         expected = {"local_healthy": True, "healthy": False, "active_confirmed": True,
                     "slot_available": True, "available": False, "can_ready": False, "error": 0}

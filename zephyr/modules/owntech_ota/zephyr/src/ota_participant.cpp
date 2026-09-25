@@ -71,7 +71,11 @@ int ota_participant_prepare(ota_participant *p, const ota_manifest *m,
     p->manifest = *m; memcpy(p->lead_eui, eui, 8); p->lead_address = address;
     p->status.campaign_id = m->campaign_id; p->status.image_size = m->image_size;
     p->status.state = OTA_PREPARING; p->status.adopted = adopt;
-    if (!p->hooks.prepare || p->hooks.prepare(p->hooks.context, m, adopt)) return fail(p, OTA_ERR_STORAGE);
+    if (!p->hooks.prepare) return fail(p, OTA_ERR_STORAGE);
+    /* The storage adapter distinguishes safety, journal, capacity and flash
+     * failures. Preserve that diagnosis before any image bytes are sent. */
+    int rc = p->hooks.prepare(p->hooks.context, m, adopt);
+    if (rc) return fail(p, rc < 0 ? rc : OTA_ERR_STORAGE);
     if (adopt) { p->status.offset = m->image_size; p->status.flash_complete = true; }
     if (journal(p, OTA_READY)) return fail(p, OTA_ERR_JOURNAL);
     return OTA_OK;

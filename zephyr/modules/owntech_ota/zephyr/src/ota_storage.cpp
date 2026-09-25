@@ -301,14 +301,8 @@ int validate(const ota_manifest *m)
 int begin(const ota_manifest *m, ota_slot_owner desired)
 {
     if (!initialized || recovery || owner != OTA_SLOT_NONE || !m || !m->campaign_id) return OTA_ERR_STATE;
-#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
-    /* A dedicated Lead must never stage receiver firmware into a boot slot. */
-    return OTA_ERR_COMPATIBILITY;
-#endif
-#if !defined(CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED) || !CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED
     /* Installed bootloader geometry/algorithm must be qualified explicitly. */
-    return OTA_ERR_COMPATIBILITY;
-#endif
+    if (!ota_storage_receiver_qualified()) return OTA_ERR_COMPATIBILITY;
     uint8_t lead_nonzero = 0; for (size_t i = 0; i < 8; ++i) lead_nonzero |= expected_lead_eui[i];
     if (!lead_nonzero) return OTA_ERR_IDENTITY;
     if (!m->image_content_size || m->image_content_size > CONFIG_OWNTECH_OTA_USABLE_IMAGE_SIZE ||
@@ -469,6 +463,16 @@ int ota_storage_init(void)
 }
 bool ota_storage_recovery_required(void) { lock guard; return recovery; }
 bool ota_storage_maintenance(void) { lock guard; return maintenance; }
+bool ota_storage_receiver_qualified(void)
+{
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    return false;
+#elif defined(CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED) && CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED
+    return true;
+#else
+    return false;
+#endif
+}
 ota_slot_owner ota_storage_owner(void) { lock guard; return owner; }
 int ota_storage_load_role(bool *lead)
 {
@@ -520,7 +524,8 @@ void ota_storage_boot_identity(ota_identity *id)
     id->hardware_id = CONFIG_OWNTECH_OTA_HARDWARE_ID; id->layout_id = CONFIG_OWNTECH_OTA_LAYOUT_ID;
     id->bootloader_id = CONFIG_OWNTECH_OTA_BOOTLOADER_ID;
     id->active_confirmed = boot_is_img_confirmed();
-    id->slot_available = owner == OTA_SLOT_NONE && !recovery && boot_available();
+    id->slot_available = owner == OTA_SLOT_NONE && !maintenance && !recovery && boot_available() &&
+        (id->image_class == OTA_IMAGE_LEAD || ota_storage_receiver_qualified());
 }
 int ota_storage_active_hash(uint8_t hash[32])
 {

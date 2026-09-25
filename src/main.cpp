@@ -102,7 +102,7 @@ void loop_background_task()
     spin.led.toggle();
 
     /* Pause between two runs of the task */
-    task.suspendBackgroundMs(1000);
+    task.suspendBackgroundMs(100);
 }
 
 /**

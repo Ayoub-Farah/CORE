@@ -83,12 +83,15 @@ def _manifest(value, compact=False):
     return value
 
 
-def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_only=False, compact_receiver_only=False):
+def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_only=False,
+                    compact_receiver_only=False, preprepare_receiver_only=False):
     """Extract immutable guards, requiring positive pre-COMMIT validation proof."""
     require(type(staged_lead_only) is bool, "staged-lead-only must be an explicit boolean mode")
     require(type(prepared_follower_only) is bool, "prepared-follower-only must be an explicit boolean mode")
     require(type(compact_receiver_only) is bool, "compact-receiver-only must be an explicit boolean mode")
-    require(sum((staged_lead_only, prepared_follower_only, compact_receiver_only)) <= 1, "recovery modes are mutually exclusive")
+    require(type(preprepare_receiver_only) is bool, "preprepare-receiver-only must be an explicit boolean mode")
+    require(sum((staged_lead_only, prepared_follower_only, compact_receiver_only, preprepare_receiver_only)) <= 1,
+            "recovery modes are mutually exclusive")
     early_failure = staged_lead_only or prepared_follower_only
     mode_name = "staged-lead-only" if staged_lead_only else "prepared-follower-only"
     path = Path(journal_path).resolve()
@@ -104,8 +107,9 @@ def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_o
     campaign = _uint(inventory.get("campaign"), 64, "campaign ID", 1)
     require(all(type(record.get("campaign")) is int and record["campaign"] == campaign for record in records),
             "mixed campaign IDs in journal")
-    if compact_receiver_only:
-        return _compact_config(path, raw, records, inventory, lead, serial, campaign)
+    if compact_receiver_only or preprepare_receiver_only:
+        return _compact_config(path, raw, records, inventory, lead, serial, campaign,
+                               preprepare_receiver_only=preprepare_receiver_only)
     targets = _roster(inventory.get("targets"))
     require(lead in targets, "frozen roster omits its Lead")
     require(isinstance(serial, str) and re.fullmatch(r"[A-Za-z0-9_.\-]{1,128}", serial) is not None,
@@ -288,7 +292,7 @@ def recovery_config(journal_path, *, staged_lead_only=False, prepared_follower_o
     return config
 
 
-def _compact_config(path, raw, records, inventory, lead, serial, campaign):
+def _compact_config(path, raw, records, inventory, lead, serial, campaign, *, preprepare_receiver_only=False):
     targets = _roster(inventory.get("targets"))
     require(lead not in targets, "compact recovery roster must exclude the dedicated Lead")
     require(isinstance(serial, str) and re.fullmatch(r"[A-Za-z0-9_.\-]{1,128}", serial),
@@ -335,7 +339,7 @@ def _compact_config(path, raw, records, inventory, lead, serial, campaign):
                             "target already records activation progress")
     require(stages == starts == 1 and records[-1].get("event") in ("FAILED", "ABORTED"),
             "compact recovery requires one source, one START and an explicit failed/aborted result")
-    return {"schema_version": 1, "compact_receiver_only": True, "journal_path": str(path),
+    config = {"schema_version": 1, "compact_receiver_only": True, "journal_path": str(path),
             "journal_sha256": hashlib.sha256(raw).hexdigest(), "campaign_id": campaign,
             "lead_identity": lead, "usb_serial": serial, "targets": originals, "manifest": manifest,
             "guards": {"local_journal_magic": "OTL2", "local_journal_version": 2, "local_commit_id": 0,
@@ -344,6 +348,74 @@ def _compact_config(path, raw, records, inventory, lead, serial, campaign):
                        "match_campaign_image_hash": True, "match_artifact_hash": True,
                        "match_image_size": True, "match_device_eui": True,
                        "host_no_commit_request": True, "host_no_reboot_or_success": True}}
+    if preprepare_receiver_only:
+        _preprepare_proof(records, targets, rows, manifest, campaign)
+        config["preprepare_receiver_only"] = True
+        config["guards"].update(local_journal_state_values=[9, 10], maintenance_required=False,
+                               maintenance_absent_or_valid_false=True, host_preprepare_failed=True,
+                               host_initial_secondary_absent_or_explicit_hash=True, host_no_transfer_or_validation=True)
+    return config
+
+
+def _preprepare_proof(records, targets, originals, manifest, campaign):
+    """Only a legacy refusal before ERASE_END can use an inactive maintenance marker."""
+    require(len(targets) == 1, "preprepare recovery requires exactly one receiver")
+    original = originals[0]
+    require(original.get("image_class") == "receiver" and original.get("state") == "IDLE"
+            and type(original.get("campaign")) is int and original["campaign"] == 0
+            and original.get("event_mask") == 0 and original.get("offset") == 0
+            and original.get("pass") == 0 and original.get("validated") is False
+            and original.get("flash_complete") is False,
+            "preprepare recovery requires a clean idle original receiver")
+    proof = False
+    started = False
+    forbidden = {"ERASE_END", "USB_TRANSFER_BEGIN", "USB_TRANSFER_END", "CAN_TRANSFER_BEGIN", "CAN_TRANSFER_END",
+                 "FLASH_COMPLETE", "VERIFY_BEGIN", "VERIFY_END", "ALL_VALIDATED", "BEGIN_PASS", "CAN_TRANSFER",
+                 "END_PASS", "PASS_OPEN", "PASS_CLOSED", "VALID", "READY", "COMMIT_REQUEST", "COMMIT_INTENT",
+                 "COMMITTED", "COMMITTING", "REBOOTING", "POSTBOOT_CHECK", "SUCCESS", "RECOVERY_REQUIRED"}
+    for record in records:
+        event = record.get("event")
+        require(event not in forbidden and record.get("device_event", 0) == 0,
+                "preprepare recovery forbids preparation completion or transfer progress")
+        if event == "START_REQUEST":
+            started = True
+        if not started:
+            continue
+        statuses = [record.get("status"), record.get("response"), record.get("rejected_row")]
+        statuses += [page.get("response") for page in record.get("page_responses", []) if isinstance(page, dict)]
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            require(status.get("phase") not in forbidden and status.get("state") not in forbidden,
+                    "preprepare snapshot already records preparation or transfer progress")
+            for field in ("offset", "source_offset", "source_length"):
+                require(field not in status or type(status[field]) is int and status[field] == 0,
+                        "preprepare snapshot records source/transfer bytes")
+            rows = status.get("targets", [status] if "identity" in status else [])
+            for row in rows:
+                require(row.get("identity") == targets[0] and row.get("state") in ("IDLE", "PREPARING", "FAILED", "ABORTED")
+                        and not _uint(row.get("event_mask", 0), 32, "event mask") & ~1
+                        and row.get("validated") is not True and row.get("flash_complete") is not True
+                        and all(field not in row or type(row[field]) is int and row[field] == 0
+                                for field in ("offset", "pass", "queue_depth")),
+                        "preprepare target already records preparation or transfer progress")
+                if event != "STATUS" or status.get("phase") != "FAILED" or row.get("state") == "ABORTED":
+                    continue
+                require(type(status.get("campaign")) is int and status["campaign"] == campaign
+                        and status.get("target_count") == 1 and len(rows) == 1
+                        and row.get("campaign") == campaign and row.get("state") == "FAILED"
+                        and row.get("image_size") == manifest["artifact_size"]
+                        and row.get("role") == "follower" and row.get("image_class") == "receiver"
+                        and row.get("mcuboot_image_hash") == original["mcuboot_image_hash"]
+                        and all(row.get(key) is True for key in ("healthy", "confirmed", "compatible"))
+                        and row.get("available") is False and row.get("error") == -7
+                        and row.get("event_mask") == 1 and row.get("event_order") == [1] + [0] * 11
+                        and row.get("offset") == row.get("pass") == row.get("queue_depth") == 0
+                        and row.get("validated") is False and row.get("flash_complete") is False,
+                        "missing exact legacy preprepare FAILED proof")
+                proof = True
+    require(proof and records[-1].get("event") in ("FAILED", "ABORTED"),
+            "preprepare recovery requires a positive failed STATUS proof")
 
 
 def _bytes(value):
@@ -366,6 +438,8 @@ def render_header(config):
         fields["COMPACT_RECEIVER_ONLY"] = "1"
         fields["ARTIFACT_HASH_BYTES"] = _bytes(config["manifest"]["artifact_sha256"])
         fields["USEFUL_CAPACITY"] = str(config["manifest"]["profile"]["useful_capacity"]) + "U"
+    if config.get("preprepare_receiver_only") is True:
+        fields["PREPREPARE_RECEIVER_ONLY"] = "1"
     if config.get("staged_lead_only") is True:
         fields["STAGED_LEAD_ONLY"] = "1"
     if config.get("prepared_follower_only") is True:
@@ -386,9 +460,11 @@ def _replace(path, content):
         temporary.unlink(missing_ok=True)
 
 
-def generate(journal_path, output_dir, *, staged_lead_only=False, prepared_follower_only=False, compact_receiver_only=False):
+def generate(journal_path, output_dir, *, staged_lead_only=False, prepared_follower_only=False,
+             compact_receiver_only=False, preprepare_receiver_only=False):
     config = recovery_config(journal_path, staged_lead_only=staged_lead_only,
-                             prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only)
+                             prepared_follower_only=prepared_follower_only, compact_receiver_only=compact_receiver_only,
+                             preprepare_receiver_only=preprepare_receiver_only)
     header = render_header(config)
     config["header_sha256"] = hashlib.sha256(header).hexdigest()
     output = Path(output_dir)
@@ -408,12 +484,15 @@ def main(argv=None):
     mode.add_argument("--prepared-follower-only", action="store_true",
                       help="repair only a prepared follower before CAN transfer; its secondary must be absent")
     mode.add_argument("--compact-receiver-only", action="store_true", help="guarded v2 receiver repair before any commit request")
+    mode.add_argument("--preprepare-receiver-only", action="store_true",
+                      help="one legacy v2 receiver that failed before maintenance or secondary preparation")
     parser.add_argument("--output-dir", type=Path,
                         default=Path(__file__).resolve().parents[2] / ".pio" / "ota-recovery-config")
     args = parser.parse_args(argv)
     try:
         config = generate(args.journal, args.output_dir, staged_lead_only=args.staged_lead_only,
-                          prepared_follower_only=args.prepared_follower_only, compact_receiver_only=args.compact_receiver_only)
+                          prepared_follower_only=args.prepared_follower_only, compact_receiver_only=args.compact_receiver_only,
+                          preprepare_receiver_only=args.preprepare_receiver_only)
     except (OSError, ValueError, CampaignError) as error:
         print("Recovery configuration refused: %s" % error, file=sys.stderr)
         return 1

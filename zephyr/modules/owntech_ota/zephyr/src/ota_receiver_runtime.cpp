@@ -154,6 +154,10 @@ extern "C" int ota_runtime_command(const ota_command *cmd,uint8_t source)
     if(!cmd || !cmd->manifest.campaign_id) return OTA_ERR_ARGUMENT;
     if(!ota_service_healthy()) return OTA_ERR_STATE;
     if(source!=cmd->lead_address || cmd->adopt || !memcmp(cmd->lead_eui,eui64,8)) return OTA_ERR_IDENTITY;
+    /* Reject an unsupported receiver before reserving the campaign or entering
+     * the participant worker. A refused PREPARE must not create a FAILED NVS
+     * journal or an ERASE_BEGIN event when storage has never been acquired. */
+    if(cmd->type==OTA_CMD_PREPARE && !ota_storage_receiver_qualified()) return OTA_ERR_COMPATIBILITY;
     Work w{};w.type=COMMAND;w.source=source;w.command=*cmd;
     auto key=k_spin_lock(&snapshot_lock);
     if(atomic_get(&identity_conflict)) {k_spin_unlock(&snapshot_lock,key);return OTA_ERR_IDENTITY;}

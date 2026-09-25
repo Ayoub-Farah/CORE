@@ -39,6 +39,9 @@ def require(condition, message):
 def validate_profile(profile=None):
     result = dict(DEFAULT_PROFILE)
     result.update(profile or {})
+    if "receiver_can_update_enabled" in result:
+        require(type(result["receiver_can_update_enabled"]) is bool,
+                "receiver_can_update_enabled must be a boolean build setting")
     for key in ("slot_size", "useful_capacity", "header_size", "write_alignment",
                 "max_alignment", "max_sectors", "hardware_id", "layout_id", "bootloader_id"):
         require(type(result[key]) is int and 0 < result[key] <= 0xFFFFFFFF,

@@ -28,6 +28,9 @@
 #ifndef OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY
 #define OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY 0
 #endif
+#ifndef OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY
+#define OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY 0
+#endif
 #ifndef OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES
 #define OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES {0}
 #endif
@@ -45,6 +48,11 @@ static_assert(OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY==0 || OWNTECH_OTA_RECOV
 static_assert(!OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY ||
               !(OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY || OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY),
               "compact recovery is separate from legacy policies");
+static_assert(OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY==0 || OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY==1,
+              "explicit preprepare recovery mode must be 0 or 1");
+static_assert(!OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY ||
+              (OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY && OWNTECH_OTA_RECOVERY_TARGET_COUNT==1),
+              "preprepare recovery requires exactly one compact receiver");
 #endif
 
 extern uint8_t dt_leg_count;
@@ -67,7 +75,8 @@ static OtaRecoveryConfig config={OWNTECH_OTA_RECOVERY_CAMPAIGN_ID,
     OWNTECH_OTA_RECOVERY_LEAD_EUI_BYTES,OWNTECH_OTA_RECOVERY_IMAGE_HASH_BYTES,
     OWNTECH_OTA_RECOVERY_IMAGE_SIZE,OWNTECH_OTA_RECOVERY_TARGET_COUNT,{},
     OWNTECH_OTA_RECOVERY_STAGED_LEAD_ONLY!=0,OWNTECH_OTA_RECOVERY_PREPARED_FOLLOWER_ONLY!=0,
-    OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY!=0,OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES};
+    OWNTECH_OTA_RECOVERY_COMPACT_RECEIVER_ONLY!=0,OWNTECH_OTA_RECOVERY_ARTIFACT_HASH_BYTES,
+    OWNTECH_OTA_RECOVERY_PREPREPARE_RECEIVER_ONLY!=0};
 static_assert(sizeof(allowed_euis)/8==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"EUI count");
 static_assert(sizeof(original_hashes)/32==OWNTECH_OTA_RECOVERY_TARGET_COUNT,"hash count");
 static_assert(OWNTECH_OTA_RECOVERY_TARGET_COUNT>0 && OWNTECH_OTA_RECOVERY_TARGET_COUNT<=16,"bounded targets");
@@ -146,6 +155,27 @@ int health(void *)
 }
 bool confirmed(void *) {return boot_is_img_confirmed();}
 int confirm(void *) {return boot_write_img_confirmed();}
+#if !defined(OWNTECH_OTA_TRANSITION) || !OWNTECH_OTA_TRANSITION
+void report_journal_refusal()
+{
+    if(!config.compact_receiver_only) return;
+    /* Read only the OTA local journal; never expose unrelated NVS records.
+     * Repeat after a refusal because USB can attach after the initial result. */
+    uint8_t record[168]={};
+    int length=read_key(nullptr,0x0502,record,sizeof(record));
+    printk("OTA_RECOVERY_DIAG journal_len=%d\n",length);
+    if(length!=int(sizeof(record))) return;
+    const bool crc_ok=le32(record+164)==ota_recovery_crc32(record,164);
+    printk("OTA_RECOVERY_DIAG magic_ok=%d format_ok=%d crc_ok=%d state=%u commit=%u campaign=%08x%08x size=%u protocol=%u class=%u reserved=%u\n",
+        le32(record)==0x324c544f,le16(record+4)==2 && le16(record+6)==168,crc_ok,
+        unsigned(record[24]),unsigned(le32(record+16)),unsigned(le32(record+12)),unsigned(le32(record+8)),
+        unsigned(le32(record+20)),unsigned(record[25]),unsigned(record[26]),unsigned(record[27]));
+    printk("OTA_RECOVERY_DIAG campaign_match=%d size_match=%d lead_match=%d artifact_match=%d image_match=%d\n",
+        le32(record+8)==uint32_t(config.campaign) && le32(record+12)==uint32_t(config.campaign>>32),
+        le32(record+20)==config.image_size,!memcmp(record+28,config.lead_eui,8),
+        !memcmp(record+36,config.artifact_hash,32),!memcmp(record+68,config.image_hash,32));
+}
+#endif
 }
 
 int main(void)
@@ -173,6 +203,7 @@ int main(void)
         printk("OTA_RECOVERY %s rc=%d EUI=%02x%02x%02x%02x%02x%02x%02x%02x confirmed=%d; outputs inhibited\n",
             ota_recovery_result_name(result),result,eui[0],eui[1],eui[2],eui[3],eui[4],eui[5],eui[6],eui[7],
             boot_is_img_confirmed());
+        if(result<0) report_journal_refusal();
 #endif
         k_sleep(K_SECONDS(2));
     }

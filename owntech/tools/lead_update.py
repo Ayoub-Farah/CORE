@@ -29,6 +29,7 @@ class ReceiverStatus:
     def __init__(self, device, timeout=2):
         import serial
         self.port = serial.Serial(device, baudrate=115200, timeout=0.2, write_timeout=0.2)
+        self.device = device
         self.timeout = timeout
         self.last_request = -1e9
 
@@ -42,12 +43,21 @@ class ReceiverStatus:
         if pause > 0:
             time.sleep(pause)
         self.port.reset_input_buffer()
-        self.port.baudrate = 115200
-        self.port.baudrate = 2400
-        self.last_request = time.monotonic()
         deadline = time.monotonic() + self.timeout
+        # A CDC line-coding request can be missed during USB startup. Retry only
+        # silence, within the original response budget and the firmware's rate
+        # limit. Keep queued input so a delayed reply is not discarded.
+        retry_interval = max(0.3, self.timeout / 3)
+        next_request = time.monotonic()
+        attempts = 0
         try:
             while time.monotonic() < deadline:
+                if attempts < 3 and time.monotonic() >= next_request:
+                    self.port.baudrate = 115200
+                    self.port.baudrate = 2400
+                    self.last_request = time.monotonic()
+                    next_request = self.last_request + retry_interval
+                    attempts += 1
                 line = self.port.readline(1025)
                 if len(line) > 1024:
                     raise ProtocolError("receiver status exceeds the bounded response")
@@ -63,7 +73,10 @@ class ReceiverStatus:
                     raise ProtocolError("incompatible receiver status")
                 result["role"] = "lead" if result["image_class"] == "lead" else "follower"
                 return result
-            raise ReceiverProbeTimeout("no OTAR2 status: legacy/bootloader state requires explicit initialization mode")
+            raise ReceiverProbeTimeout(
+                "no OTAR2 status on %s after %d read-only requests; board state is unknown. "
+                "Close Serial Monitor/Scope and retry Check connected board; a timeout does not establish that initialization is needed"
+                % (self.device, attempts))
         finally:
             self.port.baudrate = 115200
 
@@ -591,6 +604,11 @@ class Campaign:
         raise CampaignError("PARTIAL: not every frozen identity returned with the expected healthy, confirmed image")
 
     def run(self):
+        if self.manifest.get("profile", {}).get("receiver_can_update_enabled") is False:
+            raise CampaignError("Receiver artifact was built with CAN updates disabled "
+                                "(CONFIG_OWNTECH_OTA_DEFERRED_ARM_QUALIFIED=n). "
+                                "Build the receiver for the validated bootloader or the explicit OTA test bench; "
+                                "install it over USB before starting a CAN campaign.")
         info = self.probe()
         if info.get("phase") == "WAITING_CAN":
             raise CampaignError("Lead waiting for CAN; connect and power the terminated 500 kbit/s bus "

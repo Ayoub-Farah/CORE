@@ -30,6 +30,8 @@ def _status_text(info):
               ("CAN peer ready", "can_ready"), ("Available", "available"),
               ("Secondary slot available", "slot_available"), ("Version", "version"))
     lines = ["%s: %s" % (label, _display(info.get(key))) for label, key in fields]
+    if "deferred_arm_qualified" in info:
+        lines.append("CAN updates enabled in firmware: " + _display(info["deferred_arm_qualified"]))
     if "error" in info:
         lines.append("Reported error: " + _display(info["error"]))
     rows = None

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "OtaService.h"
+#include "ota_storage.h"
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
@@ -34,12 +35,14 @@ static void status_work(struct k_work *)
         "\"mcuboot_image_hash\":\"%s\",\"active_confirmed\":%s,"
         "\"local_healthy\":%s,\"healthy\":%s,\"can_ready\":%s,\"maintenance\":%s,"
         "\"phase\":\"%s\",\"error\":%d,\"available\":%s,\"slot_available\":%s,"
+        "\"deferred_arm_qualified\":%s,"
         "\"hardware_id\":%u,\"layout_id\":%u,\"bootloader_id\":%u,"
         "\"slot_size\":%u,\"useful_capacity\":%u}\n",
         d.is_lead?"lead":"receiver",identity,o.active_version,o.active_build_id,hash,
         o.confirmed?"true":"false",d.local_healthy?"true":"false",d.healthy?"true":"false",
         d.can_ready?"true":"false",ota_safety_inhibited()?"true":"false",d.phase,d.error,
-        d.healthy&&!d.busy&&!d.error?"true":"false",o.identity.slot_available?"true":"false",
+        d.healthy&&!d.busy&&!d.error&&o.identity.slot_available?"true":"false",o.identity.slot_available?"true":"false",
+        ota_storage_receiver_qualified()?"true":"false",
         o.identity.hardware_id,o.identity.layout_id,o.identity.bootloader_id,
         o.identity.usable_slot_size,o.identity.usable_image_size);
     if(n>0 && (size_t)n<sizeof(output)) (void)uart_fifo_fill(console,(const uint8_t *)output,n);

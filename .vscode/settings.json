@@ -7,5 +7,6 @@
     ".gitignore": true,
     "docs": true,
     ".github": true
-  }
+  },
+  "cmake.sourceDirectory": "C:/Users/afarahhass/Documents/Repo/core/zephyr"
 }

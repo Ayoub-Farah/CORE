@@ -64,7 +64,7 @@ struct ota_identity {
     uint32_t layout_id;
     uint32_t bootloader_id;
     bool active_confirmed;
-    bool slot_available;
+    bool slot_available; /* Can accept a campaign, including receiver build qualification. */
 };
 
 struct ota_status {
@@ -94,7 +94,8 @@ struct ota_status {
  * journal persists campaign/state/commit and maintenance through the existing
  * NVS owner. COMMIT_INTENT is durable before arm requests an MCUboot test swap;
  * COMMITTED is durable only after successful arming. No transfer writes trailer.
- * All callbacks return 0 on success.
+ * All callbacks return 0 on success. prepare returns a negative ota_result on
+ * failure; that diagnosis is published unchanged in the participant status.
  * close releases resources WITHOUT clearing maintenance or erasing an armed slot.
  * schedule_reboot must preserve the first deadline for the same commit.
  */

@@ -232,6 +232,7 @@ extern "C" int ota_storage_test_run()
     bool lead=true; CHECK(!ota_storage_load_role(&lead) && !lead);
     ota_identity identity={};ota_storage_boot_identity(&identity);
     CHECK(identity.protocol_version==2&&identity.image_class==OTA_IMAGE_RECEIVER);
+    CHECK(ota_storage_receiver_qualified()&&identity.slot_available);
     confirmed=false; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased); confirmed=true;
     swap=BOOT_SWAP_TYPE_TEST; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased);
     swap=BOOT_SWAP_TYPE_REVERT; CHECK(ota_storage_stage_begin(&m)==OTA_ERR_STATE && !erased); swap=BOOT_SWAP_TYPE_NONE;
@@ -309,12 +310,25 @@ extern "C" int ota_storage_test_run()
 extern "C" int ota_storage_gate_test_run()
 {
     reset_nv(); reset_ram(); ota_manifest m=artifact(); CHECK(!init_service());
+    CHECK(!ota_storage_receiver_qualified());
+    ota_identity identity{};ota_storage_boot_identity(&identity);
+#if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
+    /* Receiver write qualification must not hide a healthy dedicated Lead. */
+    CHECK(identity.image_class==OTA_IMAGE_LEAD&&identity.slot_available);
+#else
+    CHECK(identity.image_class==OTA_IMAGE_RECEIVER&&!identity.slot_available);
+#endif
     unsigned erase_before=erased, writes_before=nvs_writes;
     CHECK(ota_storage_stage_begin(&m)==OTA_ERR_COMPATIBILITY);
     ota_participant_hooks hooks;ota_storage_hooks(&hooks);
     CHECK(hooks.prepare(nullptr,&m,false)==OTA_ERR_COMPATIBILITY);
     CHECK(hooks.arm(nullptr,&m,77)==OTA_ERR_STATE);
     CHECK(erased==erase_before&&nvs_writes==writes_before&&!armed&&!writer_open);
+    CHECK(!ota_storage_maintenance()&&!ota_storage_recovery_required()&&ota_storage_owner()==OTA_SLOT_NONE);
+    ota_storage_journal refused{};CHECK(!ota_storage_get_journal(&refused)&&!refused.campaign_id);
+    /* A rejected campaign remains absent across power cycles. */
+    reset_ram();CHECK(!init_service()&&!ota_storage_recovery_required()&&!ota_storage_maintenance());
+    CHECK(!ota_storage_get_journal(&refused)&&!refused.campaign_id&&nvs_writes==writes_before);
 #if defined(CONFIG_OWNTECH_OTA_LEAD) && CONFIG_OWNTECH_OTA_LEAD
     ota_target target{};target.identity.eui[7]=2;
     CHECK(!ota_storage_persist_campaign(&m,&target,1,77,OTA_PREPARING));

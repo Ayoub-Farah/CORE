@@ -21,7 +21,7 @@ existing USB bootloader for individual installation.
 |---|---|---|---|
 | Ordinary USB application | OTA v2 receiver or dedicated Lead | [Case A](#case-a--ordinary-usb-application-to-ota-v2) | Correct application integration and known board history |
 | OTA v1 application | OTA v2 | [Case B](#case-b--ota-v1-to-ota-v2) | Resolve legacy campaign metadata first; no automatic v1 migration |
-| OTA v2 receiver or Lead | Ordinary USB application | [Case C](#case-c--ota-v2-back-to-an-ordinary-usb-application) | Complete/reconcile the campaign before replacing the application |
+| OTA v2 receiver or Lead | Ordinary USB application, then OTA v2 again | [Case C](#case-c--ota-v2-back-to-usb-then-back-to-ota-v2) | Complete/reconcile the campaign and retire its metadata with the signed transition helper |
 
 The current build environments have different purposes:
 
@@ -31,6 +31,7 @@ The current build environments have different purposes:
 | `OTA` | This checkout's `src/main.cpp`, minimal v2 receiver profile | Install a receiver over USB; produce future CAN update images |
 | `USB_LEAD` | `owntech/lead/main.cpp`, dedicated v2 Lead profile | Install the coordinator over USB; distribute receiver images from the PC |
 | `OTA_RECOVERY` | A campaign-bound repair application | Repair only an explicitly supported, diagnosed interrupted campaign |
+| `OTA_TRANSITION` | A board-bound terminal-v2 cleanup application | Retire completed OTA metadata for a normal USB round trip |
 
 In v2, the Lead does **not** run the receiver's application and is **not** a CAN
 update target. Reserve a separate board for it. Reusing an application board as
@@ -150,8 +151,9 @@ the [v2 operator guide](../docs/minimal-can-ota.md) for current commands and rol
 | `ota-artifacts/OTA/firmware.mcuboot.bin` | Padded, signed receiver image for individual USB installation |
 | `ota-artifacts/OTA/firmware.can.bin` | Compact, signed receiver image for a v2 CAN campaign |
 | `ota-artifacts/USB_LEAD/firmware.mcuboot.bin` | Padded, signed dedicated Lead image for USB installation |
-| `.pio/build/USB/firmware.mcuboot.bin` | Ordinary USB application's signed installation image |
+| `ota-artifacts/USB/firmware.mcuboot.bin` + `firmware.usb.json` | Ordinary USB image with local build evidence |
 | `ota-artifacts/OTA_RECOVERY/firmware.mcuboot.bin` | Generated repair image for one guarded recovery configuration |
+| `ota-artifacts/OTA_TRANSITION/firmware.mcuboot.bin` | Generated normal-transition image for one board and terminal history |
 
 Keep the associated JSON manifests for OTA artifacts. A `.can.bin` file is not
 the ordinary USB upload file; a `.mcuboot.bin` file is not a v2 CAN campaign
@@ -403,159 +405,100 @@ Section 2.5. If a legacy journal causes `RECOVERY_REQUIRED` or another startup
 failure, stop; repeated uploads do not fix its persistence. Once every board
 is correctly initialized, continue with A5 and A6.
 
-## Case C — OTA v2 back to an ordinary USB application
+## Case C — OTA v2 back to USB, then back to OTA v2
 
-This replaces the selected board's application with the `USB` build. It removes
-the OTA service from that application, but **does not reset the board's OTA
-metadata or replace its bootloader**.
+**A dedicated signed transition helper now supports this normal round trip
+without ST-Link.** Physical BOOT + RESET and the existing USB bootloader are
+used for each installation. The complete procedure is in
+[OTA v2 to ordinary USB, and back](../docs/ota-usb-transition.md), including
+PowerShell commands, per-board archives, interruption handling and the return
+to a different OTA v2 image.
 
-### C1. Finish the existing OTA work
+This complete workflow has not yet been qualified on hardware. The software
+includes host tests for the cleanup transaction and its interrupted mutations;
+those do not establish physical swap/NVS behavior or application safety.
 
-Before disconnecting receivers from the fleet, inspect the Lead and reconcile
-the original journal if a campaign exists. Require successful collective release,
-not merely completed transfer or an `ABORT` response.
+### C1. Finish the current campaign
 
-Read each selected board with `Get-OtaInfo`. Require a known active confirmed
-image, local health, no error and an available slot. For a receiver, also require
-`maintenance: false`. For the Lead, whose SMP response omits that field, require
-`IDLE` or a successfully reconciled `SUCCESS` phase and no unresolved campaign.
-Ensure no unresolved commit, reboot, pending trial or recovery state remains.
-Keep the application in its established safe stopped condition.
+Before disconnecting a receiver, finish/reconcile the original frozen campaign.
+Require all expected images healthy and confirmed, collective release, and the
+Lead's recorded `SUCCESS`. Retain the original full campaign journal and exact
+image artifacts. Prevent a new campaign while converting boards, and convert
+the Lead last when retiring the fleet.
 
-If a v2 campaign failed, only the narrowly scoped **precommit receiver** repair
-is available through `--compact-receiver-only`; it is not a general postcommit
-repair. Follow the [v2 recovery instructions](../docs/minimal-can-ota.md#recovery-and-acceptance-still-requiring-the-bench)
-before continuing. Do not use USB replacement to bypass persistent maintenance.
+The normal transition accepts a successful v2 campaign or a board that has never
+participated in a campaign. `--no-campaign` does not discard history: the helper
+requires the local and fleet records to be absent. An unknown, corrupt, legacy,
+failed or unresolved committed state remains a recovery problem.
 
-Convert receivers individually. If retiring the entire OTA fleet, keep the Lead
-until reconciliation and receiver conversion are complete, then convert it last.
-If retaining an OTA subset, explicitly adjust the next campaign's expected list
-after completing the previous campaign.
+### C2. Capture and prepare the transition
 
-### C2. Build the intended ordinary USB application
+Use `transition_ota_usb.py capture` while the old v2 application is still running.
+Archive the live board info, the exact currently installed source image and
+manifest, and the successful campaign journal when applicable. Then run
+`prepare_ota_transition.py` with that evidence and build `OTA_TRANSITION`.
 
-Check this checkout's `src/main.cpp` again, including when converting a former
-Lead: `USB` builds that application, not `owntech/lead/main.cpp`.
+The generated helper is bound to the board EUI, current image and exact expected
+terminal records. It works with the existing v2 info interface; no preliminary
+upgrade of the installed receiver is required. Archive the generated JSON/header
+pair and helper image/manifest before another operation overwrites build outputs.
 
-```powershell
-& $Pio run -e USB -t mcuboot-image
-Select-String -Path .pio/build/USB/zephyr/.config -Pattern "CONFIG_OWNTECH_OTA"
-```
+### C3. Install the helper and wait for cleanup proof
 
-Check that the resulting configuration does not enable `CONFIG_OWNTECH_OTA=y`
-or `CONFIG_OWNTECH_OTA_RECOVERY=y`. Archive
-`.pio/build/USB/firmware.mcuboot.bin` before another build.
+Enter the existing bootloader with BOOT + RESET. Use the transition tool's
+`install-helper --inspect`, followed by `install-helper --apply` with the same
+archived configuration and board identity. Keep its operation JSONL log.
 
-For the supplied layout, obtain the expected MCUboot image hash locally:
+Once the helper runs, use `receipt` to record its EUI, operation token, successful
+result and confirmation. It inhibits outputs, verifies the terminal metadata,
+persists a resumable intent, confirms itself, then removes only the obsolete
+OTA local/fleet/maintenance records. It removes its operation marker last.
+Calibration, role and other NVS records are retained.
 
-```powershell
-@'
-import sys
-from pathlib import Path
-sys.path.insert(0, "owntech/scripts")
-from ota_artifact import inspect_usb_image
-info = inspect_usb_image(Path(".pio/build/USB/firmware.mcuboot.bin").read_bytes())
-print("Expected MCUboot image hash:", info["mcuboot_image_hash"])
-print("Expected version:", info["version"])
-'@ | & $Python -
-```
+**Do not install USB until the tool reports `CLEANUP_CONFIRMED`.** An upload
+percentage or `RESET_REQUESTED` result is not proof that cleanup completed.
+This policy is separate from `OTA_RECOVERY` and `--compact-receiver-only`.
 
-This checks the padded image structure/internal hash; it does not certify
-cryptographic signature acceptance. The bootloader checks the signature. The
-MCUboot image hash differs from the whole-file hash printed by `Get-FileHash`.
+### C4. Install and use the ordinary USB application
 
-### C3. Enter the existing bootloader and inspect it
+Build `USB`, checking this checkout's actual `src/main.cpp`, and retain its
+`firmware.mcuboot.bin` and generated `firmware.usb.json`. The manifest records
+that the local build disables OTA/recovery and contains ordinary Core's image
+confirmation function.
 
-Connect only the selected board and use physical entry below. Re-enumerate its
-USB serial and port, then bind MCUmgr to the verified **current bootloader port**:
+Enter the bootloader from the helper. Use `install-usb --inspect`, then
+`install-usb --apply`, passing the cleanup receipt and exact USB artifacts.
+Allow the ordinary application to start and confirm itself. Re-enter the
+bootloader and use `verify-usb --apply` to record the confirmed image and return
+with one reset to normal USB execution.
 
-```powershell
-& $Pio device list
-$BootPort = "COM_PORT_OF_THE_SELECTED_BOARD"
-$BootConnection = "dev=$BootPort,baud=115200,mtu=128"
-& $Mcumgr --conntype serial --connstring $BootConnection image list
-```
+Ordinary USB development can continue without another helper. After installing
+a different USB build, archive its exact image/manifest, and run `verify-usb`
+again with those files and the same operation log before returning to OTA.
+Do not substitute a previous USB image's hash or manifest.
 
-Before uploading, require the known active primary image to be confirmed, with
-no pending/in-progress swap or unexplained image state. An old nonpending backup
-is not itself an active campaign. An empty image list, missing primary,
-unconfirmed active image or unexpected hash requires diagnosis; do not erase or
-force-confirm anything to make the upload proceed.
+### C5. Return to OTA v2
 
-### C4. Upload, inspect, then reset
+Build/archive the intended new `OTA` receiver or `USB_LEAD` image and manifest.
+Use the **padded USB artifact**, not `firmware.can.bin`. Enter the bootloader
+physically and use `return-ota --inspect`, then `return-ota --apply`, with the
+same operation archive, cleanup receipt and log plus the currently verified USB
+and new OTA artifacts. After boot, run `verify-ota` against the live application.
 
-Upload the ordinary USB image:
+The returned image may have a different hash/version/build ID from the previous
+OTA image: the obsolete journal has already been retired. Require the intended
+EUI/class/hash, local health, confirmation and no maintenance, then reconnect
+CAN and verify readiness. The deferred-arm qualification and application health
+requirements still apply before another CAN campaign.
 
-```powershell
-& $Mcumgr --conntype serial --connstring $BootConnection image upload .pio/build/USB/firmware.mcuboot.bin
-```
+For a later OTA-to-USB conversion, start a new operation from the then-current
+image and campaign evidence. An old cleanup receipt is not authorization to
+forget a subsequent campaign.
 
-Wait for a successful complete transfer. If it errors, stalls at `0%`, or is
-interrupted, stop and inspect the board. Do not send the reset below after a
-failed upload.
-
-Read the image state again:
-
-```powershell
-& $Mcumgr --conntype serial --connstring $BootConnection image list
-```
-
-Verify that the primary is still the original confirmed image and that the
-secondary is the exact new USB image, with the MCUboot hash computed in C2.
-For the bootloader/profile used here, expect:
-
-| Slot | Image | Required state after upload |
-|---|---|---|
-| 0 | Original active image | `active=true`, `confirmed=true`, `pending=false` |
-| 1 | Exact new USB image | `active=false`, `confirmed=false`, `pending=true` |
-
-This is a test upgrade; `permanent=true` is not required. If the identity and
-state checks pass, request one reset:
-
-```powershell
-& $Mcumgr --conntype serial --connstring $BootConnection reset
-```
-
-Wait for the normal USB application to start. Verify its expected console and
-application behavior while the power stage remains safely stopped. Ordinary USB
-Core attempts local image confirmation; it does not run the OTA health contract.
-For a recorded confirmation check, allow startup to finish, re-enter the
-bootloader physically, reselect the current port, and verify that the new image
-is the confirmed primary with no unresolved pending upgrade before normal boot.
-Then release BOOT and request one more reset on the verified bootloader port,
-or press RESET with BOOT released, to start the ordinary application again.
-
-The board now runs the ordinary USB application and is no longer a v2 CAN
-receiver. Do not expect `OTAR2` status or OTA campaign admission from that image.
-
-### C5. Understand the remaining history
-
-USB replacement leaves NVS metadata in place, including journals retained after
-a successful OTA campaign. Returning to OTA later is therefore **not** always
-a fresh Case A installation: a different active hash or a stale fleet record
-may trigger recovery/health checks. Retain the last campaign journal and exact
-artifacts; a general metadata-reset/migration workflow is not provided here.
-
-### Optional: the ordinary PlatformIO USB upload task
-
-For a known idle, confirmed board with a qualified working 1200-baud maintenance
-entry path, the existing convenience command is:
-
-```powershell
-& $Pio run -e USB -t upload
-```
-
-It builds, touches 1200 baud, uploads and resets. It does **not** perform the v2
-identity/campaign preflight described above, and its legacy board selection can
-fall back to another connected board. Connect only the intended board and verify
-its identity first. The legacy script reads `board_id` from `[env]`, not the OTA
-`custom_ota_serial` setting; do not treat it as the guarded OTA selector.
-
-A busy/inhibited v2 application or a failed maintenance callback can reject
-1200-baud entry. The legacy upload script does not prove that the bootloader
-has actually taken over. If entry fails, do not repeat it or send SMP commands
-to a still-running minimal receiver console; use C3 after resolving its state.
-`provision_ota.py` is not an installer for a non-OTA `USB` image.
+Follow the [full command walkthrough](../docs/ota-usb-transition.md) rather than
+using raw MCUmgr uploads or the legacy `pio run -e USB -t upload` task for the
+initial mode change. Those upload paths do not retire OTA metadata. Never erase
+all NVS, force image confirmation or use repeated resets to bypass a refusal.
 
 ## Physical entry into the existing bootloader
 
@@ -630,8 +573,9 @@ does not initiate a revert; it belongs only to the separately proven v1 case
 described in the recovery guide. Do not add it to a precommit receiver repair.
 
 The recovery application intentionally requires physical BOOT + RESET for its
-next replacement. Install the intended final receiver/Lead via B4, or build and
-install the intended ordinary USB application via C2–C4 after recovery succeeds.
+next replacement. Install the intended final receiver/Lead via B4. Case C starts
+from a confirmed live v2 application with captured identity and known history;
+its transition tool does not treat a legacy repair image as that source.
 
 ## Quick troubleshooting
 
@@ -644,12 +588,13 @@ install the intended ordinary USB application via C2–C4 after recovery succeed
 | Different class or image already installed | Verify the board's intended role and history; normal initialization intentionally refuses replacement |
 | Receiver `--status` fails after reading `info` | Use the `Get-OtaInfo` helper; fleet `--status` is for the dedicated Lead |
 | Empty image list, `EBADSTATE`, repeated `0%`, unknown pending state | Preserve logs and diagnose the boot state; do not force confirmation, erase NVS or reset blindly |
-| `RECOVERY_REQUIRED` after v1 replacement or a USB round trip | Existing metadata may conflict with the new image; repeated flashing is not a metadata migration |
+| `RECOVERY_REQUIRED` after v1 replacement or an unprepared USB round trip | Existing metadata may conflict with the new image; repeated flashing is not a metadata migration; normal v2 round trips use Case C before USB installation |
 | Lead absent from the expected v2 targets | Correct: it is the coordinator, not a receiver target |
 
 ## References in this checkout
 
 - [Current v2 operator guide](../docs/minimal-can-ota.md)
+- [Normal USB round-trip commands](../docs/ota-usb-transition.md)
 - [Software validation and qualification limits](../docs/minimal-can-ota-validation.md)
 - [Legacy campaign recovery evidence and procedures](../docs/ota-recovery.md)
 - [USB provisioning implementation](../owntech/tools/provision_ota.py)

@@ -11,6 +11,12 @@ override selects this directory. ThingSet node C remains separately pinned at
 
 ## Changes
 
+- `THINGSET_CAN_CLIENT=n` removes client TX storage, request transaction and
+  deadline timer. Receiver-only builds retain bounded server replies, claims
+  and report reception. A request with a client callback returns `-ENOTSUP`.
+  The OTA adapter likewise compiles its request codec and response buffer only
+  into the dedicated Lead build.
+
 - Client ISO-TP requests retain their transaction until response, correlated RX
   error, TX failure, or deadline. A spinlock protects the single terminal callback.
   Request payloads and server responses use separate bounded buffers, retained
@@ -54,7 +60,9 @@ oversized RX, server buffer ownership, request peer scope, reassembly loss and
 recovery, staggered/prolonged pool expiry and return to idle, sequence wrapping, overflow, TX error/late completion,
 fragmentation, padding, claims and discovery probes. Startup tests exercise
 driver start before peer wait, late callback registration/reentrancy, and driver,
-filter, ISO-TP and timeout failures. It is a deterministic
+filter, ISO-TP and timeout failures. A third receiver-only build verifies
+client rejection, owned server reply lifetime, unsolicited-response rejection
+and idle timers without compiling any client fields. It is a deterministic
 transport regression test, not proof of interrupt scheduling or hardware timing.
 
 Run `python tests/ota/sdk_fork_test.py` to verify the normalized-source SHA-256

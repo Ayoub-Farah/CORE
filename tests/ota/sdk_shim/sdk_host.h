@@ -12,6 +12,9 @@
 /* Windows CRT assert can open a blocking GUI dialog in unattended CI. */
 #undef assert
 #define assert(x) do { if (!(x)) { fprintf(stderr,"%s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
+#ifndef OWNTECH_RECEIVER_TRANSPORT_TEST
+#define CONFIG_THINGSET_CAN_CLIENT 1
+#endif
 #define CONFIG_THINGSET_CAN_MULTIPLE_INSTANCES 1
 #define CONFIG_THINGSET_CAN_REPORT_RX 1
 #define CONFIG_THINGSET_CAN_ROUTING_BUSES 1

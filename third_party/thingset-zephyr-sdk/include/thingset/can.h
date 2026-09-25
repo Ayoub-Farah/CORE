@@ -288,10 +288,14 @@ struct thingset_can
     struct k_spinlock report_state_lock;
     bool report_tx_pending;
     int report_tx_error;
+ #ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can_tx_context client_tx;
+ #endif
     struct thingset_can_tx_context server_tx;
     struct k_event events;
+ #ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can_request_response request_response;
+ #endif
     struct k_spinlock request_context_lock;
     k_tid_t request_thread;
     uint8_t request_source;

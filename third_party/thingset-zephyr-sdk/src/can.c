@@ -534,6 +534,7 @@ static void thingset_can_control_reporting_handler(struct k_work *work)
 /* The timer, RX path and TX error path compete for one terminal callback.
  * Retain the transaction semaphore until the callback returns: its bytes and
  * argument cannot be overwritten by a request launched from another thread. */
+#ifdef CONFIG_THINGSET_CAN_CLIENT
 static bool thingset_can_finish_request(struct thingset_can_request_response *rr,
                                        uint32_t generation, uint32_t can_id, uint8_t *data,
                                        size_t length, int send_error, int receive_error)
@@ -554,6 +555,8 @@ static bool thingset_can_finish_request(struct thingset_can_request_response *rr
     k_sem_give(&rr->sem);
     return true;
 }
+
+#endif
 
 /* ISO-TP status values are not errno values. */
 static int thingset_can_isotp_error(int error)
@@ -590,6 +593,7 @@ static struct isotp_fast_addr thingset_can_get_tx_addr(const struct isotp_fast_a
     };
 }
 
+#ifdef CONFIG_THINGSET_CAN_CLIENT
 static void thingset_can_reqresp_timeout_handler(struct k_timer *timer)
 {
     struct thingset_can_request_response *rr =
@@ -605,6 +609,8 @@ static void thingset_can_reqresp_timeout_handler(struct k_timer *timer)
         thingset_can_finish_request(rr, generation, can_id, NULL, 0, 0, -ETIMEDOUT);
     }
 }
+
+#endif
 
 int thingset_can_send_inst(struct thingset_can *ts_can, uint8_t *tx_buf, size_t tx_len,
                            uint8_t target_addr, uint8_t route,
@@ -642,17 +648,26 @@ int thingset_can_send_inst(struct thingset_can *ts_can, uint8_t *tx_buf, size_t 
                   | THINGSET_CAN_SOURCE_SET(ts_can->node_addr)
                   | THINGSET_CAN_TARGET_SET(target_addr),
     };
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can_request_response *rr = &ts_can->request_response;
-    struct thingset_can_tx_context *tx = callback != NULL ? &ts_can->client_tx
-                                                        : &ts_can->server_tx;
+    struct thingset_can_tx_context *tx = callback != NULL ? &ts_can->client_tx : &ts_can->server_tx;
+#else
+    if (callback != NULL) return -ENOTSUP;
+    (void)callback_arg;
+    struct thingset_can_tx_context *tx = &ts_can->server_tx;
+#endif
     k_timepoint_t end = sys_timepoint_calc(timeout);
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     if (callback != NULL && k_sem_take(&rr->sem, sys_timepoint_timeout(end)) != 0) {
         return -ETIMEDOUT;
     }
+#endif
     if (k_sem_take(&tx->sem, sys_timepoint_timeout(end)) != 0) {
+#ifdef CONFIG_THINGSET_CAN_CLIENT
         if (callback != NULL) {
             k_sem_give(&rr->sem);
         }
+#endif
         return -EBUSY;
     }
     memcpy(tx->data, tx_buf, tx_len);
@@ -662,6 +677,7 @@ int thingset_can_send_inst(struct thingset_can *ts_can, uint8_t *tx_buf, size_t 
     tx->completed = false;
     tx->released = false;
     k_spin_unlock(&tx->lock, key);
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     if (callback != NULL) {
         key = k_spin_lock(&rr->lock);
         tx->generation = ++rr->generation;
@@ -673,12 +689,15 @@ int thingset_can_send_inst(struct thingset_can *ts_can, uint8_t *tx_buf, size_t 
         k_timer_start(&rr->timer, remaining, K_NO_WAIT);
         k_spin_unlock(&rr->lock, key);
     }
+#endif
     int result = isotp_fast_send(&ts_can->ctx, tx->data, tx_len, tx_addr, tx);
     int error = thingset_can_isotp_error(result);
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     if (error != 0 && callback != NULL) {
         thingset_can_finish_request(rr, tx->generation, thingset_can_get_tx_addr(&tx_addr).ext_id,
                                    NULL, 0, error, 0);
     }
+#endif
     key = k_spin_lock(&tx->lock);
     tx->submitting = false;
     /* Immediate failure schedules no asynchronous callback. A synchronous SF
@@ -698,37 +717,48 @@ static void thingset_can_reqresp_recv_callback(struct net_buf *buffer, int rem_l
                                                struct isotp_fast_addr addr, void *arg)
 {
     struct thingset_can *ts_can = arg;
+    k_spinlock_key_t key;
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can_request_response *rr = &ts_can->request_response;
-    k_spinlock_key_t key = k_spin_lock(&rr->lock);
+    key = k_spin_lock(&rr->lock);
     uint32_t generation = rr->generation;
     bool response = rr->callback != NULL && rr->can_id == addr.ext_id;
     k_spin_unlock(&rr->lock, key);
+#endif
     if (rem_len != 0 || buffer == NULL) {
+#ifdef CONFIG_THINGSET_CAN_CLIENT
         if (response) {
             thingset_can_finish_request(rr, generation, addr.ext_id, NULL, 0, 0,
                                        rem_len < 0 ? thingset_can_isotp_error(rem_len) : -EMSGSIZE);
         }
+#endif
         return;
     }
     size_t length = net_buf_frags_len(buffer);
     if (length == 0 || length > sizeof(ts_can->rx_buffer)) {
+#ifdef CONFIG_THINGSET_CAN_CLIENT
         if (response) {
             thingset_can_finish_request(rr, generation, addr.ext_id, NULL, 0, 0, -EMSGSIZE);
         }
+#endif
         return;
     }
     size_t copied = net_buf_linearize(ts_can->rx_buffer, sizeof(ts_can->rx_buffer), buffer, 0,
                                      length);
     if (copied != length) {
+#ifdef CONFIG_THINGSET_CAN_CLIENT
         if (response) {
             thingset_can_finish_request(rr, generation, addr.ext_id, NULL, 0, 0, -EMSGSIZE);
         }
+#endif
         return;
     }
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     if (response) {
         thingset_can_finish_request(rr, generation, addr.ext_id, ts_can->rx_buffer, length, 0, 0);
         return;
     }
+#endif
     /* Binary response codes are >= 0x80. Never process an unsolicited/late
      * response as a command, even when another peer is currently being polled. */
     if (ts_can->rx_buffer[0] >= 0x80 || ts_can->rx_buffer[0] == ':') {
@@ -768,6 +798,7 @@ static void thingset_can_reqresp_recv_callback(struct net_buf *buffer, int rem_l
 static void thingset_can_reqresp_recv_error_callback(int8_t error, struct isotp_fast_addr addr,
                                                      void *arg)
 {
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can *ts_can = arg;
     struct thingset_can_request_response *rr = &ts_can->request_response;
     k_spinlock_key_t key = k_spin_lock(&rr->lock);
@@ -775,20 +806,28 @@ static void thingset_can_reqresp_recv_error_callback(int8_t error, struct isotp_
     k_spin_unlock(&rr->lock, key);
     thingset_can_finish_request(rr, generation, addr.ext_id, NULL, 0, 0,
                                thingset_can_isotp_error(error));
+#else
+    (void)error; (void)addr; (void)arg;
+#endif
 }
 
 static void thingset_can_reqresp_sent_callback(int result, void *arg)
 {
     struct thingset_can_tx_context *tx = arg;
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     struct thingset_can_request_response *rr = &tx->owner->request_response;
+#endif
     k_spinlock_key_t key = k_spin_lock(&tx->lock);
     if (tx->callback_seen) {
         k_spin_unlock(&tx->lock, key);
         return;
     }
     tx->callback_seen = true;
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     uint32_t generation = tx->generation;
+#endif
     k_spin_unlock(&tx->lock, key);
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     if (tx->client && result != ISOTP_N_OK) {
         key = k_spin_lock(&rr->lock);
         uint32_t can_id = rr->can_id;
@@ -796,6 +835,9 @@ static void thingset_can_reqresp_sent_callback(int result, void *arg)
         thingset_can_finish_request(rr, generation, can_id, NULL, 0,
                                    thingset_can_isotp_error(result), 0);
     }
+#else
+    (void)result;
+#endif
     /* Successful TX is not a response. Keep the request and its timer alive. */
     key = k_spin_lock(&tx->lock);
     tx->completed = true;
@@ -864,14 +906,18 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
         return thingset_can_startup_failed(ts_can, -ENODEV);
     }
 
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     k_sem_init(&ts_can->request_response.sem, 1, 1);
     k_timer_init(&ts_can->request_response.timer, thingset_can_reqresp_timeout_handler, NULL);
-    k_mutex_init(&ts_can->report_lock);
     ts_can->client_tx.owner = ts_can;
     ts_can->client_tx.client = true;
+#endif
+    k_mutex_init(&ts_can->report_lock);
     ts_can->server_tx.owner = ts_can;
     ts_can->server_tx.client = false;
+#ifdef CONFIG_THINGSET_CAN_CLIENT
     k_sem_init(&ts_can->client_tx.sem, 1, 1);
+#endif
     k_sem_init(&ts_can->server_tx.sem, 1, 1);
     k_sem_init(&ts_can->report_tx_sem, 0, 1);
     k_timer_init(&ts_can->timeout_timer, thingset_can_timeout_timer_expired, NULL);

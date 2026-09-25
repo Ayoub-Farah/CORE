@@ -12,6 +12,13 @@ menuconfig THINGSET_CAN
 
 if THINGSET_CAN
 
+config THINGSET_CAN_CLIENT
+	bool "Initiate ThingSet CAN request/response exchanges"
+	default y
+	help
+	  Disable for receiver-only devices. Server replies, address claims and
+	  report reception remain available without client TX storage or timers.
+
 config THINGSET_CAN_ALLOW_ADDRESS_WRITE
 	bool "Allow remote writes of the local CAN address"
 	default y

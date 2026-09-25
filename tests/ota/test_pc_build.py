@@ -124,6 +124,8 @@ class BuildTests(unittest.TestCase):
             build = project / ".pio" / "build" / "USB_LEAD"
             build.mkdir(parents=True)
             env = Environment(build, project)
+            original_get = env.get
+            env.get = lambda key, default=None: "lead" if key == "OWNTECH_OTA_IMAGE_CLASS" else original_get(key, default)
             script = ModuleType("SCons.Script")
             script.COMMAND_LINE_TARGETS = ["mcuboot-image"]
             with patch.dict(sys.modules, {"SCons": ModuleType("SCons"), "SCons.Script": script}):
@@ -133,12 +135,12 @@ class BuildTests(unittest.TestCase):
             target, post = env.post[0]
             self.assertEqual(target, env.Alias("mcuboot-image"))
             image = build / "firmware.mcuboot.bin"
-            image.write_bytes(artifact())
+            image.write_bytes(artifact(image_class="lead"))
             (build / "CMakeCache.txt").write_text("PYTHON_EXECUTABLE:FILEPATH=" + sys.executable + "\n")
             def sign_compact(args, **kwargs):
                 self.assertNotIn("--pad", args)
                 self.assertTrue(args[-2].endswith("firmware.bin"))
-                Path(args[-1]).write_bytes(artifact(compact=True))
+                Path(args[-1]).write_bytes(artifact(compact=True, image_class="lead"))
             with redirect_stdout(io.StringIO()), patch("ota_pio.subprocess.run", side_effect=sign_compact):
                 self.assertEqual(post([], [image], env), 0)
             manifest = json.loads(image.with_suffix(".json").read_text())
@@ -151,12 +153,17 @@ class BuildTests(unittest.TestCase):
             self.assertNotIn(build, snapshot.parents)
             self.assertEqual(snapshot.read_bytes(), image.read_bytes())
             self.assertEqual(snapshot.with_suffix(".json").read_bytes(), image.with_suffix(".json").read_bytes())
+            history = project / "ota-artifacts/history/USB_LEAD"
+            self.assertEqual((history / manifest["artifact_sha256"] / "firmware.bin").read_bytes(), image.read_bytes())
+            compact = build / "firmware.can.bin"
+            compact_manifest = json.loads(compact.with_suffix(".json").read_text())
+            self.assertEqual((history / compact_manifest["artifact_sha256"] / "firmware.bin").read_bytes(), compact.read_bytes())
             data = bytearray(image.read_bytes())
             data[200000] = 0
             image.write_bytes(data)
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(post([], [image], env), 1)
-            self.assertEqual(snapshot.read_bytes(), artifact())
+            self.assertEqual(snapshot.read_bytes(), artifact(image_class="lead"))
 
     def test_provision_hook_uses_generated_identity_and_only_custom_application_upload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -205,23 +212,16 @@ class BuildTests(unittest.TestCase):
                                        init_globals={"env": env, "Import": lambda name: None})
                     self.assertEqual(script.COMMAND_LINE_TARGETS, ["mcuboot-image", "ota_init"])
                     task = env.tasks["ota_init"]
-                    self.assertEqual(task["title"], "Initialize board over USB")
+                    self.assertEqual(task["title"], "Initialize over USB")
                     self.assertEqual(task["dependencies"], env.Alias("mcuboot-image"))
                     self.assertTrue(task["always_build"])
                     self.assertEqual(len(env.post), 1)
-                    with patch("provision_ota.main", return_value=0) as provision, patch("lead_update.main") as campaign:
+                    with patch("ota_gui_tasks.run_workflow", return_value=0) as wizard, \
+                            patch("provision_ota.main") as provision, patch("lead_update.main") as campaign:
                         self.assertEqual(task["actions"][0]([], [], env), 0)
+                    wizard.assert_called_once_with(env, "initialize")
+                    provision.assert_not_called()
                     campaign.assert_not_called()
-                    args = provision.call_args.args[0]
-                    self.assertIn("--legacy-console", args)
-                    for flag, value in (("--serial", "selected-serial"), ("--port", "COM17"),
-                                        ("--mcumgr", "existing-mcumgr"), ("--timeout", "42"),
-                                        ("--version", "1.2.3+4"), ("--build-id", "build-test"),
-                                        ("--image", str(env.build) + "/firmware.mcuboot.bin")):
-                        self.assertEqual(args[args.index(flag) + 1], value)
-                    self.assertNotIn("--expected-count", args)
-                    self.assertNotIn("--expected-id", args)
-                    self.assertNotIn("--receiver-absent", args)
 
     def test_real_scons_resolves_final_image_and_validates_before_usb_actions(self):
         # Exercise the actual Alias/AddPostAction semantics without invoking
@@ -278,8 +278,13 @@ def usb_stub(args):
     return 0
 import provision_ota
 import lead_update
+import ota_gui_tasks
 provision_ota.main = usb_stub
 lead_update.main = usb_stub
+def initialize_stub(env, action):
+    assert action == "initialize"
+    return usb_stub(["--image", env.subst("$BUILD_DIR/${PROGNAME}.mcuboot.bin")])
+ota_gui_tasks.run_workflow = initialize_stub
 runpy.run_path(str(root / "owntech/scripts" / HOOK), init_globals={"env": env, "Import": lambda name: None})
 assert "mcuboot-image" in COMMAND_LINE_TARGETS
 env.Replace(PROGNAME="release-payload")
@@ -309,7 +314,7 @@ if REQUESTED == "upload":
                     self.assertEqual((project / "order.txt").read_text(), "signed\nverified USB action\n")
                 self.assertFalse((project / "build/program.mcuboot.bin").exists())
 
-    def test_fleet_task_builds_receiver_and_never_invokes_lead_upload(self):
+    def test_fleet_task_opens_assistant_before_any_build_or_upload(self):
         with tempfile.TemporaryDirectory() as directory:
             env = Environment(Path(directory) / "build", ROOT)
             script = ModuleType("SCons.Script")
@@ -319,13 +324,16 @@ if REQUESTED == "upload":
                                init_globals={"env": env, "Import": lambda _: None})
             task = env.tasks["lead_update"]
             self.assertEqual(task["dependencies"], [])
-            with patch("subprocess.run") as build, patch("lead_update.main", return_value=0) as campaign:
+            with patch("ota_pio.platform.system", return_value="Windows"), \
+                    patch("ota_gui_tasks.gui_python", return_value=sys.executable), \
+                    patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as wizard, \
+                    patch("lead_update.main") as campaign:
                 self.assertEqual(task["actions"][0]([], [], env), 0)
-            args = build.call_args.args[0]
-            self.assertEqual(args[-4:], ["-e", "OTA", "-t", "mcuboot-image"])
+            args = wizard.call_args.args[0]
+            self.assertEqual(args[:3], [sys.executable, str(ROOT / "owntech/tools/ota_workflow.py"), "can-update"])
+            self.assertNotIn("mcuboot-image", args)
             self.assertNotIn("upload", args)
-            self.assertEqual(campaign.call_args.args[0][:2],
-                             ["--image", str(ROOT / "ota-artifacts/OTA/firmware.can.bin")])
+            campaign.assert_not_called()
 
     def test_ota_identity_hook_is_required_instead_of_silent_manual_fallback(self):
         from ota_pio import artifact_options

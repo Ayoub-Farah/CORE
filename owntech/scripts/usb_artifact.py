@@ -14,6 +14,7 @@ import subprocess
 
 from ota_artifact import PROTECTED_TLV_MAGIC, _tlvs, inspect_usb_image, require
 from ota_pio import artifact_options
+from ota_archive import archive_build
 
 
 def inspect_plain_usb(data, profile=None, version=None, build_id=None):
@@ -93,6 +94,7 @@ def usb_artifact_post_action(source, target, env):
         profile, _, _, build_id = artifact_options(env)
         manifest = inspect_plain_usb(data, profile, build_id=build_id)
         manifest.update(filename=image_path.name, build_proof=proof)
+        archive_build(project, data, manifest, "USB")
         content = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         manifest_name = env.subst("${PROGNAME}.usb.json")
         (build / manifest_name).write_text(content, encoding="utf-8")

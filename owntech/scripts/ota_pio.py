@@ -5,6 +5,7 @@ import platform
 import subprocess
 import shlex
 import sys
+from ota_archive import archive_build
 
 
 def signing_python(build):
@@ -72,6 +73,8 @@ def artifact_post_action(source, target, env):
             raise ValueError("cannot resolve a safe PlatformIO environment for the OTA snapshot")
         snapshots = Path(env.subst("$PROJECT_DIR")) / "ota-artifacts" / environment
         snapshots.mkdir(parents=True, exist_ok=True)
+        if environment in ("OTA", "USB_LEAD"):
+            archive_build(Path(env.subst("$PROJECT_DIR")), artifact, manifest, environment)
         # Copy the bytes already inspected, never reread a concurrently changed
         # build output. This directory survives PlatformIO clean_build_dir().
         (snapshots / image.name).write_bytes(artifact)
@@ -98,6 +101,7 @@ def artifact_post_action(source, target, env):
                 raise ValueError("USB and CAN artifacts do not describe the same application")
             compact_manifest["filename"] = compact.name
             compact_json = json.dumps(compact_manifest, indent=2, sort_keys=True) + "\n"
+            archive_build(Path(env.subst("$PROJECT_DIR")), compact_data, compact_manifest, environment)
             compact.with_suffix(".json").write_text(compact_json, encoding="utf-8")
             (snapshots / compact.name).write_bytes(compact_data)
             (snapshots / compact.with_suffix(".json").name).write_text(compact_json, encoding="utf-8")
@@ -145,7 +149,8 @@ def provision_action(source, target, env, legacy_console=False):
 
 
 def usb_init_action(source, target, env):
-    return provision_action(source, target, env, legacy_console=True)
+    from ota_gui_tasks import run_workflow
+    return run_workflow(env, "initialize")
 
 
 def register_artifact_validation(env):
@@ -156,7 +161,7 @@ def register_artifact_validation(env):
 
 
 def register_usb_init(env):
-    """The explicit target authorizes legacy entry; ordinary upload stays unchanged."""
+    """Build the signed snapshot before the assistant selects and initializes a board."""
     from SCons.Script import COMMAND_LINE_TARGETS
     if "ota_init" in COMMAND_LINE_TARGETS and "mcuboot-image" not in COMMAND_LINE_TARGETS:
         COMMAND_LINE_TARGETS.insert(0, "mcuboot-image")
@@ -164,7 +169,7 @@ def register_usb_init(env):
         name="ota_init",
         dependencies=env.Alias("mcuboot-image"),
         actions=[env.VerboseAction(usb_init_action, "Initializing the selected board over USB")],
-        title="Initialize board over USB",
-        description="Build/sign and initialize one legacy single-CDC board without a CAN campaign",
+        title="Initialize over USB",
+        description="Build/sign, select one board and initialize its OTA application over USB",
         always_build=True,
     )

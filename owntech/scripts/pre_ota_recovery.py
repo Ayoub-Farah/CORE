@@ -11,6 +11,21 @@ Import("env")
 
 project = Path(env.subst("$PROJECT_DIR"))
 transition = env.subst("$PIOENV") == "OTA_TRANSITION"
+# VS Code queries every environment's metadata before any scoped operation
+# exists. Export the utility's build task without configuring CMake or creating
+# placeholder guards. Actual build/upload invocations still pass every guard
+# below; this early exit applies only to PlatformIO's metadata request.
+if getattr(env, "IsIntegrationDump", lambda: False)():
+    env.AddPlatformTarget(name="mcuboot-image", dependencies=[], actions=[],
+                          title="Generate MCUboot Image",
+                          description="Prepare a scoped OwnTech operation before building this utility",
+                          always_build=False)
+    data = env.DumpIntegrationData(env)
+    path = Path(env.subst("$BUILD_DIR")) / "idedata.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    print("\n" + json.dumps(data) + "\n")
+    env.Exit(0)
 config = project / env.GetProjectOption("custom_ota_recovery_config", ".pio/ota-recovery-config")
 if not (config / "owntech_ota_recovery_config.h").is_file():
     raise ValueError("Generate the scoped configuration with prepare_ota_transition.py or prepare_ota_recovery.py first")

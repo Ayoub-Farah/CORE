@@ -819,6 +819,30 @@ class ProvisionTests(unittest.TestCase):
                 self.assertEqual(main(["--image", str(image), "--image-class", "receiver", "--mcumgr", "unused"]), 1)
                 connect.assert_not_called()
 
+    def test_gui_gets_validated_result_and_closes_transport_while_cli_still_returns_zero(self):
+        self.waiting_can()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "firmware.mcuboot.bin"
+            image.write_bytes(artifact())
+            args = ["--image", str(image), "--image-class", "receiver", "--build-id",
+                    "ota-current", "--mcumgr", "unused", "--bootloader"]
+            for return_result in (True, False):
+                with self.subTest(return_result=return_result):
+                    self.receiver.close = Mock()
+                    self.receiver.calls.clear()
+                    with patch("provision_ota.USBConnection", return_value=self.connection), \
+                         redirect_stdout(io.StringIO()):
+                        result = main(args, **({"return_result": True} if return_result else {}))
+                    if return_result:
+                        self.assertEqual(result, {"result": "PROVISIONED", "usb_serial": "physical-one",
+                                                  "can_status": "WAITING_FOR_PEER", "info": self.info})
+                        self.assertTrue(result["info"]["active_confirmed"])
+                        self.assertTrue(result["info"]["local_healthy"])
+                    else:
+                        self.assertEqual(result, 0)
+                    self.assertEqual(self.receiver.calls, [("info", {})])
+                    self.receiver.close.assert_called_once_with()
+
     def test_cli_upload_snapshot_survives_concurrent_artifact_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "firmware.mcuboot.bin"

@@ -167,7 +167,7 @@ def provision(connection, image, manifest, mcumgr, timeout=30, clock=time.monoto
     return result
 
 
-def main(argv=None, *, raise_errors=False):
+def main(argv=None, *, raise_errors=False, return_result=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--profile", type=Path)
@@ -196,9 +196,9 @@ def main(argv=None, *, raise_errors=False):
             image = Path(temporary) / args.image.name
             image.write_bytes(artifact)
             connection = USBConnection(args.serial, args.port, timeout=args.timeout)
-            provision(connection, image, manifest, args.mcumgr, timeout=args.timeout,
-                      legacy_console=args.legacy_console, bootloader=args.bootloader)
-        return 0
+            result = provision(connection, image, manifest, args.mcumgr, timeout=args.timeout,
+                               legacy_console=args.legacy_console, bootloader=args.bootloader)
+        return result if return_result else 0
     except (OSError, ValueError, CampaignError, UploadError, subprocess.SubprocessError) as error:
         if raise_errors:
             raise  # The desktop assistant displays the actual failure.

@@ -462,9 +462,11 @@ class WorkflowTests(unittest.TestCase):
     def test_initialization_preserves_compiled_manifest_build_identity_for_provision(self):
         self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
             self.fixture.source_path, self.fixture.source_manifest_path, destination))
-        self.workflow.info = Mock(return_value=self.fixture.info)
-        def provision(args, *, raise_errors=False):
+        self.workflow.info = Mock(side_effect=TransportError("redundant status read timed out"))
+        verified = {"result": "PROVISIONED", "usb_serial": "selected", "info": self.fixture.info}
+        def provision(args, *, raise_errors=False, return_result=False):
             self.assertTrue(raise_errors)
+            self.assertTrue(return_result)
             image = Path(args[args.index("--image") + 1])
             self.assertEqual(args[args.index("--serial") + 1], "selected")
             self.assertEqual(args[args.index("--image-class") + 1], "receiver")
@@ -475,11 +477,15 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["build_id"], "source-v2")
             self.assertEqual(manifest["profile"], self.fixture.source["profile"])
             self.assertEqual(self.state(image.parent.parent)["phase"], "INSTALLING")
-            return 0
+            return verified
         with patch.object(workflow, "provision_main", side_effect=provision) as run:
             self.workflow.initialize("selected")
         run.assert_called_once()
-        self.ui.show_status.assert_called_once()
+        self.workflow.info.assert_not_called()
+        self.ui.show_status.assert_called_once_with("Initialized over USB", dict(self.fixture.info, usb_serial="selected"))
+        archive = next(self.workflow.operations.glob("*/verification.json"))
+        self.assertEqual(workflow.transition._json(archive), verified)
+        self.assertEqual(self.state(archive.parent)["phase"], "OTA_READY")
 
     def test_status_receiver_only_reads_info_and_lead_adds_readonly_fleet(self):
         for role in ("receiver", "lead"):
@@ -501,7 +507,8 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.snapshot = Mock(side_effect=lambda environment, destination: workflow.copy_pair(
             self.fixture.source_path, self.fixture.source_manifest_path, destination))
         self.workflow.info = Mock(return_value=self.fixture.info)
-        with patch.object(workflow, "provision_main", side_effect=[workflow.BootloaderNotReady("COM11: Write timeout"), 0]) as provision:
+        verified = {"result": "PROVISIONED", "usb_serial": "selected", "info": self.fixture.info}
+        with patch.object(workflow, "provision_main", side_effect=[workflow.BootloaderNotReady("COM11: Write timeout"), verified]) as provision:
             self.workflow.initialize("selected")
         self.assertEqual(provision.call_count, 2)
         first, second = [call.args[0] for call in provision.call_args_list]

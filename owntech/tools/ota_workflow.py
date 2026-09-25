@@ -371,17 +371,23 @@ class Workflow:
         self.save(path, state, "INSTALLING")
         args = ["--image", str(image), "--image-class", role, "--serial", serial, "--mcumgr", str(self.mcumgr)]
         try:
-            rc = provision_main(args + ["--legacy-console"], raise_errors=True)
+            result = provision_main(args + ["--legacy-console"], raise_errors=True, return_result=True)
         except BootloaderNotReady as error:
             # This exception is raised only before the first firmware upload.
             # Other refusals and upload/postboot failures must never reset/retry.
             self.boot_prompt(serial, "Initialize OTA V2 through USB bootloader", reason=
                              "Automatic USB bootloader entry did not succeed. No firmware was sent. "
                              "Enter the bootloader manually to continue with the same saved firmware.\n\n" + str(error))
-            rc = provision_main(args + ["--bootloader"], raise_errors=True)
-        require(rc == 0, "Initialization stopped. See the PlatformIO task output; no automatic retry was made.")
+            result = provision_main(args + ["--bootloader"], raise_errors=True, return_result=True)
+        require(isinstance(result, dict) and result.get("result") in ("PROVISIONED", "ALREADY_INITIALIZED")
+                and result.get("usb_serial") == serial and isinstance(result.get("info"), dict),
+                "Initialization did not return a verified result for the selected board.")
+        transition._save(path / "verification.json", result)
         self.save(path, state, "OTA_READY")
-        self.ui.show_status("Initialized over USB", self.info(serial))
+        # Provisioning already verified this exact image, health and confirmation.
+        # Reopening the CDC immediately can miss a rate-limited status reply and
+        # turn a successful installation into a misleading timeout error.
+        self.ui.show_status("Initialized over USB", dict(result["info"], usb_serial=serial))
 
     def status(self, serial):
         connection = USBConnection(serial)

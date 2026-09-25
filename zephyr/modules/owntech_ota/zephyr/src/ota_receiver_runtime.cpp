@@ -259,6 +259,7 @@ static void process(Work &w)
 }
 static void initialize_runtime()
 {
+    int safety_rc=ota_safety_enter();
     int rc=ota_storage_init();
     ota_identity id{};memcpy(id.eui,eui64,8);id.protocol_version=OTA_PROTOCOL_VERSION;
     ota_storage_boot_identity(&id);ota_storage_hooks(&storage_hooks);
@@ -266,6 +267,7 @@ static void initialize_runtime()
     tracked.validate=tracked_validate;tracked.journal=tracked_journal;
     ota_participant_init(&participant,&id,&tracked,ota_storage_recovery_required());
     if(rc) service_error=OTA_ERR_JOURNAL;
+    else if(safety_rc) service_error=OTA_ERR_SAFETY;
     if(!service_error && ota_storage_active_hash(local_snapshot.active_mcuboot_image_hash)) service_error=OTA_ERR_HEALTH;
     ota_storage_journal j{};int jr=ota_storage_get_journal(&j);
     if(jr) service_error=OTA_ERR_JOURNAL;
@@ -298,7 +300,7 @@ static void initialize_runtime()
     while(!service_error && !atomic_get(&can->driver_started) && !atomic_get(&can->init_error) &&
           k_uptime_get()<(int64_t)deadline) k_sleep(K_MSEC(20));
     if(!service_error && (!atomic_get(&can->driver_started) || atomic_get(&can->init_error))) service_error=OTA_ERR_TRANSPORT;
-    if(!service_error && owntech_ota_check_health()) service_error=OTA_ERR_HEALTH;
+    if(!service_error && ota_safety_check()) service_error=OTA_ERR_SAFETY;
     if(!service_error) atomic_set(&local_healthy,1);
     if(!service_error && strict_boot) event(OTA_EVENT_POSTBOOT_CHECK);
     /* A controller that started is sufficient for local confirmation; no CAN

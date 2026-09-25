@@ -1,4 +1,5 @@
-/* Production receiver worker and participant; only kernel, flash and CAN seams are fake. */
+/* Production receiver worker and participant; only kernel, flash, CAN and
+ * core safety seams are fake. No application OTA callbacks are linked. */
 #include "ota_receiver_runtime.cpp"
 #include "ota_protocol.h"
 #define CHECK(x) do {if(!(x)) return __LINE__;} while(0)
@@ -8,7 +9,7 @@ static thingset_can_state_callback_t state_callback;
 static void *state_arg;
 static uint64_t now;
 static bool confirmed,inhibited,maintenance,recovery,qualified;
-static int health_result,confirms,prepares,appends,arms,last_wait;
+static int safety_result,safety_checks,safety_enter_result,safety_entries,confirms,prepares,appends,arms,last_wait;
 static ota_storage_journal journal;
 static uint8_t active_hash[32];
 extern "C" int strncmp(const char *a,const char *b,size_t n)
@@ -21,7 +22,8 @@ void thingset_can_set_state_callback(thingset_can_state_callback_t cb,void *arg)
 {state_callback=cb;state_arg=arg;cb(arg);}
 bool boot_is_img_confirmed(){return confirmed;}
 int boot_write_img_confirmed(){confirmed=true;++confirms;return 0;}
-extern "C" int owntech_ota_check_health(){return health_result;}
+extern "C" int ota_safety_check(){++safety_checks;return safety_result;}
+extern "C" int ota_safety_enter(){inhibited=true;++safety_entries;return safety_enter_result;}
 extern "C" void ota_safety_restore(bool value){inhibited=value;}
 extern "C" bool ota_safety_inhibited(){return inhibited;}
 extern "C" void ota_feedback_state(ota_state){}
@@ -68,7 +70,8 @@ static void reset()
     memset(event_ms,0,sizeof(event_ms));memset(event_order,0,sizeof(event_order));
     ota_queue.head=ota_queue.count=0;
     now=0;fake_can={1,1,1,0};confirmed=qualified=true;inhibited=true;maintenance=recovery=false;
-    health_result=confirms=prepares=appends=arms=last_wait=0;journal={};memset(active_hash,0x55,32);
+    safety_result=safety_checks=safety_enter_result=safety_entries=confirms=prepares=appends=arms=last_wait=0;
+    journal={};memset(active_hash,0x55,32);
 }
 static ota_command command()
 {
@@ -108,13 +111,27 @@ static int test_receiver()
     ota_runtime_claim(starting_peer,1);CHECK(identity_conflict);
     reset();fake_can.ready=0;initialize_runtime();ota_runtime_claim(eui64,2);
     CHECK(identity_conflict);
+    /* The system confirms its own transport/storage/safety readiness, with no
+     * main.cpp callbacks and no peer or application SYNC available. */
     reset();fake_can.ready=0;confirmed=false;initialize_runtime();
-    CHECK(confirms==1 && ota_service_local_healthy() && !ota_service_healthy());
+    CHECK(safety_entries==1 && safety_checks==1 && confirms==1 && ota_service_local_healthy() && !ota_service_healthy());
     CHECK(!inhibited && !memcmp(ota_service_phase(),"WAITING_CAN",11));
     worker_iteration();CHECK(last_wait==K_FOREVER && now==0);
     fake_can.ready=1;state_callback(state_arg);worker_iteration();CHECK(ota_service_healthy());
-    reset();health_result=OTA_ERR_HEALTH;confirmed=false;initialize_runtime();
-    CHECK(!confirms && inhibited && !ota_service_local_healthy());
+    auto autonomous=command();ota_runtime_claim(autonomous.lead_eui,2);
+    CHECK(!ota_runtime_command(&autonomous,2));worker_iteration();
+    CHECK(prepares==1 && participant.status.state==OTA_READY);
+    /* A failure of core-owned hardware safety still blocks confirmation and
+     * a new campaign before storage or its durable journal are touched. */
+    reset();safety_result=OTA_ERR_SAFETY;confirmed=false;initialize_runtime();
+    CHECK(safety_checks==1 && !confirms && inhibited && !ota_service_local_healthy());
+    CHECK(ota_service_error()==OTA_ERR_SAFETY && !ota_service_healthy());
+    autonomous=command();ota_runtime_claim(autonomous.lead_eui,2);
+    CHECK(ota_runtime_command(&autonomous,2)==OTA_ERR_STATE);
+    CHECK(!prepares && !journal.campaign_id && !accepted_campaign);
+    reset();safety_enter_result=OTA_ERR_SAFETY;confirmed=false;initialize_runtime();
+    CHECK(safety_entries==1 && !confirms && inhibited && !ota_service_local_healthy());
+    CHECK(ota_service_error()==OTA_ERR_SAFETY && !ota_service_healthy());
     reset();initialize_runtime();auto cmd=command();
     CHECK(ota_runtime_command(&cmd,2)==OTA_AGAIN); /* No evidence of Lead claim. */
     ota_runtime_claim(cmd.lead_eui,2);
@@ -152,6 +169,16 @@ static int test_receiver()
     reset();cmd=command();persist(nullptr,&cmd.manifest,OTA_COMMIT_INTENT,42);
     journal.mcuboot_image_hash[0]^=1;maintenance=recovery=true;confirmed=false;
     initialize_runtime();CHECK(!confirms && inhibited && ota_service_error()==OTA_ERR_HEALTH);
+
+    /* Decoupling application health must never legitimize a rollback or an
+     * incomplete journal, even when the local hardware passes its checks. */
+    reset();cmd=command();persist(nullptr,&cmd.manifest,OTA_COMMITTED,42);
+    journal.mcuboot_image_hash[0]^=1;maintenance=recovery=true;
+    initialize_runtime();CHECK(local_snapshot.rolled_back && !ota_service_healthy());
+    CHECK(inhibited && ota_service_error()==OTA_ERR_HEALTH);
+    CHECK(ota_runtime_command(&cmd,2)==OTA_ERR_STATE && !prepares);
+    reset();maintenance=recovery=true;confirmed=false;initialize_runtime();
+    CHECK(!confirms && inhibited && ota_service_error()==OTA_ERR_JOURNAL);
 
     /* Committed image can confirm locally, retaining collective maintenance. */
     reset();cmd=command();persist(nullptr,&cmd.manifest,OTA_COMMITTED,42);

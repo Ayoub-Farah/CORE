@@ -708,10 +708,12 @@ static void update_can_readiness()
 }
 static void initialize_runtime()
 {
+    int safety_rc=ota_safety_enter();
     int rc=ota_storage_init();
     atomic_set(&lead_role,1);memcpy(participant.identity.eui,eui64,8);
     ota_storage_boot_identity(&participant.identity);
     if(rc || ota_storage_recovery_required() || ota_storage_maintenance()) service_error=OTA_ERR_JOURNAL;
+    else if(safety_rc) service_error=OTA_ERR_SAFETY;
     if(!service_error && ota_storage_active_hash(local_snapshot.active_mcuboot_image_hash)) service_error=OTA_ERR_HEALTH;
     bool strict_boot=false;
 
@@ -723,7 +725,7 @@ static void initialize_runtime()
     while(!service_error && !atomic_get(&can->driver_started) && !atomic_get(&can->init_error) &&
           k_uptime_get()<(int64_t)deadline) k_sleep(K_MSEC(20));
     if(!service_error && (!atomic_get(&can->driver_started) || atomic_get(&can->init_error))) service_error=OTA_ERR_TRANSPORT;
-    if(!service_error && owntech_ota_check_health()) service_error=OTA_ERR_HEALTH;
+    if(!service_error && ota_safety_check()) service_error=OTA_ERR_SAFETY;
     if(!service_error) atomic_set(&local_healthy,1);
 
     /* Campaign images keep the collective postboot barrier. A late peer must

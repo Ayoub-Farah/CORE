@@ -1,5 +1,11 @@
 # MMC_ANA : audit d'intégration du récepteur minimal
 
+> Audit historique, antérieur au découplage CAN/OTA. Les callbacks faibles
+> décrits ci-dessous ont depuis été supprimés : Core vérifie désormais sa propre
+> santé et n'attend plus le MMC pour confirmer. Les limites de sûreté électrique
+> restent à qualifier. Voir le [contrat actuel](ota-implementation.md#application-integration)
+> et les [recommandations de l'incident](../Idea/recommandations_ota_mmc.md).
+
 Audit source du 25 septembre 2026, sans modification de MMC_ANA. Le fichier
 `C:/Users/afarahhass/Documents/Repo/MMC/MMC_ANA/src/main.cpp` a le SHA-256
 `36B01F28C82D51DEA740A62825ECB60CC4F7AAB0753118B8B2077E18C2E9938D`, identique

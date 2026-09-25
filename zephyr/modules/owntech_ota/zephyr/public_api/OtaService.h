@@ -5,13 +5,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Weak defaults fail closed. The application supplies maintenance and health
- * checks appropriate to its behavior; see the example hooks in src/main.cpp. */
-int owntech_ota_enter_maintenance(void);
-int owntech_ota_check_health(void);
+/* The service starts independently of main(). No application health or
+ * maintenance callback is required or invoked. OTA health describes the
+ * update service, not readiness of the application's control algorithm. */
 bool ota_safety_inhibited(void);
 void ota_safety_restore(bool inhibit);
 int ota_safety_enter(void);
+/* Core-owned hardware readback; never invokes application code. */
+int ota_safety_check(void);
 bool ota_service_busy(void);
 bool ota_service_healthy(void);
 /* Local validation/confirmation may complete before a CAN peer is present.

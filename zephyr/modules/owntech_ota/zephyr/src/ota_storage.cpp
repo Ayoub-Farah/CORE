@@ -185,7 +185,8 @@ int reserve_journal_space(ota_slot_owner desired)
      * final live-data growth. Do not credit shrinking an OTA1 fleet until its
      * compact replacement is durable. Reserve 8 B for a future GC marker and
      * 16 B for the NVS version key that the first write may create implicitly.
-     * Other application NVS writers must remain stopped during maintenance. */
+     * The NVS adapter rejects application writes while OTA is busy/inhibited;
+     * application tasks do not need to stop themselves during maintenance. */
     size_t needed = 8 + 16, overwrite = 0;
     const uint16_t keys[] = {MAINTENANCE_KEY, JOURNAL_KEY, FLEET_KEY};
     const size_t sizes[] = {sizeof(marker), sizeof(local_record), sizeof(fleet_record)};

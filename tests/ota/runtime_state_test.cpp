@@ -1,7 +1,8 @@
 /* Real runtime worker/API with deterministic queues and fake Zephyr boundaries.
  * Worker entry is exercised through initialize_runtime/worker_iteration and
  * focused process/reconcile_step calls for the protocol race regressions.
- * Portable participant/coordinator/protocol sources are linked unchanged. */
+ * Portable participant/coordinator/protocol sources are linked unchanged.
+ * No application OTA health or maintenance callback is linked. */
 #define CONFIG_OWNTECH_OTA_LEAD 1
 #define CONFIG_OWNTECH_OTA_USABLE_SLOT_SIZE 768
 #define CONFIG_OWNTECH_OTA_HARDWARE_ID 1
@@ -17,7 +18,9 @@ static void *fake_can_callback_arg;
 static uint64_t fake_now;
 static bool fake_confirmed=true,fake_inhibited=true,fake_role,fake_recovery,fake_maintenance;
 static bool fake_flushed;
-static int fake_health_result,fake_network_result,fake_hash_result,fake_journal_result;
+static int fake_safety_result,fake_network_result,fake_hash_result,fake_journal_result;
+static int fake_safety_enter_result;
+static unsigned fake_safety_checks,fake_safety_entries;
 static unsigned fake_network_inits;
 static unsigned fake_confirms,fake_prepares,fake_appends,fake_flushes,fake_reboots,fake_release_requests;
 static ota_slot_owner fake_owner=OTA_SLOT_NONE;
@@ -75,11 +78,10 @@ int thingset_can_send_raw_report(const uint8_t *bytes,size_t n,int){
     }
     return 0;
 }
-extern "C" int owntech_ota_enter_maintenance(){return 0;}
-extern "C" int owntech_ota_check_health(){return fake_health_result;}
+extern "C" int ota_safety_check(){++fake_safety_checks;return fake_safety_result;}
 extern "C" bool ota_safety_inhibited(){return fake_inhibited;}
 extern "C" void ota_safety_restore(bool value){fake_inhibited=value;}
-extern "C" int ota_safety_enter(){fake_inhibited=true;return 0;}
+extern "C" int ota_safety_enter(){fake_inhibited=true;++fake_safety_entries;return fake_safety_enter_result;}
 extern "C" void ota_feedback_state(ota_state){}
 extern "C" void ota_feedback_application_led(int){}
 int ota_storage_init(){return 0;}
@@ -187,7 +189,9 @@ static void reset_runtime(){
 }
 static void reset_all(){
     reset_runtime();fake_confirmed=true;fake_inhibited=true;fake_role=fake_recovery=fake_maintenance=false;
-    fake_health_result=fake_network_result=fake_hash_result=fake_journal_result=0;fake_confirms=fake_prepares=fake_appends=fake_flushes=fake_reboots=fake_release_requests=0;
+    fake_safety_result=fake_safety_enter_result=fake_network_result=fake_hash_result=fake_journal_result=0;
+    fake_safety_checks=fake_safety_entries=0;
+    fake_confirms=fake_prepares=fake_appends=fake_flushes=fake_reboots=fake_release_requests=0;
     fake_owner=OTA_SLOT_NONE;fake_journal={};fake_manifest={};fake_fleet_manifest={};fake_fleet_count=0;fake_offset=fake_fleet_commit=0;fake_flushed=false;
     memset(fake_active_hash,0xbb,32);memset(fake_lead,0,8);
     for(unsigned i=0;i<2;i++){
@@ -254,10 +258,27 @@ static int failures(){
     CHECK(source_window.requested&&!source_window.ready);fake_now=source_window.deadline;worker_iteration();
     CHECK(service_error==OTA_ERR_TIMEOUT&&coordinator.phase==OTA_COORD_FAILED);
     CHECK(fake_peers[0].status.state!=OTA_COMMITTED&&!fake_prepares);
+    /* Core startup confirms independently of main.cpp and remote peers. Once
+     * CAN becomes ready, the same runtime can perform an ordinary campaign. */
     reset_all();fake_confirmed=false;fake_can.ready=0;initialize_runtime();
-    CHECK(fake_confirms==1&&ota_service_local_healthy()&&!ota_service_can_ready());
+    CHECK(fake_safety_entries==1&&fake_safety_checks==1&&fake_confirms==1&&ota_service_local_healthy()&&!ota_service_can_ready());
+    CHECK(!fake_inhibited&&!ota_service_healthy());
     fake_can.ready=1;can_changed();worker_iteration();CHECK(ota_service_healthy());
-    reset_all();fake_confirmed=false;fake_health_result=-1;initialize_runtime();CHECK(!fake_confirms&&!ota_service_healthy()&&fake_inhibited);
+    rc=start_campaign();if(rc)return rc;
+    /* Independence from application health does not bypass platform safety
+     * or persistent maintenance/recovery from a previous interrupted boot. */
+    reset_all();fake_confirmed=false;fake_safety_result=-1;initialize_runtime();
+    CHECK(fake_safety_checks==1&&!fake_confirms&&!ota_service_healthy()&&fake_inhibited);
+    CHECK(ota_service_error()==OTA_ERR_SAFETY&&!ota_service_local_healthy());
+    m=make_manifest();CHECK(ota_service_stage_begin(&m)==OTA_ERR_STATE);
+    CHECK(ota_service_discover(42)==OTA_ERR_STATE&&!fake_prepares&&!fake_fleet_count);
+    reset_all();fake_confirmed=false;fake_safety_enter_result=-1;initialize_runtime();
+    CHECK(fake_safety_entries==1&&!fake_confirms&&!ota_service_healthy()&&fake_inhibited);
+    CHECK(ota_service_error()==OTA_ERR_SAFETY&&!ota_service_local_healthy());
+    reset_all();fake_confirmed=false;fake_recovery=true;initialize_runtime();
+    CHECK(!fake_confirms&&fake_inhibited&&!ota_service_healthy()&&ota_service_error()==OTA_ERR_JOURNAL);
+    reset_all();fake_confirmed=false;fake_maintenance=true;initialize_runtime();
+    CHECK(!fake_confirms&&fake_inhibited&&!ota_service_healthy()&&ota_service_error()==OTA_ERR_JOURNAL);
     reset_all();initialize_runtime();rc=start_campaign();if(rc)return rc;fake_peer_present[1]=false;
     for(unsigned i=0;i<5000&&!service_error;i++){worker_iteration();rc=serve_source();if(rc)return rc;}
     CHECK(service_error&&frozen_count==2&&!fake_prepares&&!fake_reboots);

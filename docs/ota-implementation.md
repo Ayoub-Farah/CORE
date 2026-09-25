@@ -115,19 +115,32 @@ supervision. A queued 1200-baud request rechecks the gate before any reset.
 
 ## Application integration
 
-The OTA environments add the service to `src/main.cpp`; they do not substitute
-another entry point. The repository's LED application declares its maintenance
-and health callbacks explicitly in that file. Their success is appropriate to
-that application, which does not start power conversion. It is not a general
-assertion that another application or connected power stage is safe.
+The `OTA` environment builds the chosen `src/main.cpp` with independently
+started Core CAN/OTA threads. No `owntech_ota_enter_maintenance()` or
+`owntech_ota_check_health()` implementation is required or invoked. `main` may
+return, sleep or run a normal busy loop: the OTA profiles give the services
+higher scheduling priority (OTA 7, CAN/SDK 10, main 12), enforced at configure
+time. Interrupts and preemptive scheduling must remain operational.
 
-Applications must implement `owntech_ota_enter_maintenance()` and
-`owntech_ota_check_health()` for their own electrical and control behavior. The
-service's weak defaults fail closed. The maintenance callback must put the
-application in a safe state and prevent application-specific restart paths;
-required protection and supervision must remain active. The health callback
-must verify the application's initialization before image confirmation. Both
-callbacks must finish promptly within the configured startup/health budget.
+Core checks its own hardware inhibition, CAN controller startup, storage and
+boot image before confirming. Confirmation means the update service can run,
+not that the application is initialized or ready to drive power. Application
+UIDs, RS485 peers, SYNC and control heartbeats do not gate this confirmation.
+Journal and expected-image checks still reject unresolved rollback states.
+
+Core enables the HRTIM clock and disables all twelve outputs directly, without
+depending on application PWM setup, and verifies the shield power GPIOs.
+During inhibition or an OTA operation, the shared NVS owner refuses writes to
+application keys with `-EBUSY`; OTA records remain writable. Whole-partition
+erase through the application API is refused with `-EPERM` in OTA builds.
+Applications should handle deferred writes and keep their own power permission
+and rearm logic; they may observe `ota_safety_inhibited()` for that purpose.
+
+All code still shares a privileged MCU and address space. HardFaults, disabled
+interrupts/scheduling, busy higher-priority tasks, stuck static constructors or
+direct access to reserved CAN/flash/power registers can prevent OTA. Surviving
+those requires a separately reachable recovery bootloader and reset/watchdog
+policy, which this implementation does not add.
 
 Direct PWM and protected GPIO APIs remain subject to the service's maintenance
 gate. Application-specific electrical safety, interrupt behavior and flash timing

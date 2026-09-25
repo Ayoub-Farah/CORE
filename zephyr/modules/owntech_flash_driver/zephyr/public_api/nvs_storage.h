@@ -66,6 +66,8 @@ typedef enum
  * Stores a block of data under a given identifier (data_id) in flash memory.
  * 
  * If the data already exists, it is overwritten. Useful for persisting configuration.
+ * In OTA builds, application writes return -EBUSY while the service inhibits
+ * power or owns an update. Retry once maintenance has been released.
  *
  * @param data_id     Identifier for the data item.
  * @param data        Pointer to the data to be stored.
@@ -97,6 +99,7 @@ int8_t nvs_storage_retrieve_data(uint16_t data_id,
  * @brief Clear all data stored in the NVS partition.
  *
  * Erases all key-value entries in the configured NVS area. Use with caution.
+ * OTA builds always return -EPERM to preserve their durable journal and role.
  *
  * @return 0 on success, negative value on error.
  */								 
@@ -135,7 +138,10 @@ int32_t nvs_storage_get_free_space();
 
 /* Full-length API for structured journals. Uses the same mounted NVS owner and
  * namespace as the legacy API; returns the byte count or a negative errno.
- * nvs_write may return zero when the value was already present. */
+ * nvs_write may return zero when the value was already present.
+ * With OTA enabled, keys 0x0500..0x0503 belong to the internal OTA adapter.
+ * Other writes return -EBUSY during service inhibition or an active update;
+ * reads remain available. */
 int nvs_storage_write(uint16_t data_id, const void *data, size_t size);
 int nvs_storage_read(uint16_t data_id, void *data, size_t size);
 

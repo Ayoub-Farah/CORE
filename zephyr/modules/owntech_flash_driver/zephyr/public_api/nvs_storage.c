@@ -43,6 +43,9 @@
 
 /* Current file header */
 #include "nvs_storage.h"
+#ifdef CONFIG_OWNTECH_OTA
+#include "OtaService.h"
+#endif
 
 
 /* Constants and variables */
@@ -173,7 +176,8 @@ static int8_t _nvs_storage_init()
 	initialized = true;
 
 	/* Check version in storage */
-	rc = nvs_storage_retrieve_data(VERSION, &storage_version_in_nvs, 2);
+	/* Read directly instead of recursively entering the public read API. */
+	rc = nvs_read(&fs, VERSION, &storage_version_in_nvs, 2);
 
 	if (rc < 0)
 	{
@@ -200,6 +204,19 @@ static int8_t _nvs_storage_init()
 int nvs_storage_write(uint16_t data_id, const void *data, size_t size)
 {
 	k_mutex_lock(&storage_mutex, K_FOREVER);
+#ifdef CONFIG_OWNTECH_OTA
+	/* Only the OTA role, maintenance, journal and fleet records may consume
+	 * NVS space after the service reserves it. Check under the same lock as
+	 * writes: an application write already in progress finishes before the
+	 * service can inspect/reserve journal space. Service flags are atomic and
+	 * never take the OTA storage mutex (which is acquired before this mutex).
+	 * Keys 0x0500..0x0503 are reserved for the internal OTA storage adapter. */
+	const bool ota_record = data_id >= 0x0500 && data_id <= 0x0503;
+	if (!ota_record && (ota_safety_inhibited() || ota_service_busy())) {
+		k_mutex_unlock(&storage_mutex);
+		return -EBUSY;
+	}
+#endif
 	int rc = _nvs_storage_init();
 	if (rc == 0) rc = _nvs_storage_store_version();
 	if (rc == 0) rc = nvs_write(&fs, data_id, data, size);
@@ -232,44 +249,48 @@ int8_t nvs_storage_retrieve_data(uint16_t data_id, void* data_buffer, uint8_t da
 
 int8_t nvs_storage_clear_all_stored_data()
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return 0;
+#ifdef CONFIG_OWNTECH_OTA
+	/* A whole-partition erase also removes the durable OTA journal and
+	 * provisioned role. It is never an application operation in OTA builds. */
+	return -EPERM;
+#else
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	if (rc == 0) rc = nvs_clear(&fs);
+	if (rc == 0) {
+		initialized = false;
+		storage_version_in_nvs = 0;
 	}
-
-	return nvs_clear(&fs);
+	k_mutex_unlock(&storage_mutex);
+	return rc;
+#endif
 }
 
 uint16_t nvs_storage_get_current_version()
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return 0;
-	}
-
-	return current_storage_version;
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	uint16_t version = rc == 0 ? current_storage_version : 0;
+	k_mutex_unlock(&storage_mutex);
+	return version;
 }
 
 uint16_t nvs_storage_get_version_in_nvs()
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return 0;
-	}
-
-	return storage_version_in_nvs;
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	uint16_t version = rc == 0 ? storage_version_in_nvs : 0;
+	k_mutex_unlock(&storage_mutex);
+	return version;
 }
 
 int32_t nvs_storage_get_free_space()
 {
-	if (initialized == false)
-	{
-		int8_t error = _nvs_storage_init();
-		if (error != 0) return error;
-	}
-
-	return nvs_calc_free_space(&fs);
+	/* OTA admission inspects this before reserving its journal. Serialize with
+	 * an application write that was admitted just before OTA became busy. */
+	k_mutex_lock(&storage_mutex, K_FOREVER);
+	int rc = _nvs_storage_init();
+	if (rc == 0) rc = nvs_calc_free_space(&fs);
+	k_mutex_unlock(&storage_mutex);
+	return rc;
 }

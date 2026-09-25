@@ -14,7 +14,8 @@ menuconfig OWNTECH_OTA
 	help
 	  One bus, one campaign, sequential storage. Legacy ThingSet DFU must be
 	  disabled so it cannot bypass the shared slot owner. A provisioned boot
-	  profile and application maintenance/health hooks are required to write.
+	  profile is required to write. Core owns CAN startup, hardware output
+	  inhibition and service health; application callbacks are not required.
 
 if OWNTECH_OTA
 

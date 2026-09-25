@@ -1,4 +1,28 @@
 if(CONFIG_OWNTECH_OTA)
+  # A main that never sleeps must remain preemptible by the complete CAN/OTA
+  # service path. Zephyr uses smaller numeric values for higher priorities.
+  if(NOT CONFIG_PREEMPT_ENABLED)
+    message(FATAL_ERROR "OwnTech CAN/OTA requires CONFIG_PREEMPT_ENABLED=y so services can preempt main")
+  endif()
+  foreach(owntech_priority CONFIG_MAIN_THREAD_PRIORITY CONFIG_THINGSET_CAN_THREAD_PRIORITY CONFIG_THINGSET_SDK_THREAD_PRIORITY)
+    if(NOT DEFINED ${owntech_priority} OR NOT "${${owntech_priority}}" MATCHES "^-?[0-9]+$")
+      message(FATAL_ERROR "OwnTech CAN/OTA requires a numeric ${owntech_priority}")
+    endif()
+  endforeach()
+  if(CONFIG_MAIN_THREAD_PRIORITY LESS 0)
+    message(FATAL_ERROR "OwnTech CAN/OTA requires a preemptible main; CONFIG_MAIN_THREAD_PRIORITY must not be negative")
+  endif()
+  # Keep 7 aligned with K_THREAD_DEFINE(ota_worker, ...) in both
+  # ota_receiver_runtime.cpp and ota_lead_runtime.cpp.
+  if(CONFIG_MAIN_THREAD_PRIORITY LESS_EQUAL 7)
+    message(FATAL_ERROR "OwnTech CAN/OTA requires CONFIG_MAIN_THREAD_PRIORITY > 7 (OTA worker priority)")
+  endif()
+  foreach(owntech_priority CONFIG_THINGSET_CAN_THREAD_PRIORITY CONFIG_THINGSET_SDK_THREAD_PRIORITY)
+    if(CONFIG_MAIN_THREAD_PRIORITY LESS_EQUAL ${owntech_priority})
+      message(FATAL_ERROR "OwnTech CAN/OTA requires CONFIG_MAIN_THREAD_PRIORITY > ${owntech_priority} (${${owntech_priority}})")
+    endif()
+  endforeach()
+  unset(owntech_priority)
   if(CONFIG_THINGSET_DFU)
     message(FATAL_ERROR "OTA owns the secondary slot; disable legacy THINGSET_DFU")
   endif()

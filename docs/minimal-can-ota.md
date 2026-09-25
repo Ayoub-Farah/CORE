@@ -239,10 +239,23 @@ A bootloader cannot report application image class: explicit physical entry,
 selected identity, generated manifest and these slot/journal guards are required.
 
 
-The unchanged MMC_ANA application still needs a qualified Core maintenance and
-health adapter. Default weak callbacks fail closed. A successful link is not
-proof that direct hardware power commands, RS485 restart requests, initialization
-health or protection supervision are safe. No MMC_ANA source changes are made.
+CAN/OTA starts in Core threads without any application health or maintenance
+callback. The OTA profiles run `main` at priority 12, below OTA (7) and CAN/SDK
+(10); configuration rejects a main priority that could starve these services.
+A returning, sleeping or CPU-busy `main` therefore needs no OTA servicing call,
+provided it leaves interrupts and scheduling operational. Core inhibits all
+HRTIM outputs and shield power GPIOs directly, including before PWM setup.
+Service health validates CAN startup, storage, image identity and safe outputs;
+it does not certify that MMC control or synchronization works. MMC keeps its
+own power permission and rearm logic. NVS application writes return `-EBUSY`
+while inhibited or busy, and whole-NVS erase returns `-EPERM` in OTA builds.
+
+This is independence from the application's lifecycle, not memory or CPU
+isolation: a HardFault, blocked interrupts/scheduler, higher-priority busy task,
+or direct reconfiguration of reserved peripherals can still break the service.
+Recovery from those cases needs an independently reachable CAN bootloader and
+a qualified reset/watchdog path. These are not supplied by this change. See the
+[incident and current recommendations](../Idea/recommandations_ota_mmc.md).
 
 Before operational use, complete and archive the plan's acceptance matrix:
 

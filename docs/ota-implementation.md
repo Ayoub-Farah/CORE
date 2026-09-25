@@ -1,3 +1,9 @@
+# Legacy v1 implementation reference
+
+> Current receiver/Lead v2 workflows are documented in [minimal-can-ota.md](minimal-can-ota.md).
+> The historical instructions below describe the former same-image, padded-transfer prototype.
+> They do not authorize a v2 compact campaign or its USB repair.
+
 # Collective ThingSet/CAN OTA prototype
 
 Implementation reference: [the preserved design report](../Idea/thingset_can_ota_implementation_report.md).

@@ -1,3 +1,10 @@
+# Guarded recovery for legacy v1 campaigns
+
+> Current receiver/Lead v2 workflows are documented in [minimal-can-ota.md](minimal-can-ota.md).
+> The historical instructions below describe the former same-image, padded-transfer prototype.
+> The new explicit `--compact-receiver-only` precommit repair is described in that guide;
+> legacy repair modes below do not authorize compact v2 repair.
+
 # Recovering an uncommitted OTA campaign
 
 The default procedure applies to an explicitly identified campaign that reached

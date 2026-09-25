@@ -2,31 +2,29 @@
 
 This is the OwnTech Power API Core repository.
 
-The experimental OTA environments build your current `src/main.cpp` with the
-USB/CAN update service:
+The experimental OTA v2 environments separate a minimal receiver from a dedicated Lead:
 
 ```sh
-pio run -e OTA -t ota_init               # First USB initialization of a legacy board
-pio run -e USB_LEAD -t ota_init          # First USB initialization of the future Lead
-pio run -e USB_LEAD -t lead_update       # Build and update the selected CAN fleet
+pio run -e OTA -t ota_init               # Install user src/main.cpp plus receiver over USB
+pio run -e USB_LEAD -t ota_init          # Install dedicated owntech/lead/main.cpp over USB
+pio run -e USB_LEAD -t lead_update       # Build OTA and update only selected CAN receivers
 ```
 
-Install OTA support on each board once, alone over USB if needed, then connect
-the CAN bus and use `USB_LEAD` for subsequent
-application updates. The same compatible firmware runs on the Lead and its
-participants; the Lead role is selected at runtime. Build identity is generated
-automatically from source and configuration changes. The ordinary `USB` and
-`STLink` workflows remain available.
+Initialize each board individually over USB with its existing bootloader, then
+connect the classic 500 kbit/s CAN bus. The Lead remains a dedicated coordinator;
+its image and build identity differ from the receiver application. Expected
+fleet counts and identities exclude the Lead. **Update CAN receiver boards**
+keeps the signed compact image on the PC and serves bounded blocks; it never
+flashes the receiver image onto the Lead.
 
-The **Initialize board over USB** task enters the existing bootloader before
-probing an older application's console. It initializes one board without a CAN
-peer or ST-Link. On an already initialized board, `OTA -> Upload` checks the
-current image; subsequent firmware changes use **Update Lead and CAN fleet**.
+**Initialize board over USB** explicitly enters the legacy bootloader at 1200
+baud before any SMP probe. Receiver status uses the existing console without
+application SMP or a second CDC. The ordinary `USB` and `STLink` workflows remain
+available. No OTA workflow replaces the bootloader or generates a signing key.
 
-Select the USB board and expected fleet, and adapt the application's maintenance
-and health callbacks before using power-control code. See the
-[operator guide](docs/ota-client.md) and
-[implementation and validation notes](docs/ota-implementation.md).
+See the [current operator and qualification guide](docs/minimal-can-ota.md).
+MMC_ANA is unchanged; its maintenance/health adapter, memory margins and real-time
+behavior still require bench qualification. The weak safety callbacks fail closed.
 
 The Power API is designed to be used with VS Code and PlatformIO.
 [Installing VS Code with PlatformIO](https://platformio.org/install/ide?install=vscode).

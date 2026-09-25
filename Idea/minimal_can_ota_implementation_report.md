@@ -2,7 +2,7 @@
 
 Date : 25 septembre 2026. Référence du dépôt : `5930ee6f4b2058437ea01bb1e4bf62376e541935`, branche `feat/thingset-can-ota`.
 
-**Statut : spécification et plan d'implémentation. Le récepteur minimal décrit ici n'est pas encore implémenté ni qualifié. Les mesures de l'OTA actuelle sont distinguées des objectifs. Ce rapport ne modifie ni MMC_ANA, ni les firmwares, ni les cartes.**
+**Statut : spécification de référence. L'implémentation logicielle v2 est disponible sur `feat/minimal-can-ota` ; voir le [bilan des tests et des mesures](../docs/minimal-can-ota-validation.md). Ce document conserve les mesures du prototype et les objectifs de conception. La qualification matérielle, la marge RAM dynamique et l'adaptateur MMC sûr restent à valider ; MMC_ANA est inchangé.**
 
 ## 1. Objectif et décisions
 

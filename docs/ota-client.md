@@ -1,3 +1,9 @@
+# Operator guide for the legacy v1 prototype
+
+> Current receiver/Lead v2 workflows are documented in [minimal-can-ota.md](minimal-can-ota.md).
+> The historical instructions below describe the former same-image, padded-transfer prototype.
+> They do not authorize a v2 compact campaign or its USB repair.
+
 # Update your application over USB and CAN
 
 Both OTA environments build the application's current `src/main.cpp`. `OTA`

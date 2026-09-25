@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "owntech" / "tools"))
 from lead_update import (Campaign, CampaignError, Journal, USBConnection, journal_campaign,
-                         select_port, ReceiverProbeTimeout, TransportError, read_only_status, main)
+                         select_port, ReceiverProbeTimeout, TransportError, CommandError, read_only_status, main)
 
 LEAD = "eeeeeeeeeeeeeeee"
 IDS = ["0102030405060708", "1112131415161718", "2122232425262728"]
@@ -70,7 +70,7 @@ class Transport:
             self.committed = False
             return {"state": "SOURCE_OPEN"}
         if command == "stage_data":
-            return {"offset": payload["offset"] + len(payload["data"])}
+            return {"rc": 0, "offset": payload["offset"] + len(payload["data"])}
         if command == "stage_end":
             return {"state": "SOURCE_READY"}
         if command == "commit":
@@ -95,6 +95,21 @@ class CommitTransport(Transport):
                 raise event
             response.update(event if isinstance(event, dict) else {"phase": event})
         return response
+
+
+class AutoReconcileTransport(CommitTransport):
+    """Installed dedicated Lead owns the postboot work after COMMIT."""
+    def request(self, command, payload):
+        if command == "reconcile":
+            self.calls.append((command, payload))
+            raise CommandError("automatic reconciliation already owns busy", response={"rc": -2})
+        result = super().request(command, payload)
+        if command == "status" and self.committed:
+            result["campaign"] = 42
+            for row in result["targets"]:
+                row.update(campaign=42, error=0,
+                           state="SUCCESS" if result["phase"] == "SUCCESS" else "RECOVERY_REQUIRED")
+        return result
 
 
 class CampaignTests(unittest.TestCase):
@@ -181,6 +196,113 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaises(CampaignError):
                 client._serve_source(credit)
         self.assertFalse(client._serve_source({"source_length": 0}))
+
+    def test_source_ack_uses_success_result_not_asynchronous_can_progress(self):
+        client = self.client()
+        # The installed Lead acknowledges the first source copy while CAN TX
+        # still reports zero. A repeated older credit can see later progress.
+        for source_offset, transmitted in ((0, 0), (256, 256), (0, 512)):
+            with self.subTest(source_offset=source_offset, transmitted=transmitted):
+                self.transport.request = Mock(return_value={"rc": 0, "offset": transmitted})
+                self.assertTrue(client._serve_source({"source_campaign": 42,
+                    "source_offset": source_offset, "source_length": 256}))
+                self.transport.request.assert_called_once_with("stage_data", {
+                    "campaign": 42, "offset": source_offset, "data": b"x" * 256})
+
+    def test_complete_campaign_with_source_ack_before_can_transmission(self):
+        original = self.transport.request
+        accepted = [0]
+
+        def request(command, payload):
+            reply = original(command, payload)
+            if command == "stage_data":
+                self.assertEqual(payload["offset"], accepted[0])
+                self.assertEqual(payload["data"], b"x" * 256)
+                accepted[0] += len(payload["data"])
+                return {"rc": 0, "offset": payload["offset"]}
+            if command == "status" and not self.transport.committed and accepted[0] < 512:
+                reply.update(phase="CAN_TRANSFER", source_campaign=42,
+                             source_offset=accepted[0], source_length=256)
+                for row in reply["targets"]:
+                    row.update(state="PASS_OPEN", offset=accepted[0], validated=False, flash_complete=False)
+            if command == "commit":
+                self.assertEqual(accepted[0], 512)
+            return reply
+
+        self.transport.request = request
+        self.assertEqual(self.client().run(), "SUCCESS")
+        commands = [name for name, _ in self.transport.calls]
+        self.assertEqual(commands.count("stage_data"), 2)
+        self.assertNotIn("abort", commands)
+
+    def test_source_ack_refusal_preserves_actual_reply(self):
+        client = self.client()
+        credit = {"source_campaign": 42, "source_offset": 0, "source_length": 256}
+        replies = ({"offset": 256}, {"rc": False, "offset": 256}, {"rc": 1, "offset": 256},
+                   {"rc": -3, "offset": 0}, {"rc": 0, "offset": False}, {"rc": 0, "offset": -1},
+                   {"rc": 0, "offset": 513}, {"rc": 0, "offset": 256, "err": {"rc": 3}}, None)
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.transport.request = Mock(return_value=reply)
+                with self.assertRaisesRegex(CampaignError, "Invalid source credit acknowledgement"):
+                    client._serve_source(credit)
+                record = json.loads(self.journal.path.read_text().splitlines()[-1])
+                self.assertEqual(record["event"], "PC_SOURCE_REJECTED")
+                self.assertEqual(record["response"], reply)
+                self.assertEqual((record["source_offset"], record["source_length"]), (0, 256))
+        reply = {"rc": -3, "offset": 0}
+        error = CommandError("stage_data rejected", response=reply)
+        self.transport.request = Mock(side_effect=error)
+        with self.assertRaises(CommandError) as caught:
+            client._serve_source(credit)
+        self.assertIs(caught.exception, error)
+        record = json.loads(self.journal.path.read_text().splitlines()[-1])
+        self.assertEqual(record["response"], reply)
+        self.assertEqual(record["error"], str(error))
+
+    def test_streaming_polls_between_source_credits_without_per_block_idle_delay(self):
+        original = self.transport.request
+        accepted = [0]
+        between_credits = [False]
+
+        def request(command, payload):
+            result = original(command, payload)
+            if command == "stage_data":
+                self.assertEqual(payload["offset"], accepted[0])
+                accepted[0] += len(payload["data"])
+                between_credits[0] = True
+                return {"rc": 0, "offset": payload["offset"]}
+            if command == "status" and not self.transport.committed:
+                if between_credits[0] or accepted[0] < 512:
+                    result.update(phase="CAN_TRANSFER", source_campaign=42, source_offset=accepted[0],
+                                  source_length=0 if between_credits[0] else 256)
+                    for row in result["targets"]:
+                        row.update(state="PASS_OPEN", offset=accepted[0], validated=False, flash_complete=False)
+                    between_credits[0] = False
+            return result
+
+        self.transport.request = request
+        client = self.client()
+        client.timeout = 0.05
+        self.assertEqual(client.run(), "SUCCESS")
+        self.assertEqual(accepted[0], 512)
+        self.assertLess(self.clock.now, client.timeout)
+
+    def test_nonstreaming_status_keeps_configured_poll_interval(self):
+        original = self.transport.request
+
+        def request(command, payload):
+            result = original(command, payload)
+            if command == "status":
+                result["phase"] = "PREPARING"
+            return result
+
+        self.transport.request = request
+        client = self.client()
+        with self.assertRaisesRegex(CampaignError, "bounded timeout"):
+            client._poll(lambda result: False, "preparation")
+        self.assertAlmostEqual(self.clock.now, 1.2)
+        self.assertEqual(len(self.transport.calls), 3)
 
     def test_async_source_setup_waits_before_next_command(self):
         client = self.client()
@@ -323,6 +445,75 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn("reconcile", commands)
         self.assertNotIn("abort", commands)
         self.assertNotIn("reset", commands)
+
+    def test_live_campaign_waits_for_automatic_release_without_command10(self):
+        self.transport = AutoReconcileTransport(["COMMITTING", "REBOOTING", "DISCOVERING",
+                                                "POSTBOOT_CHECK", "POSTBOOT_CHECK", "SUCCESS"], lost_ack=True)
+        client = self.client()
+        client.timeout = 5
+        self.assertEqual(client.run(), "SUCCESS")
+        self.assertFalse(self.transport.events)
+        commands = [command for command, _ in self.transport.calls]
+        self.assertEqual(commands.count("commit"), 1)
+        self.assertNotIn("reconcile", commands)
+        self.assertNotIn("abort", commands)
+        self.assertNotIn("reset", commands)
+        events = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+        self.assertEqual(events[-1]["event"], "SUCCESS")
+        postboot = [event["status"]["phase"] for event in events
+                    if event["event"] == "STATUS" and event["status"].get("campaign") == 42]
+        self.assertIn("POSTBOOT_CHECK", postboot)
+        self.assertEqual(postboot[-1], "SUCCESS")
+
+    def test_automatic_success_must_match_campaign_and_exact_released_receivers(self):
+        for fault in ("campaign", "missing", "unexpected", "hash", "version", "build", "health",
+                      "confirmation", "row_campaign", "not_released"):
+            with self.subTest(fault=fault):
+                self.transport = AutoReconcileTransport(["SUCCESS"])
+                original = self.transport.request
+
+                def request(command, payload):
+                    result = original(command, payload)
+                    if command == "status" and self.transport.committed:
+                        row = result["targets"][0]
+                        if fault == "campaign":
+                            result["campaign"] = 43
+                        elif fault == "missing":
+                            result["targets"].pop()
+                            result["target_count"] -= 1
+                        elif fault == "unexpected":
+                            result["targets"].append(dict(row, identity="aaaaaaaaaaaaaaaa", address=4))
+                            result["target_count"] += 1
+                        else:
+                            field, value = {"hash": ("mcuboot_image_hash", b"x" * 32),
+                                "version": ("version", "0.0.0"), "build": ("build_id", "wrong"),
+                                "health": ("healthy", False), "confirmation": ("confirmed", False),
+                                "row_campaign": ("campaign", 43),
+                                "not_released": ("state", "RECOVERY_REQUIRED")}[fault]
+                            row[field] = value
+                    return result
+
+                self.transport.request = request
+                with self.assertRaisesRegex(CampaignError, "PARTIAL: automatic reconciliation SUCCESS"):
+                    self.client().run()
+                commands = [command for command, _ in self.transport.calls]
+                self.assertNotIn("reconcile", commands)
+                self.assertNotIn("abort", commands)
+                self.assertEqual(commands.count("commit"), 1)
+
+    def test_automatic_postboot_wait_is_bounded_and_keeps_original_failure(self):
+        for terminal in (None, {"phase": "PARTIAL", "error": -14}):
+            with self.subTest(terminal=terminal):
+                self.transport = AutoReconcileTransport(["POSTBOOT_CHECK"] * 3 if terminal is None
+                                                        else ["POSTBOOT_CHECK", terminal])
+                client = self.client()
+                message = "PARTIAL: bounded timeout" if terminal is None else "commit/reboot failed:.*PARTIAL.*-14"
+                with self.assertRaisesRegex(CampaignError, message):
+                    client.run()
+                commands = [command for command, _ in self.transport.calls]
+                self.assertNotIn("reconcile", commands)
+                self.assertNotIn("abort", commands)
+                self.assertEqual(commands.count("commit"), 1)
 
     def test_commit_reconnect_rejects_different_lead_without_reconcile(self):
         self.transport = CommitTransport([TransportError("reboot disconnected USB")])

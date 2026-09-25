@@ -149,12 +149,21 @@ credit. The PC supplies exactly that block with `stage_data`, at most 256 bytes.
 Older offsets are permitted for retransmission. The Lead retains only a bounded
 RAM window. The PC keeps the immutable source bytes for the whole campaign.
 An absent PC times out the source and cannot cause a commit.
+The explicit `rc = 0` reply acknowledges that the exact requested block was
+validated and copied into RAM. The reply's `offset` is asynchronous CAN progress,
+so it can lag behind the accepted block or be ahead during a retransmission.
+The PC polls briefly throughout `CAN_TRANSFER`, including gaps between credits.
 
 Boards prepare their secondary slot under persisted maintenance, receive and
 verify compact bytes, then report `VALID`. Only the collective validation
 barrier permits `COMMIT`; activation is armed separately. Reconciliation checks
 every frozen receiver's expected image, health and confirmation before releasing
 maintenance. A common broadcast does not imply an atomic simultaneous reboot.
+During a live campaign the Lead performs this reconciliation automatically;
+the PC waits through `POSTBOOT_CHECK` and verifies the exact campaign, receiver
+roster and confirmed images at `SUCCESS`. It does not send a competing
+`reconcile` command while that work is active. Explicit journal reconciliation
+remains available after interruption.
 
 ```sh
 python owntech/tools/lead_update.py --serial LEAD_USB_SERIAL --status

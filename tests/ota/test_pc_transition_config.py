@@ -87,7 +87,7 @@ class CampaignWire:
             self.offset += length
             if self.offset == len(self.data):
                 self.phase = "ALL_VALIDATED"
-            return {"offset": self.offset}
+            return {"rc": 0, "offset": self.offset}
         if command == "commit":
             assert self.phase == "ALL_VALIDATED"
             self.commit_pending = True

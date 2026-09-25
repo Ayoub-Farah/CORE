@@ -427,14 +427,18 @@ class Campaign:
         while self.clock() < deadline:
             result = self._collect()
             self._table(result)
-            if str(result.get("phase", result.get("state", ""))).upper() in ("FAILED", "ABORTED"):
+            phase = str(result.get("phase", result.get("state", ""))).upper()
+            if phase in ("FAILED", "ABORTED"):
                 raise CampaignError("%s failed: %s" % (description, result))
             if any(row.get("error") not in (None, 0, "", "NONE") for row in result["targets"]):
                 raise CampaignError("target error during %s" % description)
             if predicate(result):
                 return result
             served = self._serve_source(result)
-            self.sleep(0.001 if served else self.poll_interval)
+            # Between source credits the worker still needs to finish CAN TX
+            # and open its next window. A zero-length credit during streaming
+            # must not impose the normal 400 ms status interval on every block.
+            self.sleep(0.01 if served or phase == "CAN_TRANSFER" else self.poll_interval)
         raise CampaignError("bounded timeout during " + description)
 
     def discover(self):
@@ -512,10 +516,23 @@ class Campaign:
             raise CampaignError("invalid source credit campaign or bounds")
         # Retransmissions can request older offsets. The immutable PC bytes
         # remain the authority; only the exact requested block is sent.
-        reply = self.request("stage_data", {"campaign": self.journal.campaign,
-            "offset": offset, "data": self.artifact[offset:offset + length]})
-        if reply.get("offset") != offset + length:
-            raise CampaignError("Lead did not accept the exact source credit")
+        try:
+            reply = self.request("stage_data", {"campaign": self.journal.campaign,
+                "offset": offset, "data": self.artifact[offset:offset + length]})
+        except CommandError as error:
+            self.journal.emit("PC_SOURCE_REJECTED", self.lead, source_offset=offset,
+                              source_length=length, response=error.response, error=str(error))
+            raise
+        # rc=0 acknowledges synchronous validation/copy of this exact credit.
+        # The reply's offset is the worker's CAN transmission progress, not a
+        # source-buffer acknowledgement: it can lag or be ahead on a replay.
+        if (not isinstance(reply, dict) or type(reply.get("rc")) is not int or reply["rc"] != 0
+                or reply.get("err") or type(reply.get("offset")) is not int
+                or not 0 <= reply["offset"] <= len(self.artifact)):
+            self.journal.emit("PC_SOURCE_REJECTED", self.lead, source_offset=offset,
+                              source_length=length, response=reply)
+            raise CampaignError("Invalid source credit acknowledgement at offset %d, length %d: %r"
+                                % (offset, length, reply))
         return True
 
     def _all_valid(self, result):
@@ -538,8 +555,13 @@ class Campaign:
                     # Reconciliation while this campaign is busy only yields
                     # OTA_ERR_STATE and hides e.g. a failed journal commit.
                     raise CampaignError("commit/reboot failed: %s" % result)
-                if phase in ("RECOVERY_REQUIRED", "POSTBOOT_CHECK", "SUCCESS"):
+                if phase == "SUCCESS":
+                    return result
+                if phase == "RECOVERY_REQUIRED":
                     return
+                # A dedicated Lead performs discovery and postboot release
+                # itself while busy. POSTBOOT_CHECK is still in progress;
+                # command10 here would conflict with its own reconciliation.
             except TransportError:
                 # A lost COMMIT ACK or disappearing USB port does not establish
                 # whether activation occurred. Follow only the selected Lead,
@@ -557,18 +579,21 @@ class Campaign:
         raise CampaignError("PARTIAL: bounded timeout waiting for commit/reboot; "
                             "activation remains uncertain, preserve the campaign journal")
 
-    def reconcile(self):
+    def reconcile(self, completed_status=None):
         deadline = self.clock() + self.timeout
         expected_hash = self.manifest["mcuboot_image_hash"]
         self.journal.emit("RECONCILE_BEGIN", targets=self.targets)
         good = set()
         while self.clock() < deadline:
             try:
-                result = self._collect("reconcile", {"campaign": self.journal.campaign,
-                    "targets": self.targets, "mcuboot_image_hash": bytes.fromhex(expected_hash)})
+                result = completed_status if completed_status is not None else self._collect("reconcile", {
+                    "campaign": self.journal.campaign, "targets": self.targets,
+                    "mcuboot_image_hash": bytes.fromhex(expected_hash)})
                 good = set()
+                observed = set()
                 for row in result["targets"]:
                     target = identity(row["identity"])
+                    observed.add(target)
                     active_hash = row.get("mcuboot_image_hash")
                     if isinstance(active_hash, bytes):
                         active_hash = active_hash.hex()
@@ -578,14 +603,23 @@ class Campaign:
                     valid = (target in self.targets and active_hash == expected_hash
                              and version == self.manifest["version"]
                              and row.get("build_id") == self.manifest["build_id"]
-                             and row.get("healthy") is True and row.get("confirmed") is True)
+                             and row.get("healthy") is True and row.get("confirmed") is True
+                             and (completed_status is None or (
+                                 row.get("state") == "SUCCESS" and row.get("campaign") == self.journal.campaign
+                                 and type(row.get("error")) is int and row["error"] == 0)))
                     row["postboot"] = "SUCCESS" if valid else "WRONG_IMAGE_OR_UNHEALTHY"
                     if valid:
                         good.add(target)
                 self._table(result)
-                if good == set(self.targets) and result.get("phase") == "SUCCESS":
+                if (good == observed == set(self.targets) and result.get("phase") == "SUCCESS"
+                        and (completed_status is None or result.get("campaign") == self.journal.campaign)):
                     self.journal.emit("SUCCESS", targets=self.targets)
                     return "SUCCESS"
+                if completed_status is not None:
+                    self.journal.emit("PARTIAL", error="automatic reconciliation result differs from frozen campaign",
+                                      status=result)
+                    raise CampaignError("PARTIAL: automatic reconciliation SUCCESS does not match the exact "
+                                        "campaign, receiver roster and healthy confirmed image")
             except TransportError:
                 if not self.reconnect:
                     break
@@ -630,8 +664,7 @@ class Campaign:
                 self.request("commit", {"campaign": self.journal.campaign})
             except TransportError:
                 pass
-            self._wait_commit_reboot()
-            return self.reconcile()
+            return self.reconcile(completed_status=self._wait_commit_reboot())
         except Exception as error:
             if not self.committed:
                 try:

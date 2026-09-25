@@ -1,6 +1,6 @@
 # Incident OTA du MMC : problèmes identifiés et prévention
 
-État au 25 septembre 2026 : réparation individuelle des deux cartes (SM2 puis SM1), puis découplage CAN/OTA dans le code. Cette nouvelle version découplée n'est pas encore installée sur les cartes.
+État au 25 septembre 2026 : réparation individuelle des deux cartes (SM2 puis SM1), découplage CAN/OTA, puis première campagne CAN complète réussie avec le nouveau main sans callbacks OTA.
 
 ## Ce qui a posé problème
 
@@ -57,16 +57,16 @@ Le Lead prévoit déjà une redécouverte après redémarrage et possède des co
 | UID réels associés à SM1 et SM2 | Corrigé dans le code, testé |
 | Confirmation locale d'un follower sans SYNC | Corrigée, testée et vérifiée sur SM2 |
 | Contrôle de santé installé lors des réparations | Identité MMC, initialisation, tâche de fond, sorties arrêtées ; cycles locaux exigés pour SM1 seulement |
-| Découplage du code actuel | Confirmation du socle CAN/OTA sans callback applicatif, sans UID MMC, sans tâche MMC ni SYNC ; validation matérielle de cette nouvelle version à faire |
+| Découplage du code actuel | Confirmation du socle CAN/OTA sans callback applicatif ; déploiement et disponibilité vérifiés sur les deux cartes avec le nouveau main |
 | Campagne bloquée sur SM2 | Réparée par SWD après sauvegardes et vérification du retour arrière |
 | Campagne bloquée sur SM1 | Réparée à partir de ses propres sauvegardes ; même image corrigée installée et confirmée |
 | Vérification des rôles avant transfert | Pas encore implémentée |
 | Cause du `-4` du Lead | À investiguer |
-| Cycle OTA complet avec le MMC sur deux récepteurs | À refaire |
+| Cycle OTA complet avec le nouveau MMC sur deux récepteurs | Réussi : campagne `6169884459129618946`, deux cartes confirmées et disponibles |
 
-**Résultat vérifié individuellement sur SM1 et SM2 : `IDLE`, erreur `0`, firmware confirmé automatiquement, santé locale et CAN valides, récepteur disponible en OTA.** Les deux cartes exécutent le même build `ota-d8f4b20f4ffa5d7e56c19ecf`. Les sorties ont été vérifiées arrêtées ; les bootloaders, secondaires et calibrations enregistrées sont préservés.
+**Résultat après les réparations individuelles, avant le déploiement du découplage : `IDLE`, erreur `0`, firmware confirmé automatiquement, santé locale et CAN valides, récepteur disponible en OTA.** Les deux cartes exécutaient alors le même build `ota-d8f4b20f4ffa5d7e56c19ecf`. Les sorties ont été vérifiées arrêtées ; les bootloaders, secondaires et calibrations enregistrées ont été préservés.
 
-La confirmation locale ne valide pas le fonctionnement de puissance ni la perte de SYNC en exploitation. Le cycle complet via le Lead reste à refaire. Les détails flash, hashes et preuves sont dans les rapports [SM2](../recovery-backups/2026-09-25-3232500B00290049/README.md) et [SM1](../recovery-backups/2026-09-25-3232500B0029004C/README.md).
+La confirmation locale ne valide pas le fonctionnement de puissance ni la perte de SYNC en exploitation. Le cycle complet via le Lead a ensuite réussi, comme décrit plus bas. Les détails des réparations, hashes et preuves sont dans les rapports [SM2](../recovery-backups/2026-09-25-3232500B00290049/README.md) et [SM1](../recovery-backups/2026-09-25-3232500B0029004C/README.md).
 
 ## Découplage réalisé : remplacer le main sans réécrire CAN/OTA
 
@@ -82,7 +82,7 @@ Le socle prend maintenant en charge :
 
 **Utilisation : remplacer `src/main.cpp` et compiler avec l'environnement `OTA`.** Aucun include ou callback OTA n'est obligatoire. Un main qui retourne, dort, attend SYNC ou boucle normalement ne doit pas empêcher les services de tourner. L'environnement `USB_LEAD` conserve son application dédiée ; l'environnement ordinaire `USB` ne garantit pas la présence du récepteur OTA.
 
-Le MMC conserve seulement une observation facultative de l'inhibition pour gérer ses commandes et son réarmement après un nouvel état IDLE. Il ne pilote plus la disponibilité de CAN/OTA. Une carte inconnue peut donc refuser la puissance tout en restant accessible pour recevoir un logiciel corrigé.
+Le MMC utilisé pour la validation logicielle du découplage conservait une observation facultative de l'inhibition pour gérer ses commandes et son réarmement après un nouvel état IDLE. Le main remplacé ensuite par l'utilisateur ne reprend pas cette observation. La disponibilité de CAN/OTA ne dépend pas de ces fonctions applicatives ; le refus de puissance pour une carte inconnue et la gestion des commandes après inhibition doivent être vérifiés pour chaque application.
 
 **Le sens de « santé » change explicitement : il s'agit de la santé du service de mise à jour.** Une image confirmée peut contenir une application MMC défaillante ; son diagnostic et son autorisation de puissance restent distincts. Les contrôles de journal, de hash, de retour arrière et de sécurité matérielle ne sont pas contournés. Un journal incohérent reste un motif légitime de refus.
 
@@ -94,11 +94,19 @@ Pour récupérer même dans ces situations, l'étape suivante serait un **bootlo
 
 ### Vérification logicielle du découplage
 
-La commande `python -m unittest discover -s tests/ota -p '*test*.py'` termine sans échec : 386 tests, dont un ignoré parce que la création de liens symboliques exige des privilèges Windows supplémentaires. Elle couvre notamment les runtimes récepteur/Lead sans hooks applicatifs, l'arrêt matériel avant initialisation PWM, les gardes NVS, les priorités et le réarmement MMC. Les tests matériels utilisent des substituts ; ils ne mesurent ni le temps réel ni les signaux électriques.
+Lors de la validation du découplage, avant le remplacement du main, la commande `python -m unittest discover -s tests/ota -p '*test*.py'` a terminé sans échec : 386 tests, dont un ignoré parce que la création de liens symboliques exige des privilèges Windows supplémentaires. Elle couvrait notamment les runtimes récepteur/Lead sans hooks applicatifs, l'arrêt matériel avant initialisation PWM, les gardes NVS, les priorités et le réarmement MMC. Les tests matériels utilisent des substituts ; ils ne mesurent ni le temps réel ni les signaux électriques.
 
 Le build `OTA` du MMC sans callbacks produit une image CAN de 204 828 octets. Les images USB et CAN ont une signature vérifiée par `imgtool` et le même hash MCUboot `4d946d879d9df7ab4b5f97763e287f6a1c7a5fb61a0d091fefc41a0cfff6f789` (build `ota-d0130040168cf4c8cf56ab2d`). Les priorités 12/10/10 sont présentes dans la configuration compilée. Les journaux de compilation sont conservés dans [ota-artifacts/qualification/ota-autonomy](../ota-artifacts/qualification/ota-autonomy/).
 
 Le build `USB_LEAD` réussit également, avec une image compacte de 198 052 octets ; ses signatures USB/CAN sont vérifiées et leur hash MCUboot correspond. Aucun de ces nouveaux builds n'a été flashé pendant cette validation logicielle. Les essais de disponibilité face à un main occupé, les deux campagnes CAN consécutives et les mesures de temps réel restent à réaliser sur le banc.
+
+### Premier déploiement du découplage depuis le Lead
+
+Après remplacement du main par l'utilisateur, l'image `ota-7c602295d5a07efc4667f737` a été compilée et transférée aux deux cartes lors de la campagne `6169884459129618946`, terminée avec succès le 25 septembre à 15:58:42 UTC. Ce main ne contient aucune fonction OTA. Seuls les UID SM1/SM2, revenus aux anciennes valeurs, ont été rétablis selon l'affectation convenue.
+
+Les deux cartes exécutent le hash MCUboot `8b6a363c70c3fbd914faaafcaf5172062c03b5884a0c01f9ea7aa85587a2aa6f`, confirmé automatiquement. Leur état final est `SUCCESS`, erreur `0`, `healthy=true`, `confirmed=true`, `available=true`. Les adresses CAN ont changé de `7` à `52` pour SM1 et de `93` à `155` pour SM2 ; le Lead les a retrouvées par EUI et a terminé la réconciliation sans erreur `-4`.
+
+Le Lead n'a pas été reflashé. Aucun accès ST-Link, reset forcé ni effacement de journal n'a été nécessaire. Le main déployé attend un maître MMC distinct ; la réussite OTA ne valide pas son fonctionnement de puissance. Une deuxième campagne consécutive et les essais d'un main volontairement occupé restent à faire. Voir le [rapport et les preuves de campagne](../ota-artifacts/operations/20260925T155432Z-main-can-update/README.md).
 
 ## Recommandations pour éviter une récidive
 
@@ -171,7 +179,7 @@ Dans l'interface, distinguer réception, validation, activation, santé, confirm
 | Main qui retourne ou boucle sans dormir | CAN/OTA toujours joignable si interruptions et ordonnanceur opérationnels | Priorités contrôlées à la compilation ; essai sur carte à faire |
 | Écriture NVS applicative en maintenance, ou effacement global | Refus ; journal OTA préservé | Tests logiciels ajoutés |
 | Carte inconnue, rôle dupliqué ou configuration différente du binaire | Refus avant effacement du secondaire | À ajouter avec la vérification préalable |
-| Changement d'adresse CAN après redémarrage | Même identité retrouvée sans fausse collision | À tester sur le Lead |
+| Changement d'adresse CAN après redémarrage | Même identité retrouvée sans fausse collision | Vérifié sur les deux cartes lors de la campagne réussie ; ancienne cause du `-4` non démontrée |
 | Retour arrière après commit | Diagnostic précis et récupération maîtrisée | Réparations SM1/SM2 réussies ; procédure générale à prévoir |
 | Perte de SYNC en exploitation | Arrêt des sorties selon les exigences MMC | À qualifier |
 | Coupure pendant activation ou récupération | Reprise contrôlée, données non OTA préservées | À qualifier |
@@ -183,7 +191,7 @@ Vérifier aussi les coefficients de mesure avant un essai de puissance : la cons
 
 ## Prochaines actions
 
-1. Installer la version découplée, vérifier un main minimal et un main occupé sur carte, puis retrouver les deux récepteurs depuis le Lead dans un même inventaire.
+1. Compléter le premier déploiement réussi par les essais d'un main minimal et d'un main occupé sur carte.
 2. Ajouter la vérification applicative avant transfert et la configuration commune liée à l'image.
 3. Déterminer la cause du `-4` du Lead et vérifier le suivi des adresses.
 4. Valider deux campagnes consécutives avec les deux récepteurs, puis qualifier séparément la puissance et la perte de synchronisation.

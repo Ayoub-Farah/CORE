@@ -21,7 +21,7 @@ static void next(ota_coordinator *c, uint64_t now)
 void ota_coordinator_default_options(ota_coordinator_options *o)
 {
     memset(o, 0, sizeof(*o));
-    o->total_timeout_ms = 600000; o->command_timeout_ms = 20000; o->retry_interval_ms = 250;
+    o->total_timeout_ms = 1800000; o->command_timeout_ms = 20000; o->retry_interval_ms = 250;
     o->inter_block_ms = 10; o->reboot_delay_ms = 1000; o->max_passes = 5; o->max_stalled_passes = 2;
 }
 static int init(ota_coordinator *c, const ota_manifest *m, const ota_target *targets, size_t count,

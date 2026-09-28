@@ -99,6 +99,23 @@ class ReceiverStatusTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assert_read_only()
 
+    def test_running_recovery_helper_is_reported_instead_of_a_timeout_or_ota_success(self):
+        for result, rc, confirmed in (("ALREADY_RECOVERED", 1, 1), ("RECOVERED", 0, 1),
+                                      ("JOURNAL_REFUSED", -4, 0)):
+            self.requests.clear()
+            self.client.last_request = -1e9
+            line = ("OTA_RECOVERY %s rc=%d EUI=446175dbdc484504 confirmed=%d; outputs inhibited\n"
+                    % (result, rc, confirmed)).encode("ascii")
+            self.responses = {1: b"startup prefix " + line}
+            with self.subTest(result=result), self.assertRaisesRegex(CampaignError, "recovery helper is running") as stopped:
+                self.client.request("info")
+            self.assertIn(result, str(stopped.exception))
+            self.assertIn("446175dbdc484504", str(stopped.exception))
+            self.assertIn("Finish receiver recovery", str(stopped.exception))
+            self.assertNotIsInstance(stopped.exception, ReceiverProbeTimeout)
+            self.assertEqual(len(self.requests), 1)
+            self.assert_read_only()
+
     def test_incompatible_reply_fails_immediately_without_retry(self):
         self.responses[1] = status_line(protocol=1)
         self.responses[2] = status_line()

@@ -244,6 +244,65 @@ def classify_boot_state(image_state, helper_hash, receiver_hash):
     return "UNEXPECTED", "The images or activation flags do not match an expected recovery state. Preserve this snapshot for diagnosis."
 
 
+def inspect_connected_bootloader(serial_number, output, *, enumerate_ports, transport_factory=SerialSMP,
+                                timeout=30, clock=time.monotonic, sleep=time.sleep):
+    """Read slots after operator-confirmed physical entry, without needing a live application or archive."""
+    require(isinstance(serial_number, str) and bool(serial_number), "Explicit USB serial required")
+    require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+            and math.isfinite(timeout) and 0 < timeout <= 60, "Bootloader inspection timeout must be within 0..60 seconds")
+    deadline = clock() + timeout
+    last = "selected USB serial is absent"
+    while clock() < deadline:
+        ports = [p for p in enumerate_ports() if p.vid == 0x2FE3 and p.serial_number == serial_number]
+        require(len(ports) <= 1, "Multiple USB interfaces for the selected board; bootloader port is ambiguous")
+        transport = None
+        if ports:
+            device = ports[0].device
+            try:
+                transport = transport_factory(device, timeout=min(2, max(0.01, deadline - clock())))
+                try:
+                    transport.request("info")
+                except CommandError as error:
+                    require(error.unsupported, "Bootloader service proof must be unsupported OTA group rc=8")
+                else:
+                    raise CampaignError("The application still replies. Follow the physical BOOT + RESET prompt before inspecting the bootloader.")
+                if clock() < deadline:
+                    transport.timeout = min(2, deadline - clock())
+                    image_state = transport.image_state()
+                    # A COM number alone cannot bind a snapshot to the chosen board.
+                    select_port(enumerate_ports(), serial_number, device)
+                    result = dict(result="BOOTLOADER_IMAGE_STATE", usb_serial=serial_number, port=device,
+                                  timestamp=datetime.now(timezone.utc).isoformat(), image_state=image_state)
+                    # Empty lists and unconfirmed/pending images are evidence, not permission to repair.
+                    transition._save(output, result)
+                    return result
+            except OSError as error:
+                last = str(error)
+            finally:
+                if transport:
+                    transport.close()
+        sleep(min(0.25, max(0, deadline - clock())))
+    raise CampaignError("No bootloader image state for USB %s within %g seconds (%s). "
+                        "No erase, upload, confirmation or reset command was sent." % (serial_number, timeout, last))
+
+
+def bootloader_summary(result):
+    lines = ["USB serial: " + result["usb_serial"], "Port: " + result["port"],
+             "Bootloader image list received. Application health and maintenance remain unknown."]
+    images = result["image_state"]["images"]
+    if not images:
+        lines += ["", "No image was recognized by the bootloader. This does not prove that the flash is empty."]
+    for item in images:
+        digest = item.get("hash")
+        if isinstance(digest, bytes):
+            digest = digest.hex()
+        lines += ["", "Slot %s | version: %s" % (item["slot"], item["version"]),
+                  "Hash: " + (digest or "not reported")]
+        lines += ["%s: %s" % (key, str(item[key]).lower() if key in item else "not reported")
+                  for key in ("active", "confirmed", "pending", "permanent", "bootable")]
+    return "\n".join(lines)
+
+
 def inspect_boot_state(serial_number, target, helper, receiver, output, *, enumerate_ports, transport_factory=SerialSMP):
     """Explicit physical bootloader entry, followed only by info/image-state reads."""
     device = select_port(enumerate_ports(), serial_number).device
@@ -425,6 +484,18 @@ class RecoveryWorkflow:
                        log_path=path / "recovery.jsonl", enumerate_ports=self.w.enumerate)
 
     def run(self, action, serial_number):
+        if action == "recovery-bootloader-inspect":
+            self.w.boot_prompt(serial_number, "Inspect connected bootloader", reason=
+                               "Use this diagnostic when Check connected board stays silent. No recovery archive is required. "
+                               "Only the bootloader image list is read; no erase, upload, confirmation or reset command is sent.")
+            output = self.w.project / "ota-artifacts/diagnostics" / (
+                "bootloader-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json")
+            result = inspect_connected_bootloader(serial_number, output, enumerate_ports=self.w.enumerate)
+            message = bootloader_summary(result) + "\n\nSnapshot: " + str(output)
+            print("OwnTech: " + message, flush=True)
+            self.ui.notice("Connected bootloader", message +
+                           "\n\nInspection only: no recovery was performed. Leave the board in its bootloader and retain this snapshot for diagnosis.")
+            return
         path, state = self.choose_operation(serial_number, new_allowed=action not in ("recovery-finish", "recovery-boot-state"))
         _, helper, receiver, data = self.context(path, state)
         require(state["phase"] in ("PREPARED", "INSPECTED", "HELPER_INSTALLING", "HELPER_STARTED", "RECOVERED",

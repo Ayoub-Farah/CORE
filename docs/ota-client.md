@@ -164,7 +164,7 @@ Select the Lead USB serial and exact expected inventory, including the Lead, in
 custom_ota_serial = YOUR_USB_SERIAL_NUMBER
 custom_ota_expected_ids = 0102030405060708, 1112131415161718, 2122232425262728
 ; Alternatively on a controlled bench: custom_ota_expected_count = 3
-custom_ota_timeout = 180
+custom_ota_timeout = 1800
 ```
 
 Pause power conversion/control on the whole fleet before starting the command;

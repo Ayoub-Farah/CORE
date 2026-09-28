@@ -11,6 +11,8 @@ import uuid
 RECOVERY_TASKS = (
     ("ota_board_status", "status", "Check connected board",
      "Read the connected board's application status"),
+    ("ota_bootloader_inspect", "recovery-bootloader-inspect", "Inspect connected bootloader",
+     "Read image slots after physical BOOT + RESET; no recovery archive or flash operation needed"),
     ("ota_recovery_inspect", "recovery-inspect", "Prepare and inspect receiver recovery",
      "Select a failed precommit campaign, build its recovery image and inspect one receiver"),
     ("ota_recovery_run", "recovery-run", "Recover interrupted receiver",

@@ -16,8 +16,8 @@ from smp_transport import SerialSMP, TransportError, ReceiverProbeTimeout, Proto
 from bootloader_upload import upload_image, UploadError
 
 
-# Allow larger fleets to finish streaming; the Lead also bounds a campaign to 10 minutes.
-DEFAULT_CAMPAIGN_TIMEOUT = 600
+# Allow larger fleets to finish streaming; the Lead also bounds a campaign to 30 minutes.
+DEFAULT_CAMPAIGN_TIMEOUT = 1800
 
 
 class CampaignError(RuntimeError):
@@ -65,6 +65,14 @@ class ReceiverStatus:
                 line = self.port.readline(1025)
                 if len(line) > 1024:
                     raise ProtocolError("receiver status exceeds the bounded response")
+                recovery = re.search(rb"OTA_RECOVERY ([A-Z_]+) rc=(-?\d+) EUI=([0-9a-f]{16}) confirmed=([01]); outputs inhibited", line)
+                if recovery:
+                    detail = recovery.group(0).decode("ascii")
+                    raise CampaignError(
+                        "The recovery helper is running on %s; the receiver application has not been restored.\n%s\n"
+                        "Use OTA_RECOVERY > Finish receiver recovery with this board's saved recovery archive. "
+                        "If that archive is unavailable, preserve this result for diagnosis. No reset or upload was sent."
+                        % (self.device, detail))
                 marker = line.find(b"OTAR2 ")
                 if marker < 0:
                     continue
@@ -79,7 +87,9 @@ class ReceiverStatus:
                 return result
             raise ReceiverProbeTimeout(
                 "no OTAR2 status on %s after %d read-only requests; board state is unknown. "
-                "Close Serial Monitor/Scope and retry Check connected board; a timeout does not establish that initialization is needed"
+                "Close Serial Monitor/Scope and retry Check connected board. If the port is free and silence persists, "
+                "use OTA_RECOVERY > Inspect connected bootloader and follow its physical BOOT + RESET prompt. "
+                "A timeout does not establish that initialization is needed"
                 % (self.device, attempts))
         finally:
             self.port.baudrate = 115200

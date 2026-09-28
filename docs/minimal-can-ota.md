@@ -55,6 +55,18 @@ timeout, without sending console bytes or resetting the board. A missing
 not a reason to initialize a board with an existing campaign. Close other
 serial tools and retry **Check connected board**. A returned `FAILED` state is
 the campaign result, not a USB detection failure.
+If the port is free but status remains silent, use **OTA_RECOVERY > Custom >
+Inspect connected bootloader** and follow its physical BOOT + RESET prompt.
+This diagnostic needs neither a live OTA reply nor a recovery archive. It waits
+up to 30 seconds for the same USB serial, reads only the existing bootloader's
+image list and saves `ota-artifacts/diagnostics/bootloader-*.json`. It performs
+no erase, upload, confirmation or software reset. Keep the board in its bootloader
+and examine the snapshot before deciding the next step. Image flags alone do
+not establish application health, maintenance state or recovery completion.
+If the console reports `OTA_RECOVERY`, **Check connected board** identifies the
+running recovery helper instead of treating it as an unresponsive OTA application.
+Even `RECOVERED` or `ALREADY_RECOVERED` means the original receiver still needs to
+be restored: use **Finish receiver recovery** with that board's saved archive.
 
 Receiver status also reports `deferred_arm_qualified`, the compiled activation
 gate. An unqualified receiver now advertises unavailable and rejects PREPARE
@@ -134,12 +146,13 @@ Alternatively, use `--expected-count 2` when a receiver count is sufficient.
 The expected IDs and count always exclude the Lead. With exact IDs, an absent
 or unexpected receiver causes discovery to fail before the campaign starts.
 
-The PC client allows 600 seconds per campaign wait phase, including CAN transfer
+The PC client allows 1800 seconds (30 minutes) per campaign wait phase, including CAN transfer
 and validation. This is a fixed deadline, not an inactivity timeout: continued
 transfer progress does not extend it. The graphical task uses this default and
 does not read `custom_ota_timeout`; the direct CLI accepts `--timeout SECONDS`.
-The Lead firmware separately limits the overall campaign to 600 seconds, so
-increasing the PC timeout alone cannot extend that firmware limit.
+The Lead firmware separately limits the overall campaign to 1800 seconds, so
+increasing the PC timeout alone cannot extend that firmware limit. Rebuild and
+reinstall `USB_LEAD` for an already installed Lead to use the new 30-minute limit.
 
 The assistant explicitly builds the
 `OTA` environment and distributes its compact receiver artifact. It does not
@@ -230,6 +243,7 @@ For a compact receiver transfer that failed **before activation**, PlatformIO
 | Action | Purpose |
 | --- | --- |
 | **Check connected board** | Read the application status of the USB-connected board. |
+| **Inspect connected bootloader** | Diagnose a silent application after physical BOOT + RESET; save image slots and flags without a recovery archive or flash operation. |
 | **Prepare and inspect receiver recovery** | Select the failed campaign, archive its evidence and original firmware, build the scoped helper, then inspect the bootloader slots without writing flash. |
 | **Recover interrupted receiver** | Perform preparation/inspection if needed, install the helper, verify its result, restore the original receiver firmware and check the final state. |
 | **Finish receiver recovery** | Continue the saved recovery for the same USB serial after a cancellation or interruption. |
@@ -279,7 +293,8 @@ the restored image, identity, confirmation and clean maintenance state.
 
 If the new actions are not visible, refresh PlatformIO Project Tasks. The
 equivalent terminal targets are `ota_board_status`, `ota_recovery_inspect`,
-`ota_recovery_run`, `ota_recovery_finish` and `ota_recovery_boot_state`, under `-e OTA_RECOVERY`.
+`ota_recovery_run`, `ota_recovery_finish`, `ota_recovery_boot_state` and
+`ota_bootloader_inspect`, under `-e OTA_RECOVERY`.
 Listing or launching the assistants requires no pre-existing recovery config;
 the wizard builds with a private configuration and preserves `src/app.ini`.
 

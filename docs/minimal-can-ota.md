@@ -233,6 +233,7 @@ For a compact receiver transfer that failed **before activation**, PlatformIO
 | **Prepare and inspect receiver recovery** | Select the failed campaign, archive its evidence and original firmware, build the scoped helper, then inspect the bootloader slots without writing flash. |
 | **Recover interrupted receiver** | Perform preparation/inspection if needed, install the helper, verify its result, restore the original receiver firmware and check the final state. |
 | **Finish receiver recovery** | Continue the saved recovery for the same USB serial after a cancellation or interruption. |
+| **Inspect recovery boot state** | After a missing recovery result, enter the bootloader as instructed and save a read-only snapshot of both image slots and activation flags. |
 
 Start with one receiver connected by USB in its application (no BOOT/RESET).
 Close Serial Monitor/Scope and keep power outputs stopped. Choose **Recover
@@ -243,6 +244,12 @@ before writing. It restores the original archived receiver firmware, not a new
 build of `src/main.cpp`. Repeat for each affected receiver. These actions exclude
 the Lead and campaigns that already requested activation.
 
+An isolated USB receiver may display `WAITING_CAN` while `maintenance` remains
+true: this diagnostic phase masks the retained OTA state until a CAN peer is
+available. Recovery accepts this case with local health, the confirmed original
+image and a matching precommit campaign; it does not require a CAN peer. The
+bootloader slot checks and the helper's on-device journal checks still apply.
+
 Progress, firmware, receipts and logs remain under
 `ota-artifacts/operations/<operation>/`. Use **Finish receiver recovery** after
 a cancelled dialog. If an upload's result is uncertain, this action checks the
@@ -251,9 +258,28 @@ A partially written or unrecognized image stops for diagnosis. A successful
 finish requires the correct confirmed image and maintenance released; a receiver
 without a CAN peer may report `WAITING_CAN` until the bus is reconnected.
 
+After a helper upload reaches 100%, a missing console result does not establish
+that cleanup succeeded or failed. Leave BOOT released, close Serial Monitor/Scope
+and use **Finish receiver recovery** with the saved operation. The result reader
+waits up to 60 seconds, follows USB re-enumeration for the same serial and preserves
+fragmented console lines. It records received bytes and reconnect errors in
+`recovery-result-console.log` beside `operation.json`, including on timeout.
+It sends no console command, upload or reset during this observation.
+If the log reports no console bytes, use **Inspect recovery boot state** with
+that same archive instead of repeating the result wait. Follow the physical
+BOOT + RESET prompt, then retain the displayed diagnosis and the timestamped
+`recovery-boot-state-*.json` snapshot. The task sends no flash or reset command
+and leaves the recovery phase unchanged. Even a confirmed helper image is not
+treated as proof that cleanup finished; restoration still requires its result.
+After the receiver firmware upload, final verification also waits up to 60 seconds
+for the same USB serial to return and leave `BOOT`. Temporary USB absence or a
+changed COM number does not restart installation. If verification stops at
+`RECEIVER_STARTED`, use **Finish receiver recovery**; that phase only verifies
+the restored image, identity, confirmation and clean maintenance state.
+
 If the new actions are not visible, refresh PlatformIO Project Tasks. The
 equivalent terminal targets are `ota_board_status`, `ota_recovery_inspect`,
-`ota_recovery_run` and `ota_recovery_finish`, under `-e OTA_RECOVERY`.
+`ota_recovery_run`, `ota_recovery_finish` and `ota_recovery_boot_state`, under `-e OTA_RECOVERY`.
 Listing or launching the assistants requires no pre-existing recovery config;
 the wizard builds with a private configuration and preserves `src/app.ini`.
 

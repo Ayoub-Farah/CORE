@@ -449,7 +449,7 @@ class Workflow:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("initialize", "to-usb", "to-ota", "status", "can-update", "reconcile",
-                                          "recovery-inspect", "recovery-run", "recovery-finish"))
+                                          "recovery-inspect", "recovery-run", "recovery-finish", "recovery-boot-state"))
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--environment", choices=("USB", "OTA", "USB_LEAD", "OTA_RECOVERY"), required=True)
     parser.add_argument("--mcumgr", type=Path, required=True)

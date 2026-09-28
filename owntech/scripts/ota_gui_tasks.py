@@ -17,6 +17,8 @@ RECOVERY_TASKS = (
      "Guide one receiver through recovery and restoration of its original firmware"),
     ("ota_recovery_finish", "recovery-finish", "Finish receiver recovery",
      "Continue a saved receiver recovery without repeating an uncertain upload"),
+    ("ota_recovery_boot_state", "recovery-boot-state", "Inspect recovery boot state",
+     "Read bootloader image slots for a saved recovery; never erase, upload, confirm or reset"),
 )
 RECOVERY_GUI_TARGETS = frozenset(row[0] for row in RECOVERY_TASKS)
 GUI_ONLY_TARGETS = frozenset({

@@ -123,9 +123,70 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.w.info.return_value = self.info
         self.events.insert(-1, dict(self.events[-1], event="COMMIT_REQUEST"))
         self.write_events()
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(CampaignError, "Cannot use campaign journal"):
             self.r.prepare("selected")
         self.runner.assert_not_called()
+
+    def test_mixed_journal_error_names_selected_file_and_valid_alternative(self):
+        wrong = self.journal.with_name("old-mixed.jsonl")
+        events = copy.deepcopy(self.events)
+        events[-1]["campaign"] += 1
+        wrong.write_text("".join(json.dumps(event) + "\n" for event in events))
+        original = wrong.read_bytes()
+        self.ui.answers["Interrupted CAN campaign"] = "browse"
+        self.ui.file.side_effect = None
+        self.ui.file.return_value = wrong
+        with self.assertRaises(CampaignError) as stopped:
+            self.r.prepare("selected")
+        self.assertIn("mixed campaign IDs", str(stopped.exception))
+        self.assertIn(str(wrong), str(stopped.exception))
+        self.assertIn(str(self.journal), str(stopped.exception))
+        self.assertEqual(self.ui.file.call_args.args[1], self.w.operations)
+        self.assertEqual(wrong.read_bytes(), original)
+        self.runner.assert_not_called()
+
+    def test_already_recovered_receiver_stops_before_journal_selection(self):
+        self.w.info.return_value = dict(self.info, phase="IDLE", maintenance=False)
+        with self.assertRaisesRegex(CampaignError, "connect the next affected receiver"):
+            self.r.prepare("selected")
+        self.ui.choose.assert_not_called()
+        self.ui.file.assert_not_called()
+        self.runner.assert_not_called()
+
+    def test_usb_only_receiver_in_maintenance_can_be_prepared_and_inspected(self):
+        self.info.update(phase="WAITING_CAN", can_ready=False, healthy=False, error=0)
+        path, state = self.prepared()
+        config, _, _, _ = self.r.context(path, state)
+        self.assertEqual(config["targets"][0]["identity"], IDS[1])
+        with patch.object(recovery, "recover") as operation, patch.object(recovery, "restore_receiver") as restore:
+            self.r.run("recovery-inspect", "selected")
+        self.assertEqual(operation.call_count, 1)
+        self.assertFalse(operation.call_args.kwargs["apply"])
+        restore.assert_not_called()
+
+    def test_waiting_can_does_not_bypass_maintenance_health_or_campaign_guards(self):
+        self.info.update(phase="WAITING_CAN", can_ready=False, healthy=False, error=0)
+        config = recovery.recovery_config(self.journal, compact_receiver_only=True)
+        for change in ({"maintenance": False}, {"maintenance": None}, {"local_healthy": False},
+                       {"active_confirmed": False}, {"mcuboot_image_hash": "ff" * 32},
+                       {"identity": IDS[0]}, {"can_ready": True}, {"healthy": True},
+                       {"error": -17}, {"error": False}):
+            with self.subTest(change=change), self.assertRaises(CampaignError):
+                self.r.match_board(dict(self.info, **change), config)
+        self.events.insert(-1, dict(self.events[-1], event="COMMIT_REQUEST"))
+        self.write_events()
+        self.ui.answers["Interrupted CAN campaign"] = "browse"
+        self.ui.file.side_effect = None
+        self.ui.file.return_value = self.journal
+        with self.assertRaisesRegex(CampaignError, "before any commit or reboot"):
+            self.r.prepare("selected")
+        self.runner.assert_not_called()
+
+    def test_maintenance_with_ineligible_phase_is_not_described_as_already_recovered(self):
+        for phase in ("PASS_OPEN", "VERIFYING", "COMMIT_INTENT", "COMMITTED", "REBOOTING", "IDLE"):
+            with self.subTest(phase=phase), self.assertRaisesRegex(CampaignError, "still in maintenance") as stopped:
+                self.r.require_interrupted_receiver(dict(self.info, phase=phase))
+            self.assertNotIn("already recovered", str(stopped.exception))
 
     def test_inspection_never_applies_or_uploads(self):
         path, _ = self.prepared()
@@ -148,7 +209,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         with patch.object(recovery, "recover", side_effect=operation), \
                 patch.object(recovery, "collect_result", side_effect=result), \
                 patch.object(recovery, "restore_receiver", side_effect=lambda *a, **kw: order.append("restore")), \
-                patch.object(recovery.transition, "verify_ota", side_effect=lambda *a: (order.append("verify") or self.verification())):
+                patch.object(recovery, "verify_restored_receiver", side_effect=lambda *a, **kw: (order.append("verify") or self.verification())):
             self.r.run("recovery-run", "selected")
         self.assertEqual(order, ["inspect", "apply", "receipt", "restore", "verify"])
         self.assertEqual(json.loads((path / "operation.json").read_text())["phase"], "COMPLETE")
@@ -176,7 +237,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
     def test_uncertain_receiver_upload_only_verifies_and_cannot_report_false_success(self):
         path, _ = self.prepared("RECEIVER_INSTALLING")
         with patch.object(recovery, "recover") as operation, patch.object(recovery, "restore_receiver") as restore, \
-                patch.object(recovery.transition, "verify_ota", side_effect=CampaignError("wrong firmware")), \
+                patch.object(recovery, "verify_restored_receiver", side_effect=CampaignError("wrong firmware")), \
                 self.assertRaises(CampaignError):
             self.r.run("recovery-finish", "selected")
         operation.assert_not_called()
@@ -200,7 +261,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
             console = Mock()
             console.__enter__ = Mock(return_value=console)
             console.__exit__ = Mock(return_value=False)
-            console.readline.return_value = line
+            console.readline.return_value = line + b"\n"
             factory = Mock(return_value=console)
             output = self.root / "receipt.json"
             with self.subTest(line=line):
@@ -211,6 +272,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
                     with self.assertRaises(CampaignError):
                         recovery.collect_result("selected", IDS[1], output, enumerate_ports=self.enumerate, console_factory=factory)
                 console.write.assert_not_called()
+                console.reset_input_buffer.assert_not_called()
 
     def test_restore_guards_slots_and_verifies_uploaded_candidate_before_reset(self):
         path, state = self.prepared()
@@ -247,6 +309,257 @@ class RecoveryWorkflowTests(unittest.TestCase):
                 run()
             uploader.assert_not_called()
             self.assertFalse(any(isinstance(c[0], int) for c in device.calls))
+
+    def result_reader(self, chunks):
+        """A serial timeout advances simulated time, even when no bytes arrive."""
+        from test_pc_campaign import Clock
+        clock = Clock()
+        values = iter(chunks)
+        console = Mock()
+        console.__enter__ = Mock(return_value=console)
+        console.__exit__ = Mock(return_value=False)
+        def read(_):
+            clock.sleep(0.2)
+            value = next(values, b"")
+            if isinstance(value, Exception):
+                raise value
+            return value
+        console.readline.side_effect = read
+        return clock, console
+
+    def test_result_reader_preserves_partial_lines_and_startup_output(self):
+        line = ("OTA_RECOVERY RECOVERED rc=0 EUI=" + IDS[1] + " confirmed=1; outputs inhibited").encode()
+        clock, console = self.result_reader([b"boot banner\r\n", line[:5], b"", line[5:40], line[40:], b"\r\n"])
+        output = self.root / "result.json"
+        result = recovery.collect_result("selected", IDS[1], output, enumerate_ports=self.enumerate,
+                                         console_factory=Mock(return_value=console), clock=clock, sleep=clock.sleep)
+        self.assertEqual(result["line"], line.decode())
+        self.assertIn("boot banner", output.with_name("result-console.log").read_text())
+        console.reset_input_buffer.assert_not_called()
+        console.write.assert_not_called()
+
+    def test_result_reader_reopens_silent_interface_without_replaying_upload_or_reset(self):
+        line = ("OTA_RECOVERY ALREADY_RECOVERED rc=1 EUI=" + IDS[1] + " confirmed=1; outputs inhibited\n").encode()
+        clock, silent = self.result_reader([])
+        active = Mock()
+        active.__enter__ = Mock(return_value=active)
+        active.__exit__ = Mock(return_value=False)
+        active.readline.return_value = line
+        new_port = SimpleNamespace(device="COM9", vid=0x2FE3, serial_number="selected")
+        enumerate_ports = Mock(side_effect=[[self.port], [new_port], [new_port]])
+        factory = Mock(side_effect=[silent, active])
+        recovery.collect_result("selected", IDS[1], self.root / "result.json", enumerate_ports=enumerate_ports,
+                                console_factory=factory, clock=clock, sleep=clock.sleep)
+        self.assertEqual([call.args[0] for call in factory.call_args_list], ["COM7", "COM9"])
+        self.assertTrue(all(call.kwargs["baudrate"] == 115200 for call in factory.call_args_list))
+        self.assertGreaterEqual(clock.now, 3)
+        self.assertLess(clock.now, 60)
+        for console in (silent, active):
+            console.write.assert_not_called()
+            console.__exit__.assert_called_once()
+
+    def test_result_reader_waits_for_same_serial_and_recovers_from_disconnection(self):
+        line = ("OTA_RECOVERY RECOVERED rc=0 EUI=" + IDS[1] + " confirmed=1; outputs inhibited\n").encode()
+        clock, disconnected = self.result_reader([OSError("USB detached")])
+        active = Mock()
+        active.__enter__ = Mock(return_value=active)
+        active.__exit__ = Mock(return_value=False)
+        active.readline.return_value = line
+        new_port = SimpleNamespace(device="COM10", vid=0x2FE3, serial_number="selected")
+        enumerate_ports = Mock(side_effect=[[], [self.port], [], [new_port], [new_port]])
+        factory = Mock(side_effect=[disconnected, active])
+        output = self.root / "result.json"
+        recovery.collect_result("selected", IDS[1], output, enumerate_ports=enumerate_ports,
+                                console_factory=factory, clock=clock, sleep=clock.sleep)
+        self.assertIn("USB detached", output.with_name("result-console.log").read_text())
+        self.assertEqual([call.args[0] for call in factory.call_args_list], ["COM7", "COM10"])
+        active.write.assert_not_called()
+        disconnected.write.assert_not_called()
+
+    def test_silent_or_unrelated_output_times_out_with_diagnostics_without_success(self):
+        for chunks, expected in (([], "No console bytes"), ([b"bootloader banner\n"], "Console data received")):
+            clock, console = self.result_reader(chunks)
+            output = self.root / "silent.json"
+            with self.subTest(chunks=chunks), self.assertRaisesRegex(CampaignError, expected) as stopped:
+                recovery.collect_result("selected", IDS[1], output, enumerate_ports=self.enumerate, timeout=2,
+                                        console_factory=Mock(return_value=console), clock=clock, sleep=clock.sleep)
+            self.assertIn("Inspect recovery boot state" if not chunks else "preserve the console log", str(stopped.exception))
+            self.assertFalse(output.exists())
+            self.assertTrue(output.with_name("silent-console.log").is_file())
+            self.assertLessEqual(clock.now, 2.3)
+            console.write.assert_not_called()
+
+    def test_result_reader_does_not_open_a_different_usb_board(self):
+        clock, console = self.result_reader([])
+        other = SimpleNamespace(device="COM20", vid=0x2FE3, serial_number="other")
+        factory = Mock(return_value=console)
+        with self.assertRaisesRegex(CampaignError, "No console bytes"):
+            recovery.collect_result("selected", IDS[1], self.root / "result.json", enumerate_ports=lambda: [other],
+                                    timeout=1, console_factory=factory, clock=clock, sleep=clock.sleep)
+        factory.assert_not_called()
+
+    def test_result_reader_rejects_overlong_or_wrong_identity_fragmented_message(self):
+        wrong = ("OTA_RECOVERY RECOVERED rc=0 EUI=" + IDS[0] + " confirmed=1; outputs inhibited\n").encode()
+        for chunks in ([wrong[:10], wrong[10:]], [b"x" * 513]):
+            clock, console = self.result_reader(chunks)
+            output = self.root / "result.json"
+            with self.subTest(chunks=chunks), self.assertRaises(CampaignError):
+                recovery.collect_result("selected", IDS[1], output, enumerate_ports=self.enumerate,
+                                        console_factory=Mock(return_value=console), clock=clock, sleep=clock.sleep)
+            self.assertFalse(output.exists())
+            console.write.assert_not_called()
+
+    def test_boot_state_inspection_classifies_images_without_any_mutation(self):
+        path, state = self.prepared("HELPER_STARTED")
+        _, helper, receiver, _ = self.r.context(path, state)
+        h, r = helper["mcuboot_image_hash"], receiver["mcuboot_image_hash"]
+        cases = [
+            ([slot(0, r, active=True, confirmed=True)], "ORIGINAL_ONLY"),
+            ([slot(0, r, active=True, confirmed=True), slot(1, h, pending=True)], "HELPER_PENDING"),
+            ([slot(0, r, active=False, confirmed=True), slot(1, h, pending=True)], "HELPER_PENDING"),
+            ([slot(0, r, active=True, confirmed=True), slot(1, h)], "ORIGINAL_WITH_HELPER_BACKUP"),
+            ([slot(0, h, active=True, confirmed=True), slot(1, r)], "HELPER_CONFIRMED"),
+            ([slot(0, h, active=True), slot(1, r)], "HELPER_UNCONFIRMED"),
+            ([slot(0, "dd" * 32, active=True, confirmed=True), slot(1, r)], "UNEXPECTED"),
+        ]
+        for images, expected in cases:
+            device = Device()
+            device.images = images
+            output = path / "diagnostic.json"
+            with self.subTest(expected=expected):
+                result = recovery.inspect_boot_state("selected", IDS[1], helper, receiver, output,
+                                                     enumerate_ports=self.enumerate, transport_factory=lambda *a, **kw: device)
+                self.assertEqual(result["diagnosis"], expected)
+                self.assertEqual(json.loads(output.read_text())["diagnosis"], expected)
+                self.assertEqual(device.calls, [("info",), ("image_state",), ("close",)])
+                if expected == "HELPER_CONFIRMED":
+                    self.assertIn("confirmation alone is insufficient", result["explanation"])
+
+    def test_boot_state_inspection_preserves_empty_list_for_diagnosis(self):
+        path, state = self.prepared("HELPER_STARTED")
+        _, helper, receiver, _ = self.r.context(path, state)
+        device = Device()
+        device.images = []
+        output = path / "diagnostic.json"
+        with self.assertRaisesRegex(ValueError, "empty or invalid"):
+            recovery.inspect_boot_state("selected", IDS[1], helper, receiver, output,
+                                        enumerate_ports=self.enumerate, transport_factory=lambda *a, **kw: device)
+        self.assertEqual(json.loads(output.read_text())["image_state"]["images"], [])
+        self.assertEqual(device.calls, [("info",), ("image_state",), ("close",)])
+
+    def test_boot_state_action_preserves_phase_and_never_starts_build_or_recovery(self):
+        path, state = self.prepared("HELPER_INSTALLING")
+        before = (path / "operation.json").read_bytes()
+        self.runner.reset_mock()
+        with patch.object(recovery, "inspect_boot_state", return_value={"diagnosis": "HELPER_PENDING", "explanation": "Pending"}) as inspect, \
+                patch.object(recovery, "recover") as apply, patch.object(recovery, "restore_receiver") as restore, \
+                patch.object(recovery, "collect_result") as collect:
+            self.r.run("recovery-boot-state", "selected")
+        inspect.assert_called_once()
+        self.assertEqual(inspect.call_args.args[:2], ("selected", IDS[1]))
+        self.assertEqual((path / "operation.json").read_bytes(), before)
+        self.runner.assert_not_called()
+        apply.assert_not_called()
+        restore.assert_not_called()
+        collect.assert_not_called()
+        self.assertEqual(self.ui.notice.call_args.args[0], "Recovery boot state")
+
+    def test_cancelled_boot_state_prompt_never_opens_port(self):
+        self.prepared("HELPER_STARTED")
+        self.ui.cancel_title = "Inspect recovery boot state"
+        with patch.object(recovery, "inspect_boot_state") as inspect, self.assertRaises(Cancelled):
+            self.r.run("recovery-boot-state", "selected")
+        inspect.assert_not_called()
+
+    def test_boot_state_action_rejects_live_application_and_wrong_serial(self):
+        path, state = self.prepared("HELPER_STARTED")
+        _, helper, receiver, _ = self.r.context(path, state)
+        device = Device()
+        device.app_reply = True
+        factory = Mock(return_value=device)
+        with self.assertRaisesRegex(CampaignError, "application still replies"):
+            recovery.inspect_boot_state("selected", IDS[1], helper, receiver, path / "diagnostic.json",
+                                        enumerate_ports=self.enumerate, transport_factory=factory)
+        self.assertEqual(device.calls, [("info",), ("close",)])
+        factory.reset_mock()
+        with self.assertRaises(CampaignError):
+            recovery.inspect_boot_state("other", IDS[1], helper, receiver, path / "diagnostic.json",
+                                        enumerate_ports=self.enumerate, transport_factory=factory)
+        factory.assert_not_called()
+
+    def ready_info(self, **changes):
+        return dict(self.info, **dict(dict(service="owntech-ota", protocol=2, phase="IDLE", maintenance=False,
+                                         healthy=True, can_ready=True, error=0, available=True, slot_available=True,
+                                         hardware_id=self.original["hardware_id"], layout_id=self.original["layout_id"],
+                                         bootloader_id=self.original["bootloader_id"],
+                                         slot_size=self.original["profile"]["slot_size"],
+                                         useful_capacity=self.original["profile"]["useful_capacity"]), **changes))
+
+    def test_final_verification_waits_for_usb_then_boot_then_confirmed_receiver(self):
+        from test_pc_campaign import Clock
+        clock = Clock()
+        transport = Mock()
+        transport.request.side_effect = [self.ready_info(phase="BOOT"), self.ready_info()]
+        factory = Mock(return_value=transport)
+        enumerate_ports = Mock(side_effect=[[], [], [self.port], [self.port], [self.port], [self.port]])
+        result = recovery.verify_restored_receiver("selected", IDS[1], self.original, enumerate_ports=enumerate_ports,
+                                                  receiver_factory=factory, clock=clock, sleep=clock.sleep)
+        self.assertEqual(result["result"], "OTA_VERIFIED")
+        self.assertGreaterEqual(clock.now, 0.75)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(transport.method_calls, [("request", ("info",), {}), ("close", (), {}),
+                                                ("request", ("info",), {}), ("close", (), {})])
+
+    def test_final_verification_retries_disconnection_and_new_com_for_same_serial(self):
+        from test_pc_campaign import Clock
+        clock = Clock()
+        transport = Mock(request=Mock(side_effect=[OSError("detached"), self.ready_info(), self.ready_info()]))
+        new_port = SimpleNamespace(device="COM12", vid=0x2FE3, serial_number="selected")
+        enumerate_ports = Mock(side_effect=[[self.port], [self.port], [], [new_port], [new_port]])
+        factory = Mock(return_value=transport)
+        result = recovery.verify_restored_receiver("selected", IDS[1], self.original, enumerate_ports=enumerate_ports,
+                                                  receiver_factory=factory, clock=clock, sleep=clock.sleep)
+        self.assertEqual(result["result"], "OTA_VERIFIED")
+        self.assertEqual([c.args[0] for c in factory.call_args_list], ["COM7", "COM7", "COM12"])
+        self.assertEqual(transport.close.call_count, 3)
+
+    def test_final_verification_accepts_clean_receiver_waiting_for_can(self):
+        info = self.ready_info(phase="WAITING_CAN", healthy=False, can_ready=False, available=False)
+        transport = Mock(request=Mock(return_value=info))
+        result = recovery.verify_restored_receiver("selected", IDS[1], self.original, enumerate_ports=self.enumerate,
+                                                  receiver_factory=Mock(return_value=transport))
+        self.assertEqual(result["info"], info)
+        transport.close.assert_called_once()
+
+    def test_final_verification_rejects_wrong_image_identity_maintenance_and_health_without_retry(self):
+        for change in ({"identity": IDS[0]}, {"mcuboot_image_hash": "dd" * 32}, {"maintenance": True},
+                       {"phase": "FAILED"}, {"local_healthy": False}, {"error": -1}, {"image_class": "lead"}):
+            transport = Mock(request=Mock(return_value=self.ready_info(**change)))
+            factory = Mock(return_value=transport)
+            with self.subTest(change=change), self.assertRaises((CampaignError, ValueError)):
+                recovery.verify_restored_receiver("selected", IDS[1], self.original, enumerate_ports=self.enumerate,
+                                                  receiver_factory=factory)
+            factory.assert_called_once()
+            self.assertEqual(transport.method_calls, [("request", ("info",), {}), ("close", (), {})])
+
+    def test_final_verification_absence_is_bounded_and_does_not_open_other_board(self):
+        from test_pc_campaign import Clock
+        clock = Clock()
+        other = SimpleNamespace(device="COM20", vid=0x2FE3, serial_number="other")
+        factory = Mock()
+        with self.assertRaisesRegex(CampaignError, "selected did not become ready"):
+            recovery.verify_restored_receiver("selected", IDS[1], self.original, enumerate_ports=lambda: [other],
+                                              timeout=1, receiver_factory=factory, clock=clock, sleep=clock.sleep)
+        factory.assert_not_called()
+        self.assertEqual(clock.now, 1)
+
+    def test_final_verification_duplicate_interfaces_fail_before_any_request(self):
+        second = SimpleNamespace(device="COM8", vid=0x2FE3, serial_number="selected")
+        factory = Mock()
+        with self.assertRaisesRegex(CampaignError, "found 2"):
+            recovery.verify_restored_receiver("selected", IDS[1], self.original,
+                                              enumerate_ports=lambda: [self.port, second], receiver_factory=factory)
+        factory.assert_not_called()
 
     def test_restore_wrong_upload_never_resets(self):
         path, state = self.prepared()

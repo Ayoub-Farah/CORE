@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/tools"))
 import test_pc_transition_usb as fixture_module
+import test_pc_transition_config as campaign_fixture_module
 from ota_workflow_dialogs import Cancelled
 from lead_update import CampaignError, prepare_manifest
 from smp_transport import TransportError
@@ -203,6 +204,61 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.pick_image.reset_mock()
         self.assertEqual(self.workflow.source(self.fixture.info), (history / "firmware.bin", history / "firmware.json"))
         self.workflow.pick_image.assert_not_called()
+
+    def campaign_fixture(self):
+        fixture = campaign_fixture_module.TransitionTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def test_source_prefers_successful_campaign_bytes_over_resigned_same_image(self):
+        fixture = self.campaign_fixture()
+        campaign = self.workflow.operations / "saved-update"
+        expected = workflow.copy_pair(fixture.image, fixture.manifest_path, campaign / "firmware")
+        shutil.copyfile(fixture.journal, campaign / "campaign.jsonl")
+        history = self.root / "ota-artifacts/history/OTA/resigned"
+        history.mkdir(parents=True)
+        data = bytearray(fixture.image.read_bytes())
+        data[-1] ^= 1  # Different signature, identical MCUboot image hash.
+        manifest = campaign_fixture_module.inspect_image(bytes(data), build_id=fixture.manifest["build_id"])
+        self.assertEqual(manifest["mcuboot_image_hash"], fixture.manifest["mcuboot_image_hash"])
+        (history / "firmware.bin").write_bytes(data)
+        workflow.transition._save(history / "firmware.json", manifest)
+        self.assertEqual(self.workflow.source(fixture.info), expected)
+        # Failed campaigns cannot supply the preferred source.
+        (campaign / "campaign.jsonl").write_text('{"event":"FAILED"}\n', encoding="utf-8")
+        self.assertEqual(self.workflow.source(fixture.info), (history / "firmware.bin", history / "firmware.json"))
+
+    def test_history_defaults_to_latest_completion_and_excludes_failed_journals(self):
+        fixture = self.campaign_fixture()
+        path, _ = self.workflow.create("receiver-usb", "usb-roundtrip")
+        workflow.copy_pair(fixture.image, fixture.manifest_path, path / "source")
+        shutil.copyfile(fixture.info_path, path / "board-info.json")
+        folder = self.root / "ota-journals"
+        folder.mkdir()
+        newest = folder / "campaign-0001.jsonl"
+        oldest = folder / "campaign-ffff.jsonl"
+        for journal, timestamp in ((newest, "2026-09-28T15:00:00+00:00"),
+                                   (oldest, "2026-09-27T15:00:00+00:00")):
+            records = copy.deepcopy(fixture.records)
+            records[-1]["timestamp"] = timestamp
+            journal.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        (folder / "campaign-failed.jsonl").write_text('{"event":"FAILED"}\n', encoding="utf-8")
+        self.ui.answers["Board history"] = str(newest)
+        result = self.workflow.history(path)
+        self.assertEqual(result, {"journal_path": path / "campaign.jsonl"})
+        self.assertEqual((path / "campaign.jsonl").read_bytes(), newest.read_bytes())
+        options = self.ui.choose.call_args.args[2]
+        self.assertEqual([value for value, _ in options], [str(newest), str(oldest), "browse", "unused"])
+        self.assertIn("default", options[0][1])
+        self.ui.file.assert_not_called()
+
+    def test_history_without_matching_log_explains_missing_evidence(self):
+        path, _ = self.archive()
+        self.ui.answers["Board history"] = "unused"
+        self.assertEqual(self.workflow.history(path), {"no_campaign": True})
+        self.assertIn("No matching successful CAN update", self.ui.choose.call_args.args[1])
+        self.assertEqual([value for value, _ in self.ui.choose.call_args.args[2]], ["browse", "unused"])
 
     def test_prepare_caches_original_source_before_any_build_and_validates_helper(self):
         path, state = self.workflow.create("selected", "usb-roundtrip")

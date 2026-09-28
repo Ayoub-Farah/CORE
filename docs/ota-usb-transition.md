@@ -29,6 +29,14 @@ bootloader enforcing version downgrade prevention requires separate support.
 
 ## 1. Establish a completed campaign or genuinely unused OTA state
 
+The graphical **Switch to USB** action first looks for the exact firmware saved
+with a successful CAN update matching the connected board. In **Board history**,
+the matching log with the latest recorded completion time is selected by default;
+click **Continue** to use it. If a newer update was performed elsewhere, select
+that log instead. When no matching log is found, the dialog explains this and
+offers file selection. Choose **never** only for a board initialized over USB
+that has never participated in a CAN update.
+
 Keep the power stage safely stopped and prevent automatic restarts. Close Scope
 and serial monitors. Before removing a receiver, finish/reconcile the whole
 frozen campaign through the Lead and retain its original JSONL journal:

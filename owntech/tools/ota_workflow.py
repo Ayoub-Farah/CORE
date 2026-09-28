@@ -15,13 +15,26 @@ from lead_update import BootloaderNotReady, CampaignError, USBConnection, identi
 from lead_update import main as campaign_main
 from provision_ota import main as provision_main
 import transition_ota_usb as transition
-from prepare_ota_transition import generate, transition_config, _source, _board
+from prepare_ota_transition import generate, transition_config, _source, _board, _campaign
 from ota_workflow_dialogs import Cancelled, Dialogs
 
 
 def require(condition, message):
     if not condition:
         raise CampaignError(message)
+
+
+def campaign_completed_at(journal):
+    """Order by recorded completion, not random campaign IDs or copied-file dates."""
+    try:
+        record = json.loads(journal.read_bytes().splitlines()[-1])
+        if record.get("event") == "SUCCESS":
+            stamp = datetime.fromisoformat(record["timestamp"])
+            if stamp.tzinfo is not None:
+                return stamp
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 @contextmanager
@@ -185,6 +198,21 @@ class Workflow:
         return image, manifest
 
     def source(self, info):
+        # Signing the same application again can change its signature bytes
+        # without changing its MCUboot hash. Prefer the exact completed CAN
+        # campaign artifact before considering independently signed builds.
+        journals = sorted(self.operations.glob("*/campaign.jsonl"), key=campaign_completed_at, reverse=True)
+        for journal in journals:
+            image = journal.parent / "firmware/image.bin"
+            path = journal.parent / "firmware/manifest.json"
+            try:
+                data = image.read_bytes()
+                manifest = _source(data, transition._json(path))
+                _board(info, manifest, False)
+                _campaign(journal.read_bytes(), info, manifest, data)
+                return image, path
+            except (OSError, ValueError):
+                continue
         manifests = list((self.project / "ota-artifacts/history").glob("*/*/firmware.json"))
         for environment in ("OTA", "USB_LEAD"):
             folder = self.project / "ota-artifacts" / environment
@@ -206,16 +234,21 @@ class Workflow:
         journals = list((self.project / "ota-journals").glob("*.jsonl")) + list(self.operations.glob("*/campaign.jsonl"))
         valid = []
         args = (path / "source/image.bin", path / "source/manifest.json", path / "board-info.json")
-        for journal in sorted(journals, reverse=True):
+        for journal in sorted(journals, key=campaign_completed_at, reverse=True):
             try:
                 transition_config(*args, journal_path=journal)
                 valid.append(journal)
             except (OSError, ValueError):
                 continue
         options = [(str(journal), "Completed CAN update: " + journal.parent.name + "/" + journal.name) for journal in valid]
+        if options:
+            options[0] = (options[0][0], "Latest matching update (default): " + str(valid[0].relative_to(self.project)))
         options += [("browse", "Select the log of the latest successful CAN update"),
                     ("unused", "This board has never participated in a CAN update")]
-        choice = self.ui.choose("Board history", "Select this board's latest completed update. Choose 'never' only for a board initialized over USB without a CAN campaign.", options)
+        message = ("The latest matching successful CAN update saved in this project is selected. Click Continue to use it, or select a newer log saved elsewhere."
+                   if valid else "No matching successful CAN update was found in this project. Select its log saved elsewhere.")
+        message += " Choose 'never' only for a board initialized over USB without a CAN campaign."
+        choice = self.ui.choose("Board history", message, options)
         if choice == "unused":
             transition_config(*args, no_campaign=True)
             return {"no_campaign": True}

@@ -11,6 +11,20 @@ Import("env")
 
 project = Path(env.subst("$PROJECT_DIR"))
 transition = env.subst("$PIOENV") == "OTA_TRANSITION"
+from SCons.Script import COMMAND_LINE_TARGETS
+sys.path.insert(0, str(project / "owntech/scripts"))
+from ota_gui_tasks import RECOVERY_TASKS, RECOVERY_GUI_TARGETS, register_gui_tasks, run_workflow
+
+if not transition:
+    register_gui_tasks(env)
+    requested = set(COMMAND_LINE_TARGETS) & RECOVERY_GUI_TARGETS
+    if requested and not getattr(env, "IsIntegrationDump", lambda: False)():
+        if len(COMMAND_LINE_TARGETS) != 1:
+            raise ValueError("Run one recovery assistant task at a time, without build/upload targets")
+        action = next(row[1] for row in RECOVERY_TASKS if row[0] in requested)
+        # Run before Zephyr configuration: no old guard file is needed, and the
+        # assistant's nested scoped build owns the ordinary SCons database.
+        env.Exit(run_workflow(env, action))
 # VS Code queries every environment's metadata before any scoped operation
 # exists. Export the utility's build task without configuring CMake or creating
 # placeholder guards. Actual build/upload invocations still pass every guard

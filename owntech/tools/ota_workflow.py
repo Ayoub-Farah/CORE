@@ -434,16 +434,24 @@ class Workflow:
         self.ui.notice("Update reconciled", "The original update has reached SUCCESS. Its saved log can be used by Switch to USB.")
 
     def run(self, action):
+        if self.environment == "OTA_RECOVERY":
+            require(action == "status" or action.startswith("recovery-"), "Choose a receiver recovery action under OTA_RECOVERY.")
+        else:
+            require(not action.startswith("recovery-"), "Choose receiver recovery under OTA_RECOVERY.")
         serial = self.board()
+        if action.startswith("recovery-"):
+            from ota_recovery_workflow import RecoveryWorkflow
+            return RecoveryWorkflow(self).run(action, serial)
         {"initialize": self.initialize, "to-usb": self.to_usb, "to-ota": self.to_ota,
          "status": self.status, "can-update": self.can_update, "reconcile": self.reconcile}[action](serial)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("initialize", "to-usb", "to-ota", "status", "can-update", "reconcile"))
+    parser.add_argument("action", choices=("initialize", "to-usb", "to-ota", "status", "can-update", "reconcile",
+                                          "recovery-inspect", "recovery-run", "recovery-finish"))
     parser.add_argument("--project", type=Path, required=True)
-    parser.add_argument("--environment", choices=("USB", "OTA", "USB_LEAD"), required=True)
+    parser.add_argument("--environment", choices=("USB", "OTA", "USB_LEAD", "OTA_RECOVERY"), required=True)
     parser.add_argument("--mcumgr", type=Path, required=True)
     parser.add_argument("--pio-python", type=Path, help="PlatformIO interpreter, separate from the desktop GUI Python")
     args = parser.parse_args(argv)

@@ -16,6 +16,10 @@ from smp_transport import SerialSMP, TransportError, ReceiverProbeTimeout, Proto
 from bootloader_upload import upload_image, UploadError
 
 
+# Allow larger fleets to finish streaming; the Lead also bounds a campaign to 10 minutes.
+DEFAULT_CAMPAIGN_TIMEOUT = 600
+
+
 class CampaignError(RuntimeError):
     pass
 
@@ -318,7 +322,7 @@ class Journal:
 
 class Campaign:
     def __init__(self, transport, manifest, artifact, journal, expected_ids=None, expected_count=None,
-                 reconnect=None, timeout=180, poll_interval=0.4, clock=time.monotonic, sleep=time.sleep,
+                 reconnect=None, timeout=DEFAULT_CAMPAIGN_TIMEOUT, poll_interval=0.4, clock=time.monotonic, sleep=time.sleep,
                  output=print):
         self.transport, self.manifest, self.artifact, self.journal = transport, manifest, artifact, journal
         self.expected_ids = [identity(value) for value in expected_ids] if expected_ids else None
@@ -761,7 +765,8 @@ def main(argv=None, *, raise_errors=False):
     parser.add_argument("--expected-id", action="append")
     parser.add_argument("--expected-count", type=int)
     parser.add_argument("--journal", type=Path)
-    parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_CAMPAIGN_TIMEOUT,
+                        help="PC timeout per campaign wait phase in seconds (default: %(default)s)")
     parser.add_argument("--build-id")
     parser.add_argument("--version")
     parser.add_argument("--receiver-absent", action="store_true",

@@ -134,6 +134,13 @@ Alternatively, use `--expected-count 2` when a receiver count is sufficient.
 The expected IDs and count always exclude the Lead. With exact IDs, an absent
 or unexpected receiver causes discovery to fail before the campaign starts.
 
+The PC client allows 600 seconds per campaign wait phase, including CAN transfer
+and validation. This is a fixed deadline, not an inactivity timeout: continued
+transfer progress does not extend it. The graphical task uses this default and
+does not read `custom_ota_timeout`; the direct CLI accepts `--timeout SECONDS`.
+The Lead firmware separately limits the overall campaign to 600 seconds, so
+increasing the PC timeout alone cannot extend that firmware limit.
+
 The assistant explicitly builds the
 `OTA` environment and distributes its compact receiver artifact. It does not
 upload to, reset, or replace the Lead. The previous `--receiver-absent` campaign
@@ -216,6 +223,40 @@ and activation gate before returning to `lead_update`.
 Keep the journal after any interruption. A failed transfer retains maintenance;
 do not interpret `ABORT` as proof that an already armed image was disarmed.
 After commit, read the real boot state and reconcile the original frozen roster.
+
+For a compact receiver transfer that failed **before activation**, PlatformIO
+**Project Tasks > OTA_RECOVERY > Custom** provides these desktop assistants:
+
+| Action | Purpose |
+| --- | --- |
+| **Check connected board** | Read the application status of the USB-connected board. |
+| **Prepare and inspect receiver recovery** | Select the failed campaign, archive its evidence and original firmware, build the scoped helper, then inspect the bootloader slots without writing flash. |
+| **Recover interrupted receiver** | Perform preparation/inspection if needed, install the helper, verify its result, restore the original receiver firmware and check the final state. |
+| **Finish receiver recovery** | Continue the saved recovery for the same USB serial after a cancellation or interruption. |
+
+Start with one receiver connected by USB in its application (no BOOT/RESET).
+Close Serial Monitor/Scope and keep power outputs stopped. Choose **Recover
+interrupted receiver** for the complete procedure; preparation/inspection is
+also available separately. Select the failed campaign when prompted. The wizard
+asks for BOOT + RESET before each bootloader step and verifies the exact images
+before writing. It restores the original archived receiver firmware, not a new
+build of `src/main.cpp`. Repeat for each affected receiver. These actions exclude
+the Lead and campaigns that already requested activation.
+
+Progress, firmware, receipts and logs remain under
+`ota-artifacts/operations/<operation>/`. Use **Finish receiver recovery** after
+a cancelled dialog. If an upload's result is uncertain, this action checks the
+running helper or receiver; it never blindly repeats an erase, upload or reset.
+A partially written or unrecognized image stops for diagnosis. A successful
+finish requires the correct confirmed image and maintenance released; a receiver
+without a CAN peer may report `WAITING_CAN` until the bus is reconnected.
+
+If the new actions are not visible, refresh PlatformIO Project Tasks. The
+equivalent terminal targets are `ota_board_status`, `ota_recovery_inspect`,
+`ota_recovery_run` and `ota_recovery_finish`, under `-e OTA_RECOVERY`.
+Listing or launching the assistants requires no pre-existing recovery config;
+the wizard builds with a private configuration and preserves `src/app.ini`.
+
 The guarded `OTA_RECOVERY` utility preserves its legacy v1 modes and adds an
 explicit `--compact-receiver-only` mode. This mode requires a frozen receiver
 roster excluding the Lead, a source/START followed by FAILED or ABORTED, and no

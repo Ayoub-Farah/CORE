@@ -8,9 +8,20 @@ import sys
 import uuid
 
 
+RECOVERY_TASKS = (
+    ("ota_board_status", "status", "Check connected board",
+     "Read the connected board's application status"),
+    ("ota_recovery_inspect", "recovery-inspect", "Prepare and inspect receiver recovery",
+     "Select a failed precommit campaign, build its recovery image and inspect one receiver"),
+    ("ota_recovery_run", "recovery-run", "Recover interrupted receiver",
+     "Guide one receiver through recovery and restoration of its original firmware"),
+    ("ota_recovery_finish", "recovery-finish", "Finish receiver recovery",
+     "Continue a saved receiver recovery without repeating an uncertain upload"),
+)
+RECOVERY_GUI_TARGETS = frozenset(row[0] for row in RECOVERY_TASKS)
 GUI_ONLY_TARGETS = frozenset({
     "ota_to_usb", "ota_to_ota", "ota_board_status", "ota_reconcile", "lead_update",
-})
+}) | RECOVERY_GUI_TARGETS
 
 
 def isolate_gui_signatures(env, targets):
@@ -138,7 +149,7 @@ def workflow_action(action):
 
 def register_gui_tasks(env):
     environment = env.subst("$PIOENV")
-    if environment not in ("USB", "OTA", "USB_LEAD"):
+    if environment not in ("USB", "OTA", "USB_LEAD", "OTA_RECOVERY"):
         raise ValueError("OwnTech board assistant requires USB, OTA or USB_LEAD")
     tasks = [
         ("ota_to_usb", "to-usb", "Switch to USB",
@@ -152,6 +163,8 @@ def register_gui_tasks(env):
     if environment == "USB_LEAD":
         tasks.append(("ota_reconcile", "reconcile", "Finish previous CAN update",
                       "Select the saved CAN campaign and verify every expected receiver"))
+    if environment == "OTA_RECOVERY":
+        tasks = RECOVERY_TASKS
     for name, action, title, description in tasks:
         env.AddCustomTarget(name=name, dependencies=[],
                             actions=[env.VerboseAction(workflow_action(action), title)],

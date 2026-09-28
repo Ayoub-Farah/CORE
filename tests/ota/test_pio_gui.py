@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "owntech/scripts"))
-from ota_gui_tasks import GUI_ONLY_TARGETS, gui_python, run_workflow
+from ota_gui_tasks import GUI_ONLY_TARGETS, RECOVERY_TASKS, RECOVERY_GUI_TARGETS, gui_python, run_workflow
 from test_pc_build import Environment as BuildEnvironment
 
 
@@ -336,7 +336,8 @@ env.File("build/image.bin").get_stored_info()
                 with self.subTest(environment=name), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exited:
                     run_script("pre_ota_recovery.py", env, ["__idedata"])
                 self.assertEqual(exited.exception.code, 0)
-                self.assertEqual(set(env.tasks), {"mcuboot-image"})
+                expected = {"mcuboot-image"} | (RECOVERY_GUI_TARGETS if name == "OTA_RECOVERY" else set())
+                self.assertEqual(set(env.tasks), expected)
                 self.assertEqual(env.tasks["mcuboot-image"]["dependencies"], [])
                 self.assertTrue((env.build / "idedata.json").is_file())
                 self.assertEqual(cache.read_text(), "preserve")
@@ -349,10 +350,30 @@ env.File("build/image.bin").get_stored_info()
                     run_script("pre_ota_recovery.py", plain, ["mcuboot-image"])
 
     def test_unsupported_environments_do_not_register_actions(self):
-        env = Environment(ROOT, "OTA_RECOVERY")
+        env = Environment(ROOT, "OTA_TRANSITION")
         with self.assertRaises(ValueError):
             run_script("pre_ota_gui.py", env, [])
         self.assertEqual(env.tasks, {})
+
+    def test_recovery_actions_run_without_guard_files_or_zephyr_configuration(self):
+        class AssistantEnvironment(Environment):
+            def Exit(self, status):
+                raise SystemExit(status)
+
+        with tempfile.TemporaryDirectory() as directory:
+            for target, action, title, _ in RECOVERY_TASKS:
+                env = AssistantEnvironment(Path(directory), "OTA_RECOVERY")
+                with self.subTest(target=target), patch("ota_gui_tasks.run_workflow", return_value=7) as wizard:
+                    with self.assertRaises(SystemExit) as result:
+                        run_script("pre_ota_recovery.py", env, [target])
+                    self.assertEqual(result.exception.code, 7)
+                    wizard.assert_called_once_with(env, action)
+                    self.assertEqual(env.tasks[target]["title"], title)
+                    self.assertEqual(env.post, [])
+                self.assertFalse((Path(directory) / ".pio/ota-recovery-config").exists())
+            with patch("ota_gui_tasks.run_workflow") as wizard, self.assertRaisesRegex(ValueError, "one recovery"):
+                run_script("pre_ota_recovery.py", env, ["ota_recovery_run", "upload"])
+            wizard.assert_not_called()
 
 
 if __name__ == "__main__":

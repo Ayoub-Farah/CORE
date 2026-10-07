@@ -67,6 +67,8 @@ extern "C" {
  * Configure before starting the critical task. The first repetition callback
  * arms phase acquisition from PWM resets with SCOUT closed and TX deferred.
  * The next callback closes ITR10; subsequent CH2 events open the sync window.
+ * Master mode uses a zero-latency ISR. Any TIM2 CH1 user callback sharing
+ * this interrupt must not call Zephyr kernel APIs.
  */
 int timer2_master_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks);
 void timer2_master_sync_event(void);

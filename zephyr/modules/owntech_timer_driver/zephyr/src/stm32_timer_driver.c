@@ -171,11 +171,13 @@ void timer_stm32_config(const struct device* dev,
 				data->timer_compare_usec = config->timer_compare_t_usec;
 			uint32_t flags = 0;
 
-			if (config->timer_use_zero_latency == 1)
+			if (config->timer_use_zero_latency == 1 ||
+				(tim_dev == TIM2 && timer2_master_mode))
 			{
 				flags = IRQ_ZERO_LATENCY;
 			}
 
+			irq_disable(data->interrupt_line);
 			irq_connect_dynamic(data->interrupt_line,
 								data->interrupt_prio,
 								timer_stm32_callback,
@@ -482,13 +484,13 @@ int timer2_master_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks)
 	LL_TIM_ClearFlag_TRIG(TIM2);
 	NVIC_ClearPendingIRQ((IRQn_Type)TIMER2_INTERRUPT_LINE);
 	irq_connect_dynamic(TIMER2_INTERRUPT_LINE, TIMER2_INTERRUPT_PRIO,
-						timer_stm32_callback, dev, 0);
-	irq_enable(TIMER2_INTERRUPT_LINE);
+						timer_stm32_callback, dev, IRQ_ZERO_LATENCY);
 	timer2_master_mode = true;
 	timer2_master_acquiring = true;
 	/* Defer prepared TX until hardware has acquired a control boundary. */
 	timer2_master_dma_armed = dma_armed;
 	timer2_master_irq_armed = irq_armed;
+	irq_enable(TIMER2_INTERRUPT_LINE);
 	return 0;
 #else
 	return -ENODEV;
@@ -508,8 +510,11 @@ void timer2_master_sync_event(void)
 	if (!timer2_master_mode)
 		return;
 
-	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
+	/* Prevent the zero-latency CH2 handler from reopening the pin while
+	 * the repetition callback is closing the synchronization window.
+	 */
 	LL_TIM_DisableIT_CC2(TIM2);
+	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
 	LL_TIM_ClearFlag_CC2(TIM2);
 	if (!timer2_master_started || !LL_TIM_IsActiveFlag_TRIG(TIM2))
 	{
@@ -551,9 +556,9 @@ void timer2_master_sync_stop(void)
 	if (!timer2_master_mode)
 		return;
 
+	LL_TIM_DisableIT_CC2(TIM2);
 	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
 	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
-	LL_TIM_DisableIT_CC2(TIM2);
 	LL_TIM_ClearFlag_CC2(TIM2);
 	LL_TIM_DisableDMAReq_CC1(TIM2);
 	LL_TIM_DisableCounter(TIM2);

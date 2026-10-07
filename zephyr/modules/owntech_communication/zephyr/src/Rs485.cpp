@@ -31,6 +31,7 @@
 #include <stm32_ll_hrtim.h>
 #include <errno.h>
 #include "timer.h"
+#include "communication_dispatch.h"
 
 /* Zephyr drivers */
 #include <zephyr/drivers/uart.h>
@@ -86,6 +87,8 @@ static uint8_t* tx_usart_val;
 static uint8_t* rx_usart_val;
 
 static uint16_t dma_buffer_size;
+static uint16_t rx_buffer_size;
+static bool synchronous_mode = false;
 
 /* TIM2 CH1 performs one word write to enable the USART-paced TX channel.
  * DMA1 channels 1..5 are used by ADC acquisition, 6..7 by USART3.
@@ -113,8 +116,9 @@ static void _dma_callback_tx(const struct device *dev,
     LL_DMA_DisableChannel(DMA_USART, LL_DMA_CHANNEL_TX);
 
     LL_USART_ClearFlag_TXFE(USART3);
-    /* Clear transmission complete flag USART */
-    LL_USART_ClearFlag_TC(USART3);
+    /* Preserve USART TC: a delayed DMA callback may run after the last
+     * stop bit. Writing the next byte to TDR clears TC automatically.
+     */
     /* Clear transmission complete dma channel TX */
     LL_DMA_ClearFlag_TC6(DMA_USART);
 }
@@ -167,6 +171,7 @@ void init_usrBaudrate(uint32_t usr_baud)
 void init_usrDataSize(uint16_t size)
 {
     dma_buffer_size = size;
+    rx_buffer_size = size;
 }
 
 /**
@@ -202,6 +207,12 @@ void serial_init(void)
      * Not Empty Interrupt for DMA to fetch data */
     LL_USART_DisableIT_RXNE_RXFNE(USART3);
 
+    if (synchronous_mode)
+    {
+        LL_USART_DisableIT_IDLE(USART3);
+        LL_USART_DisableIT_PE(USART3);
+        LL_USART_DisableIT_ERROR(USART3);
+    }
     LL_USART_Enable(USART3);
 }
 
@@ -258,6 +269,8 @@ void dma_channel_init_tx()
 {
     serial_sync_tx_stop();
     sync_tx_configured = false;
+    synchronous_mode = false;
+    communication_dispatch_reset();
     /* Configure DMA */
     struct dma_config dma_config_s = {0};
     LL_DMA_InitTypeDef DMA_InitStruct = {0};
@@ -301,6 +314,7 @@ void dma_channel_init_tx()
 
     /* Enable transfer complete interruption */
     LL_DMA_EnableIT_TC(DMA_USART, LL_DMA_CHANNEL_TX);
+    LL_DMA_DisableIT_TE(DMA_USART, LL_DMA_CHANNEL_TX);
     /* Disable half-transfer interruption */
     LL_DMA_DisableIT_HT(DMA_USART, LL_DMA_CHANNEL_TX);
     tx_configured = true;
@@ -325,10 +339,13 @@ void dma_channel_init_rx()
     DMA_InitStruct.PeriphOrM2MSrcIncMode = LL_DMA_PERIPH_NOINCREMENT;
     DMA_InitStruct.MemoryOrM2MDstIncMode = LL_DMA_MEMORY_INCREMENT;
     DMA_InitStruct.PeriphRequest = LL_DMAMUX_REQ_USART3_RX;
-    DMA_InitStruct.NbData = dma_buffer_size;
+    DMA_InitStruct.NbData = rx_buffer_size;
 
     IRQ_DIRECT_CONNECT(17, 0, _dma_callback_rx, IRQ_ZERO_LATENCY);
-    irq_enable(17);
+    if (synchronous_mode)
+        irq_disable(17);
+    else
+        irq_enable(17);
 
     /* Disabling channel for initial set-up */
     LL_DMA_DisableChannel(DMA_USART, LL_DMA_CHANNEL_RX);
@@ -336,7 +353,7 @@ void dma_channel_init_rx()
     /* Initialize DMA */
 
     /* DMA data size */
-    LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_RX, dma_buffer_size);
+    LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_RX, rx_buffer_size);
     /* DMA channel priority */
     LL_DMA_SetChannelPriorityLevel(DMA_USART,
                                    LL_DMA_CHANNEL_RX,
@@ -351,7 +368,11 @@ void dma_channel_init_rx()
     /* Enabling channel */
     LL_DMA_EnableChannel(DMA_USART, LL_DMA_CHANNEL_RX);
     /* Enable transfer complete interruption */
-    LL_DMA_EnableIT_TC(DMA_USART, LL_DMA_CHANNEL_RX);
+    if (synchronous_mode)
+        LL_DMA_DisableIT_TC(DMA_USART, LL_DMA_CHANNEL_RX);
+    else
+        LL_DMA_EnableIT_TC(DMA_USART, LL_DMA_CHANNEL_RX);
+    LL_DMA_DisableIT_TE(DMA_USART, LL_DMA_CHANNEL_RX);
     /* Disable half-transfer interruption */
     LL_DMA_DisableIT_HT(DMA_USART, LL_DMA_CHANNEL_RX);
 }
@@ -363,6 +384,9 @@ void dma_channel_init_rx()
  */
 void serial_tx_on()
 {
+    /* Synchronous mode is armed only through prepareSynchronizedTransmission. */
+    if (synchronous_mode || serial_tx_busy())
+        return;
     serial_sync_tx_stop();
     /* Making sure the flag is cleared before transmission */
     LL_DMA_ClearFlag_TC6(DMA_USART);
@@ -436,6 +460,7 @@ int serial_sync_tx_config(uint32_t delay_us)
 
 int serial_sync_tx_prepare()
 {
+    serial_tx_poll();
     if (!sync_tx_configured)
         return -EINVAL;
 
@@ -474,6 +499,97 @@ void serial_sync_tx_stop()
         timer_stop(timer2);
     LL_DMA_DisableChannel(DMA2, LL_DMA_CHANNEL_1);
     LL_DMA_ClearFlag_GI1(DMA2);
+}
+
+/* Poll completion in synchronous mode; USART TC remains set until next TX. */
+void serial_tx_poll()
+{
+    if (synchronous_mode && LL_DMA_IsActiveFlag_TC6(DMA_USART))
+    {
+        LL_DMA_DisableChannel(DMA_USART, LL_DMA_CHANNEL_TX);
+        LL_DMA_ClearFlag_TC6(DMA_USART);
+        LL_DMA_ClearFlag_HT6(DMA_USART);
+    }
+}
+
+uint32_t serial_poll_errors()
+{
+    if (!synchronous_mode)
+        return RS485_ERROR_NONE;
+
+    /* Snapshot before clearing: faults must remain visible to the caller. */
+    const uint32_t uart_faults = USART3->ISR &
+        (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE);
+    uint32_t errors = RS485_ERROR_NONE;
+    if (uart_faults & USART_ISR_ORE)
+        errors |= RS485_ERROR_RX_OVERRUN;
+    if (uart_faults & USART_ISR_FE)
+        errors |= RS485_ERROR_RX_FRAMING;
+    if (uart_faults & USART_ISR_NE)
+        errors |= RS485_ERROR_RX_NOISE;
+    if (uart_faults & USART_ISR_PE)
+        errors |= RS485_ERROR_RX_PARITY;
+    if (LL_DMA_IsActiveFlag_TE7(DMA_USART))
+        errors |= RS485_ERROR_RX_DMA;
+    if (LL_DMA_IsActiveFlag_TE6(DMA_USART))
+        errors |= RS485_ERROR_TX_DMA;
+    if (sync_tx_configured && LL_DMA_IsActiveFlag_TE1(DMA2))
+        errors |= RS485_ERROR_TRIGGER_DMA;
+
+    if (errors & (RS485_ERROR_TX_DMA | RS485_ERROR_TRIGGER_DMA))
+    {
+        /* Stop the trigger before disabling TX; never retry a partial frame
+         * automatically. Bytes already in USART may finish shifting out.
+         */
+        serial_sync_tx_stop();
+        LL_DMA_DisableChannel(DMA_USART, LL_DMA_CHANNEL_TX);
+        LL_DMA_ClearFlag_GI6(DMA_USART);
+    }
+    if (errors & RS485_RX_ERRORS)
+    {
+        /* Data after a receive fault cannot be presented as a valid snapshot.
+         * Flush pending UART data and restart DMA from the ring base.
+         */
+        LL_USART_DisableDMAReq_RX(USART3);
+        LL_DMA_DisableChannel(DMA_USART, LL_DMA_CHANNEL_RX);
+        LL_USART_RequestRxDataFlush(USART3);
+        WRITE_REG(USART3->ICR, uart_faults);
+        LL_DMA_ClearFlag_GI7(DMA_USART);
+        LL_DMA_SetMemoryAddress(DMA_USART, LL_DMA_CHANNEL_RX, (uint32_t)rx_usart_val);
+        LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_RX, rx_buffer_size);
+        __DMB();
+        LL_DMA_EnableChannel(DMA_USART, LL_DMA_CHANNEL_RX);
+        LL_USART_EnableDMAReq_RX(USART3);
+    }
+    return errors;
+}
+
+bool serial_tx_busy()
+{
+    serial_tx_poll();
+    return (sync_tx_configured &&
+            LL_DMA_IsEnabledChannel(DMA2, LL_DMA_CHANNEL_1) &&
+            !LL_DMA_IsActiveFlag_TC1(DMA2)) ||
+        (tx_configured && (LL_DMA_IsEnabledChannel(DMA_USART, LL_DMA_CHANNEL_TX) ||
+         !LL_USART_IsActiveFlag_TC(USART3)));
+}
+
+uint16_t serial_rx_write_position()
+{
+    return (rx_buffer_size - LL_DMA_GetDataLength(DMA_USART, LL_DMA_CHANNEL_RX))
+        % rx_buffer_size;
+}
+
+void serial_synchronous_mode(uint16_t reception_size)
+{
+    synchronous_mode = true;
+    user_fnc = NULL;
+    rx_buffer_size = reception_size;
+    /* Configure mode before initializing the RX DMA ring. */
+    LL_DMA_DisableIT_TC(DMA_USART, LL_DMA_CHANNEL_TX);
+    LL_DMA_DisableIT_HT(DMA_USART, LL_DMA_CHANNEL_TX);
+    LL_DMA_DisableIT_TE(DMA_USART, LL_DMA_CHANNEL_TX);
+    irq_disable(17);
 }
 
 /**

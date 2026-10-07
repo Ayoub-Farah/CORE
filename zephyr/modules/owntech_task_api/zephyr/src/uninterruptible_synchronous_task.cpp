@@ -31,6 +31,9 @@
 #include "timer.h"
 #include "hrtim.h"
 #include "SpinAPI.h"
+#ifdef CONFIG_OWNTECH_COMMUNICATION_ENABLE_RS485
+#include "communication_dispatch.h"
+#endif
 
 #ifdef CONFIG_OWNTECH_SAFETY_API
 #include "safety_internal.h"
@@ -118,6 +121,10 @@ void user_task_proxy()
 	{
 		spin.data.doFullDispatch();
 	}
+
+	#ifdef CONFIG_OWNTECH_COMMUNICATION_ENABLE_RS485
+	communication_dispatch();
+	#endif
 
 	user_periodic_task();
 }

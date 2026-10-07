@@ -28,6 +28,7 @@
 #include <zephyr/kernel.h>
 
 #include <stm32_ll_usart.h>
+#include "Rs485Communication.h"
 
 typedef void (*dma_callbackRXfunc_t)();
 
@@ -117,6 +118,17 @@ void dma_channel_init_rx();
  * @note After reloading the buffer, USART will start sending datas
  */
 void serial_tx_on();
+
+/* Synchronous-mode polling and separate RX ring size. */
+void serial_tx_poll();
+/* Poll hardware faults and recover channels only in synchronous mode. */
+uint32_t serial_poll_errors();
+#define RS485_RX_ERRORS (RS485_ERROR_RX_OVERRUN | RS485_ERROR_RX_FRAMING | \
+                         RS485_ERROR_RX_NOISE | RS485_ERROR_RX_PARITY | \
+                         RS485_ERROR_RX_DMA)
+bool serial_tx_busy();
+uint16_t serial_rx_write_position();
+void serial_synchronous_mode(uint16_t reception_size);
 
 /** @brief Configure TIM2 CH1 to start a prepared TX after HRTIM ITR10.
  * Reserves TIM2 and DMA2 channel 1. Call after RS485 configuration.

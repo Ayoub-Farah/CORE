@@ -26,6 +26,7 @@ if(CONFIG_OWNTECH_COMMUNICATION)
     zephyr_library_sources(
       src/Rs485Communication.cpp
       src/Rs485.cpp
+      src/communication_dispatch.cpp
     )
   endif()
 

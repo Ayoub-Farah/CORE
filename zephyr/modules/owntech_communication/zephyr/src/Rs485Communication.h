@@ -169,12 +169,15 @@ class Rs485Communication
          * Returns -EBUSY while a trigger/TX is pending. The configured buffer
          * must remain unchanged until TX completes. Rearm for each message.
          * The TIM2 event starts DMA without a CPU interrupt. Synchronous
+         * rearming preserves the current sync phase on both master and slave;
+         * prepare before the assigned compare to transmit in that cycle.
          * configuration polls TX completion; software-triggered configuration
          * retains the DMA completion interrupt.
          */
         int prepareSynchronizedTransmission();
 
         /** @brief Cancel a pending TX trigger without aborting an active TX.
+         * The slave sync clock also continues independently of TX arming.
          * In master mode, SCOUT timing continues independently of TX arming.
          */
         void stopSynchronizedTransmission();

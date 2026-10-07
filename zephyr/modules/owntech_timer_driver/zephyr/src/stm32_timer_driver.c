@@ -358,6 +358,19 @@ void timer_stm32_start(const struct device* dev)
 					LL_TIM_EnableIT_CC1(TIM2);
 				return;
 			}
+			if (READ_BIT(TIM2->SMCR, TIM_SMCR_SMS) == LL_TIM_SLAVEMODE_COMBINED_RESETTRIGGER)
+			{
+				/* SCIN has already started the current slot clock. Rearming
+				 * must not stop/reset it or wait for another sync pulse.
+				 * If CH1 has passed, the request waits for the next sync.
+				 */
+				LL_TIM_ClearFlag_CC1(TIM2);
+				if (data->timer_compare_dma)
+					LL_TIM_EnableDMAReq_CC1(TIM2);
+				else
+					LL_TIM_EnableIT_CC1(TIM2);
+				return;
+			}
 			LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
 			LL_TIM_DisableCounter(TIM2);
 			LL_TIM_DisableIT_CC1(TIM2);
@@ -365,7 +378,7 @@ void timer_stm32_start(const struct device* dev)
 			uint32_t compare = data->timer_compare_usec * 10U;
 			LL_TIM_OC_SetCompareCH1(TIM2, compare);
 			LL_TIM_SetAutoReload(TIM2, compare + 1U);
-			/* Load the prescaler and start each arm from zero. */
+			/* Initialize once after configuration/explicit timer stop. */
 			LL_TIM_GenerateEvent_UPDATE(TIM2);
 			LL_TIM_SetCounter(TIM2, 0);
 			LL_TIM_ClearFlag_UPDATE(TIM2);

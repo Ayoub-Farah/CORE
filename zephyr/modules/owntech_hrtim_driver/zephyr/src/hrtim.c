@@ -358,7 +358,7 @@ static inline uint32_t _period_ckpsc(uint32_t freq, timer_hrtim_t *tu)
  *
  * This function manages various HRTIM (High-Resolution Timer) synchronization 
  * conditions and clears the corresponding hardware flags. It also temporarily 
- * closes the master synchronization window and manages TIM2 phase acquisition,
+ * closes the synchronization window and manages TIM2 phase acquisition,
  * and finally calls a user-defined callback if one is set.
  *
  * - Clears the master repetition flag if no synchronization input is configured.
@@ -368,6 +368,8 @@ static inline uint32_t _period_ckpsc(uint32_t freq, timer_hrtim_t *tu)
  *
  * - In master communication mode, restores PB1 to output mode and disables
  *   TIM2's ITR10 gate. Startup and missed triggers acquire phase in hardware.
+ * - In slave communication mode, closes TIM2's ITR10 gate on the SCIN callback
+ *   before invoking the user callback. CH2 alone opens the gate from a ZLI.
  *
  * - Executes the user-defined callback if it is not `NULL`.
  *
@@ -378,6 +380,10 @@ void _hrtim_callback()
     if (LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_NONE)
     {
         timer2_master_sync_event();
+    }
+    else if (LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT)
+    {
+        timer2_slave_sync_event();
     }
 #endif
     if (LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_NONE)

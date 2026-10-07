@@ -50,26 +50,6 @@ bool timer2_sync_enabled(void)
 	return timer2_master_mode || timer2_slave_mode;
 }
 
-/* Called only after TIM2 has accepted an ITR10 reset in hardware. */
-static void timer2_slave_sync_event(void)
-{
-	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
-	LL_TIM_ClearFlag_TRIG(TIM2);
-	LL_TIM_ClearFlag_CC2(TIM2);
-	LL_TIM_EnableIT_CC2(TIM2);
-	if (timer2_sync_acquiring)
-	{
-		LL_TIM_ClearFlag_CC1(TIM2);
-		if (timer2_sync_dma_armed)
-			LL_TIM_EnableDMAReq_CC1(TIM2);
-		if (timer2_sync_irq_armed)
-			LL_TIM_EnableIT_CC1(TIM2);
-		timer2_sync_dma_armed = false;
-		timer2_sync_irq_armed = false;
-		timer2_sync_acquiring = false;
-	}
-}
-
 bool timer2_master_sync_enabled(void)
 {
 	return timer2_master_mode;
@@ -121,9 +101,6 @@ static void timer_stm32_callback(const void* arg)
 
 	if (data->timer_struct == TIM2)
 	{
-		if (timer2_slave_mode && LL_TIM_IsEnabledIT_TRIG(TIM2) &&
-			LL_TIM_IsActiveFlag_TRIG(TIM2))
-			timer2_slave_sync_event();
 		if (timer2_sync_enabled() && LL_TIM_IsEnabledIT_CC2(TIM2) &&
 			LL_TIM_IsActiveFlag_CC2(TIM2))
 		{
@@ -520,14 +497,6 @@ static int timer2_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks,
 	/* Defer prepared TX until hardware has acquired a control boundary. */
 	timer2_sync_dma_armed = dma_armed;
 	timer2_sync_irq_armed = irq_armed;
-	if (!master)
-	{
-		/* Acquire the first local PWM rollover, then accept only the event
-		 * following CH2 at control_ticks - 3 us. PB1 remains closed.
-		 */
-		LL_TIM_EnableIT_TRIG(TIM2);
-		LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_COMBINED_RESETTRIGGER);
-	}
 	irq_enable(TIMER2_INTERRUPT_LINE);
 	return 0;
 #else
@@ -553,20 +522,21 @@ void timer2_compare_disarm(void)
 	timer2_sync_irq_armed = false;
 }
 
-void timer2_master_sync_event(void)
+static void timer2_sync_event(void)
 {
-	if (!timer2_master_mode)
+	if (!timer2_sync_enabled())
 		return;
 
 	/* Prevent the zero-latency CH2 handler from reopening the pin while
-	 * the repetition callback is closing the synchronization window.
+	 * the HRTIM repetition/SCIN callback is closing the sync window.
 	 */
 	LL_TIM_DisableIT_CC2(TIM2);
-	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
+	if (timer2_master_mode)
+		LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
 	LL_TIM_ClearFlag_CC2(TIM2);
 	if (!timer2_sync_started || !LL_TIM_IsActiveFlag_TRIG(TIM2))
 	{
-		/* Acquire phase from PWM resets until the next repetition callback.
+		/* Acquire phase from PWM resets until the next HRTIM callback.
 		 * Keep SCOUT closed and TX deferred. This also recovers a missed gate.
 		 */
 		timer2_sync_dma_armed |= LL_TIM_IsEnabledDMAReq_CC1(TIM2);
@@ -580,7 +550,7 @@ void timer2_master_sync_event(void)
 		return;
 	}
 
-	/* The hardware reset at the repetition boundary establishes the phase.
+	/* The accepted hardware reset establishes the boundary phase.
 	 * Close the internal gate before the next PWM event, then arm CH2.
 	 */
 	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
@@ -597,6 +567,18 @@ void timer2_master_sync_event(void)
 		timer2_sync_irq_armed = false;
 		timer2_sync_acquiring = false;
 	}
+}
+
+void timer2_master_sync_event(void)
+{
+	if (timer2_master_mode)
+		timer2_sync_event();
+}
+
+void timer2_slave_sync_event(void)
+{
+	if (timer2_slave_mode)
+		timer2_sync_event();
 }
 
 void timer2_sync_stop(void)

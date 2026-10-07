@@ -77,12 +77,15 @@ void timer2_master_sync_stop(void);
 bool timer2_master_sync_enabled(void);
 /* Slave synchronization uses Timer A resets on each master period event.
  * Configure the HRTIM critical task first. TIM2 runs continuously; CH2 opens
- * ITR10 reception 3 us before each control boundary. The trigger ZLI closes
- * reception after the accepted hardware reset, then rearms CH2. Acquisition
- * starts at the first local PWM rollover; TX is deferred until that reset.
+ * ITR10 reception 3 us before each control boundary. The HRTIM SCIN callback
+ * closes reception before the user callback, then rearms CH2. As in master
+ * mode, the first callback arms hardware phase acquisition with TX deferred;
+ * a subsequent callback with an accepted trigger ends acquisition. A missing
+ * trigger keeps reception open for reacquisition. No TIM2 trigger IRQ is used.
  * Slave mode never opens PB1. CH1 callbacks share the ZLI restrictions above.
  */
 int timer2_slave_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks);
+void timer2_slave_sync_event(void);
 bool timer2_sync_enabled(void);
 void timer2_sync_stop(void);
 /* Cancel CH1 including a transmission deferred during phase acquisition. */

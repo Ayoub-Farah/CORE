@@ -65,9 +65,10 @@ public:
 	 * and resets on each pulse. Timer A relays each local master rollover
 	 * through SYNCOUT to ITR10, with PB1 held low. Then create/start an HRTIM
 	 * critical task: TIM2 keeps counting, opens ITR10 from a ZLI 3 us before
-	 * each control boundary, and closes it from the accepted trigger ZLI.
-	 * The first local rollover acquires phase. Other ZLIs may delay the gate;
-	 * a missed rollover is acquired on the next available PWM event.
+	 * each control boundary, and closes it in the SCIN callback before the
+	 * critical task runs. The first SCIN callback arms hardware acquisition;
+	 * a subsequent callback with an accepted ITR10 trigger ends acquisition.
+	 * Other ZLIs may delay CH2; a missed trigger causes reacquisition.
 	 */
 	static void initSlave();
 };

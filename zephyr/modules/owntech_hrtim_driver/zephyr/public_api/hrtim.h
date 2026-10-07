@@ -511,7 +511,7 @@ void hrtim_PeriodicEvent_dis(hrtim_tu_t tu);
 /**
  * @brief Changes the repetition counter value to control the ISR interrupt
  * @return 0 on success, -EINVAL for invalid timing, -EBUSY for a running
- *         synchronized master. Stop the periodic event before changing it.
+ *         synchronized timer. Stop the periodic event before changing it.
  * @param tu_src timing unit which will be the source for the ISR:
  *                  `MSTR`, `TIMA`, `TIMB`, `TIMC`, `TIMD`, `TIME`, `TIMF`
  * @param repetion value between 1 and 256 for the repetition counter:

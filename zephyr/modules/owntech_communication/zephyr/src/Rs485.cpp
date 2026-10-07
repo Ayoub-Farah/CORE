@@ -412,15 +412,14 @@ int serial_sync_tx_config(uint32_t delay_us)
         return -ENODEV;
 
     bool master = LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_NONE;
-    uint32_t source = master ? LL_HRTIM_SYNCOUT_SRC_TIMA_START :
-                              LL_HRTIM_SYNCOUT_SRC_MASTER_START;
+    uint32_t source = LL_HRTIM_SYNCOUT_SRC_TIMA_START;
     if ((!master && LL_HRTIM_GetSyncInSrc(HRTIM1) != LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT) ||
         LL_HRTIM_GetSyncOutSrc(HRTIM1) != source ||
         LL_HRTIM_GetSyncOutConfig(HRTIM1) != LL_HRTIM_SYNCOUT_POSITIVE_PULSE)
         return -EINVAL;
-    if (master && !timer2_master_sync_enabled())
+    if (!timer2_sync_enabled())
         return -EAGAIN;
-    if (master && delay_us * 10U >= LL_TIM_OC_GetCompareCH2(TIM2))
+    if (delay_us * 10U >= LL_TIM_OC_GetCompareCH2(TIM2))
         return -EINVAL;
 
     if (LL_DMA_IsEnabledChannel(DMA_USART, LL_DMA_CHANNEL_TX) ||
@@ -493,10 +492,7 @@ void serial_sync_tx_stop()
     if (!sync_tx_configured)
         return;
 
-    /* Cancel only the TX compare request. The sync clock must keep its
-     * phase on slaves too: prepare() is called after SCIN in the user task.
-     * Reconfiguration stops/reinitializes TIM2 through timer_config().
-     */
+    /* Cancel TX without discarding the phase acquired from HRTIM sync. */
     timer2_compare_disarm();
     LL_DMA_DisableChannel(DMA2, LL_DMA_CHANNEL_1);
     LL_DMA_ClearFlag_GI1(DMA2);

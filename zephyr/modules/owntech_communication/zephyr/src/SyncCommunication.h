@@ -60,8 +60,14 @@ public:
 	/**
 	 * @brief Initialization synchronization as `SLAVE`,
 	 * 		  the slave receive the synchronization pulse.
-	 * HRTIM must be initialized first. The master waits for SCIN, resets on
-	 * each pulse, and relays its start/reset to TIM2 through ITR10.
+	 * Initialize PWM Timer A first at zero phase, in continuous mode, with
+	 * MASTER_PER as its only reset trigger. The HRTIM master waits for SCIN
+	 * and resets on each pulse. Timer A relays each local master rollover
+	 * through SYNCOUT to ITR10, with PB1 held low. Then create/start an HRTIM
+	 * critical task: TIM2 keeps counting, opens ITR10 from a ZLI 3 us before
+	 * each control boundary, and closes it from the accepted trigger ZLI.
+	 * The first local rollover acquires phase. Other ZLIs may delay the gate;
+	 * a missed rollover is acquired on the next available PWM event.
 	 */
 	static void initSlave();
 };

@@ -75,6 +75,16 @@ int timer2_master_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks);
 void timer2_master_sync_event(void);
 void timer2_master_sync_stop(void);
 bool timer2_master_sync_enabled(void);
+/* Slave synchronization uses Timer A resets on each master period event.
+ * Configure the HRTIM critical task first. TIM2 runs continuously; CH2 opens
+ * ITR10 reception 3 us before each control boundary. The trigger ZLI closes
+ * reception after the accepted hardware reset, then rearms CH2. Acquisition
+ * starts at the first local PWM rollover; TX is deferred until that reset.
+ * Slave mode never opens PB1. CH1 callbacks share the ZLI restrictions above.
+ */
+int timer2_slave_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks);
+bool timer2_sync_enabled(void);
+void timer2_sync_stop(void);
 /* Cancel CH1 including a transmission deferred during phase acquisition. */
 void timer2_compare_disarm(void);
 
@@ -144,7 +154,10 @@ struct timer_config_t
 	/* TIM2 only: CH1 compare delay after HRTIM ITR10, in microseconds.
 	 * Set timer_enable_irq and timer_irq_callback, or timer_enable_compare_dma.
 	 * Valid range: 1..429496729.
-	 * TIM2 waits for sync and stops after each compare; a new sync restarts it.
+	 * Configure the HRTIM critical task before configuring TIM2. Start arms
+	 * the compare without resetting the running control-period counter.
+	 * Delay must precede CH2 (control period minus 3 us). Prepare TX before
+	 * its compare deadline.
 	 * HRTIM synchronization output must be configured separately.
 	 */
 	uint32_t         timer_compare_t_usec;

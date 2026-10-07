@@ -132,19 +132,23 @@ void serial_synchronous_mode(uint16_t reception_size);
 
 /** @brief Configure TIM2 CH1 to start a prepared TX after HRTIM ITR10.
  * Reserves TIM2 and DMA2 channel 1. Call after RS485 configuration.
- * In master mode, first configure the HRTIM critical task so its control
- * period is known. Delay must precede the SCOUT opening compare.
+ * First configure the HRTIM critical task in either sync mode so its control
+ * period is known. Delay must precede the ITR10 opening compare.
  * Returns 0 on success or a negative errno.
  */
 int serial_sync_tx_config(uint32_t delay_us);
 
-/** @brief Prepare one TX for the next sync, without sending immediately.
+/** @brief Prepare one TX for the next synchronized compare.
  * Returns -EBUSY if a TX or prepared trigger is pending. Keep the TX buffer
  * unchanged until transmission completes. Call again to arm another message.
+ * In slave mode, prepare before the compare deadline of the desired period;
+ * preparation preserves the counter phased by the accepted HRTIM rollover.
  */
 int serial_sync_tx_prepare();
 
-/** @brief Cancel a pending synchronized TX; an active TX is not aborted. */
+/** @brief Cancel a pending synchronized TX, preserving the sync clock.
+ * An active TX is not aborted.
+ */
 void serial_sync_tx_stop();
 
 /**

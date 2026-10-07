@@ -61,8 +61,9 @@ void SyncCommunication::initMaster()
 
 void SyncCommunication::initSlave()
 {
-	timer2_master_sync_stop();
+	timer2_sync_stop();
 	LL_HRTIM_TIM_CounterDisable(HRTIM1, LL_HRTIM_TIMER_MASTER);
+	LL_HRTIM_TIM_CounterDisable(HRTIM1, LL_HRTIM_TIMER_A);
 
 	/* HRTIM synchronization input source */
 	LL_HRTIM_SetSyncInSrc(HRTIM1, LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT);
@@ -71,13 +72,22 @@ void SyncCommunication::initSlave()
 	 * when receiving a synchronization input event */
 	LL_HRTIM_TIM_EnableResetOnSync(HRTIM1, LL_HRTIM_TIMER_MASTER);
 	LL_HRTIM_TIM_EnableStartOnSync(HRTIM1, LL_HRTIM_TIMER_MASTER);
-	/* Relay each SCIN reset/start to the on-chip timers through ITR10. */
+	/* RM0440 28.3.19: MASTER_START does not provide a period-rollover
+	 * source. Timer A resets on MASTER_PER and emits SYNCOUT on each reset.
+	 * Initialize PWM Timer A at zero phase before entering slave mode.
+	 */
 	LL_HRTIM_ConfigSyncOut(HRTIM1,
 						   LL_HRTIM_SYNCOUT_POSITIVE_PULSE,
-						   LL_HRTIM_SYNCOUT_SRC_MASTER_START);
+						   LL_HRTIM_SYNCOUT_SRC_TIMA_START);
+
+	/* The internal SYNCOUT signal feeds ITR10 independently of PB1.
+	 * Keep the physical output closed in slave mode.
+	 */
+	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOB);
+	LL_GPIO_ResetOutputPin(GPIOB, LL_GPIO_PIN_1);
+	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
 
 	/* HRTIM_SCIN pin configuration */
-	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOB);
 
 #if defined(CONFIG_SHIELD_TWIST_V1_4_0) || \
 	defined(CONFIG_SHIELD_TWIST_V1_4_1) || \
@@ -103,5 +113,6 @@ void SyncCommunication::initSlave()
 	LL_GPIO_SetAFPin_0_7    (GPIOB, LL_GPIO_PIN_6, LL_GPIO_AF_12);
 #endif
 
+	LL_HRTIM_TIM_CounterEnable(HRTIM1, LL_HRTIM_TIMER_A);
 	LL_HRTIM_TIM_CounterEnable(HRTIM1, LL_HRTIM_TIMER_MASTER);
 }

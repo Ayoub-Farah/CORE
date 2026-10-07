@@ -117,7 +117,7 @@ class Rs485Communication
         /** @brief Configure interrupt-free synchronous RS485.
          * Configure before starting the critical task; stop it before
          * reconfiguring buffers or switching modes.
-         * Initialize HRTIM synchronization first; in master mode create the
+         * Initialize HRTIM synchronization first; in either sync mode create the
          * critical task first. TX is armed separately for each message.
          * rx_ring and rx_snapshot must each hold reception_size bytes and
          * must not overlap each other or TX. Keep all buffers alive.

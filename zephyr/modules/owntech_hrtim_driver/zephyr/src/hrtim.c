@@ -1419,15 +1419,24 @@ hrtim_adc_edgetrigger_t hrtim_adc_rollover_get(hrtim_tu_number_t tu_number)
  * microsecond period used by TaskAPI. TIM2 uses the same system-clock time
  * base as the existing TIM6/TIM7 driver on SPIN.
  */
-static int _configure_master_sync_timing(void)
+static int _configure_sync_timing(void)
 {
-    if (LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_NONE &&
+    uint32_t sync_in = LL_HRTIM_GetSyncInSrc(HRTIM1);
+    if ((sync_in == LL_HRTIM_SYNCIN_SRC_NONE ||
+         sync_in == LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT) &&
         LL_HRTIM_GetSyncOutConfig(HRTIM1) == LL_HRTIM_SYNCOUT_POSITIVE_PULSE &&
         LL_HRTIM_GetSyncOutSrc(HRTIM1) == LL_HRTIM_SYNCOUT_SRC_TIMA_START)
     {
 #ifdef CONFIG_OWNTECH_TIMER_DRIVER
         if (!(LL_HRTIM_TIM_GetResetTrig(HRTIM1, TIMA) & LL_HRTIM_RESETTRIG_MASTER_PER))
-            return -1;
+            return -EINVAL;
+        if (sync_in == LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT &&
+            (LL_HRTIM_TIM_GetResetTrig(HRTIM1, TIMA) != LL_HRTIM_RESETTRIG_MASTER_PER ||
+             LL_HRTIM_TIM_GetCounterMode(HRTIM1, TIMA) != LL_HRTIM_MODE_CONTINUOUS ||
+             LL_HRTIM_TIM_IsEnabledStartOnSync(HRTIM1, TIMA) ||
+             LL_HRTIM_TIM_IsEnabledResetOnSync(HRTIM1, TIMA) ||
+             !(HRTIM1->sMasterRegs.MCR & HRTIM_MCR_TACEN)))
+            return -EINVAL;
         uint64_t pwm_ticks = (uint64_t)LL_HRTIM_TIM_GetPeriod(HRTIM1, MSTR)
             * (1U << LL_HRTIM_TIM_GetPrescaler(HRTIM1, MSTR))
             * CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC;
@@ -1437,6 +1446,8 @@ static int _configure_master_sync_timing(void)
             (LL_HRTIM_TIM_GetRepetition(HRTIM1, MSTR) + 1U) / divisor;
         if (control_ticks >= UINT32_MAX)
             return -1;
+        if (sync_in == LL_HRTIM_SYNCIN_SRC_EXTERNAL_EVENT)
+            return timer2_slave_sync_configure(control_ticks, pwm_ticks / divisor);
         return timer2_master_sync_configure(control_ticks, pwm_ticks / divisor);
 #else
         return -ENODEV;
@@ -1457,7 +1468,7 @@ int hrtim_PeriodicEvent_configure(hrtim_tu_t tu, uint32_t repetition,
 
 int hrtim_PeriodicEvent_en(hrtim_tu_t tu)
 {
-    int result = tu == MSTR ? _configure_master_sync_timing() : 0;
+    int result = tu == MSTR ? _configure_sync_timing() : 0;
     if (result != 0)
         return result;
     if (LL_HRTIM_GetSyncInSrc(HRTIM1) == LL_HRTIM_SYNCIN_SRC_NONE)
@@ -1488,7 +1499,7 @@ int hrtim_PeriodicEvent_en(hrtim_tu_t tu)
 void hrtim_PeriodicEvent_dis(hrtim_tu_t tu)
 {
 #ifdef CONFIG_OWNTECH_TIMER_DRIVER
-    timer2_master_sync_stop();
+    timer2_sync_stop();
 #endif
     irq_disable(HRTIM_IRQ_NUMBER);
     /* Disabling the interrupt on repetition counter event */
@@ -1502,13 +1513,13 @@ int hrtim_PeriodicEvent_SetRep(hrtim_tu_t tu, uint32_t repetition)
         return -EINVAL;
 #ifdef CONFIG_OWNTECH_TIMER_DRIVER
     /* Changing a live repetition preload would leave TIM2 on the old phase. */
-    if (tu == MSTR && timer2_master_sync_enabled() &&
-        LL_HRTIM_IsEnabledIT_REP(HRTIM1, MSTR))
+    if (tu == MSTR && timer2_sync_enabled() &&
+        (LL_HRTIM_IsEnabledIT_REP(HRTIM1, MSTR) || LL_HRTIM_IsEnabledIT_SYNC(HRTIM1)))
         return -EBUSY;
 #endif
     uint32_t previous = LL_HRTIM_TIM_GetRepetition(HRTIM1, tu);
     LL_HRTIM_TIM_SetRepetition(HRTIM1, tu, repetition - 1U);
-    int result = tu == MSTR ? _configure_master_sync_timing() : 0;
+    int result = tu == MSTR ? _configure_sync_timing() : 0;
     if (result != 0)
         LL_HRTIM_TIM_SetRepetition(HRTIM1, tu, previous);
     return result;

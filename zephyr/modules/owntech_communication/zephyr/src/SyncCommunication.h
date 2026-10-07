@@ -49,10 +49,10 @@ public:
 	 * 		  the master send the synchronization pulse.
 	 * Initialize PWM Timer A first: it must reset on the master period event.
 	 * Then create/start an HRTIM critical task. TIM2 CH2 opens SCOUT and ITR10
-	 * 1 us before each boundary; the repetition ISR closes them. The first ISR
+	 * 3 us before each boundary; the repetition ISR closes them. The first ISR
 	 * arms hardware phase acquisition with SCOUT closed and TX deferred; the
 	 * next ISR ends acquisition. CH2 uses a zero-latency ISR and can preempt
-	 * the control task. It must execute within its 1 us lead; other zero-latency
+	 * the control task. It must execute within its 3 us lead; other zero-latency
 	 * ISRs can still delay it. A missed trigger reacquires phase.
 	 */
 	static void initMaster();

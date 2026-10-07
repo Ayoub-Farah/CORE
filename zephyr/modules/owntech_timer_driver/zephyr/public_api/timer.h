@@ -67,6 +67,7 @@ extern "C" {
  * Configure before starting the critical task. The first repetition callback
  * arms phase acquisition from PWM resets with SCOUT closed and TX deferred.
  * The next callback closes ITR10; subsequent CH2 events open the sync window.
+ * CH2 is scheduled 3 us before the boundary; the PWM period must exceed 3 us.
  * Master mode uses a zero-latency ISR. Any TIM2 CH1 user callback sharing
  * this interrupt must not call Zephyr kernel APIs.
  */

@@ -160,7 +160,7 @@ class Rs485Communication
         /** @brief Configure TX delay after a sync/control boundary.
          * Call configure() and initSlave() or initMaster() first.
          * For master mode, create the HRTIM critical task before this call.
-         * Its delay must be less than the control period minus 1 us.
+         * Its delay must be less than the control period minus 3 us.
          * Uses TIM2 CH1 and DMA2 channel 1. Returns 0 or a negative errno.
          */
         int configureSynchronizedTransmission(uint32_t delay_us);

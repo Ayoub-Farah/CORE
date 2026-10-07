@@ -32,6 +32,11 @@
 #include "stm32_timer_driver.h"
 #include <errno.h>
 
+/* The ZLI handler reaches PB1 about 1.44 us after CH2 on SPIN.
+ * Allow 3 us so SCOUT and ITR10 open before the control boundary.
+ */
+#define TIMER2_MASTER_SYNC_LEAD_TICKS 30U
+
 static bool timer2_master_mode = false;
 static bool timer2_master_started = false;
 static bool timer2_master_acquiring = false;
@@ -451,24 +456,25 @@ int timer2_master_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks)
 {
 #if DT_NODE_HAS_STATUS(TIMER2_NODE, okay)
 	const struct device* dev = DEVICE_DT_GET(TIMER2_DEVICE);
-	/* Fixed 1 us lead. It must fit entirely between two PWM events. */
+	/* The opening lead must fit entirely between two PWM events. */
 	if (!device_is_ready(dev))
 		return -ENODEV;
-	if (control_ticks <= 10U || pwm_ticks <= 10U || control_ticks == UINT32_MAX)
+	if (control_ticks <= TIMER2_MASTER_SYNC_LEAD_TICKS ||
+		pwm_ticks <= TIMER2_MASTER_SYNC_LEAD_TICKS || control_ticks == UINT32_MAX)
 		return -EINVAL;
 
 	bool dma_armed = LL_TIM_IsEnabledDMAReq_CC1(TIM2) || timer2_master_dma_armed;
 	bool irq_armed = LL_TIM_IsEnabledIT_CC1(TIM2) || timer2_master_irq_armed;
 	struct stm32_timer_driver_data* data = dev->data;
 	if (data->timer_mode == synchronized_compare &&
-		data->timer_compare_usec * 10U >= control_ticks - 10U)
+		data->timer_compare_usec * 10U >= control_ticks - TIMER2_MASTER_SYNC_LEAD_TICKS)
 		return -EINVAL;
 	/**
 	 * Disable interrupts before configuring
 	 */
 	irq_disable(TIMER2_INTERRUPT_LINE);
 	timer2_master_sync_stop();
-	timer2_master_open_ticks = control_ticks - 10U;
+	timer2_master_open_ticks = control_ticks - TIMER2_MASTER_SYNC_LEAD_TICKS;
 	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
 	LL_TIM_DisableCounter(TIM2);
 	LL_TIM_DisableIT_CC1(TIM2);

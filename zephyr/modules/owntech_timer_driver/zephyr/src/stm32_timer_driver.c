@@ -461,6 +461,10 @@ int timer2_master_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks)
 	if (data->timer_mode == synchronized_compare &&
 		data->timer_compare_usec * 10U >= control_ticks - 10U)
 		return -EINVAL;
+	/**
+	 * Disable interrupts before configuring
+	 */
+	irq_disable(TIMER2_INTERRUPT_LINE);
 	timer2_master_sync_stop();
 	timer2_master_open_ticks = control_ticks - 10U;
 	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);

@@ -474,12 +474,14 @@ static int timer2_sync_configure(uint32_t control_ticks, uint32_t pwm_ticks,
 	LL_TIM_DisableIT_CC2(TIM2);
 	LL_TIM_DisableIT_TRIG(TIM2);
 	LL_TIM_DisableDMAReq_CC1(TIM2);
-	/* Slave keeps counting until the selected hardware reset. A late event
-	 * must not stop TIM2 or cause a software-generated phase reset.
+	/* Keep both modes counting until the selected hardware reset. With a
+	 * one-pulse master, overflow near the next control boundary can clear
+	 * CEN after the trigger starts the counter, losing the next CH1/CH2
+	 * compares and forcing phase reacquisition. CH2 and the HRTIM callback
+	 * gate the resets; ARR must not introduce another period boundary.
 	 */
-	LL_TIM_SetOnePulseMode(TIM2, master ? LL_TIM_ONEPULSEMODE_SINGLE :
-							  LL_TIM_ONEPULSEMODE_REPETITIVE);
-	LL_TIM_SetAutoReload(TIM2, master ? control_ticks : UINT32_MAX);
+	LL_TIM_SetOnePulseMode(TIM2, LL_TIM_ONEPULSEMODE_REPETITIVE);
+	LL_TIM_SetAutoReload(TIM2, UINT32_MAX);
 	LL_TIM_OC_SetMode(TIM2, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_FROZEN);
 	LL_TIM_OC_SetCompareCH2(TIM2, timer2_sync_open_ticks);
 	LL_TIM_GenerateEvent_UPDATE(TIM2);

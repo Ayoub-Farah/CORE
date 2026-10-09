@@ -72,8 +72,13 @@ void SyncCommunication::initSlave()
 	 * when receiving a synchronization input event */
 	LL_HRTIM_TIM_EnableResetOnSync(HRTIM1, LL_HRTIM_TIMER_MASTER);
 	LL_HRTIM_TIM_EnableStartOnSync(HRTIM1, LL_HRTIM_TIMER_MASTER);
+	/* SCIN must reset Timer A directly as well: resetting the master just
+	 * before its rollover can suppress MASTER_PER at this boundary. Timer A's
+	 * reset supplies SYNCOUT/ITR10 so TIM2 does not defer the slave's TX.
+	 */
+	LL_HRTIM_TIM_EnableResetOnSync(HRTIM1, LL_HRTIM_TIMER_A);
 	/* RM0440 28.3.19: MASTER_START does not provide a period-rollover
-	 * source. Timer A resets on MASTER_PER and emits SYNCOUT on each reset.
+	 * source. Timer A resets on MASTER_PER and SCIN, emitting SYNCOUT on reset.
 	 * Initialize PWM Timer A at zero phase before entering slave mode.
 	 */
 	LL_HRTIM_ConfigSyncOut(HRTIM1,

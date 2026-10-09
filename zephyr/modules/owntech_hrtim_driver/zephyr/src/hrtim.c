@@ -1440,7 +1440,7 @@ static int _configure_sync_timing(void)
             (LL_HRTIM_TIM_GetResetTrig(HRTIM1, TIMA) != LL_HRTIM_RESETTRIG_MASTER_PER ||
              LL_HRTIM_TIM_GetCounterMode(HRTIM1, TIMA) != LL_HRTIM_MODE_CONTINUOUS ||
              LL_HRTIM_TIM_IsEnabledStartOnSync(HRTIM1, TIMA) ||
-             LL_HRTIM_TIM_IsEnabledResetOnSync(HRTIM1, TIMA) ||
+             !LL_HRTIM_TIM_IsEnabledResetOnSync(HRTIM1, TIMA) ||
              !(HRTIM1->sMasterRegs.MCR & HRTIM_MCR_TACEN)))
             return -EINVAL;
         uint64_t pwm_ticks = (uint64_t)LL_HRTIM_TIM_GetPeriod(HRTIM1, MSTR)

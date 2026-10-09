@@ -506,15 +506,17 @@ serial_interface_menu_mode mode = IDLEMODE;
 
 /* [us] period of the control task (=critical task) */
 static constexpr uint32_t control_task_period = 200; // µs
-/* Delay from SCOUT/SCIN boundary: lead=60 us, SM1=72 us, ..., SM10=180 us.
- * The lead must prepare TX before 60 us; all control work must finish before
- * the master's SCOUT gate opens at 199 us. Verify these deadlines on hardware.
+/* Delay from SCOUT/SCIN boundary: lead=90 us, SM1=98 us, ..., SM10=170 us.
+ * The measured lead DMA rearm finishes around 65 us. Allow preparation margin
+ * before its slot, then leave a quiet interval before the sync gate at 197 us.
+ * Keep every module on this same slot schedule. Verify POWER-mode deadlines
+ * on hardware; a 200 us task period does not guarantee an earlier TX deadline.
  * Keep the existing SPEED_20M baud/oversampling settings (21.25 Mbit/s).
  */
 constexpr uint32_t MMC_RS485_BASE_BAUD = 10625000;
 constexpr uint32_t MMC_RS485_WIRE_BAUD = 2 * MMC_RS485_BASE_BAUD;
-constexpr uint32_t MMC_SLOT_FIRST_US = 60;
-constexpr uint32_t MMC_SLOT_SPACING_US = 12;
+constexpr uint32_t MMC_SLOT_FIRST_US = 90;
+constexpr uint32_t MMC_SLOT_SPACING_US = 8;
 constexpr uint32_t MMC_SLOT_GUARD_US = 4;
 constexpr uint32_t MMC_QUIET_US = 10;
 constexpr uint32_t MMC_TX_WIRE_US =
@@ -523,7 +525,7 @@ constexpr uint32_t MMC_TX_WIRE_US =
 static_assert(MMC_TX_WIRE_US + MMC_SLOT_GUARD_US <= MMC_SLOT_SPACING_US,
               "RS485 slot needs frame time plus DE/clock guard time");
 static_assert(MMC_SLOT_FIRST_US + MMC_SM_COUNT * MMC_SLOT_SPACING_US +
-              MMC_TX_WIRE_US + MMC_SLOT_GUARD_US + MMC_QUIET_US < control_task_period - 1,
+              MMC_TX_WIRE_US + MMC_SLOT_GUARD_US + MMC_QUIET_US < control_task_period - 3,
               "RS485 slots must finish before the next synchronization gate");
 static float32_t Ts = control_task_period * 1e-6F; // s
 /* [bool] state of the PWM (ctrl task) */
@@ -906,9 +908,8 @@ void setup_routine()
         printk("Unable to configure synchronous RS485: %d\n", result);
         return;
     }
-    /* Prime before SCIN: the current slave driver arms for the next pulse.
-     * Later prepares use the same API; a pending TX is left intact. Verify
-     * per-cycle slave rearming separately before changing driver behavior.
+    /* Prime before SCIN; its direct Timer A reset establishes the boundary.
+     * Later prepares use the same API; a pending TX is left intact.
      */
     mmc_prepare_transmission();
     task.startCritical();

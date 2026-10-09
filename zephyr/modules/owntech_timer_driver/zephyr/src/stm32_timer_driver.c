@@ -588,7 +588,11 @@ void timer2_sync_stop(void)
 
 	LL_TIM_DisableIT_CC2(TIM2);
 	LL_TIM_DisableIT_TRIG(TIM2);
-	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
+	/* Only the master drives TWIST's shared SYNC line. A stopped slave
+	 * must leave SCOUT high impedance, including during reconfiguration.
+	 */
+	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1,
+					   timer2_master_mode ? LL_GPIO_MODE_OUTPUT : LL_GPIO_MODE_INPUT);
 	LL_TIM_SetSlaveMode(TIM2, LL_TIM_SLAVEMODE_DISABLED);
 	LL_TIM_ClearFlag_CC2(TIM2);
 	LL_TIM_ClearFlag_TRIG(TIM2);

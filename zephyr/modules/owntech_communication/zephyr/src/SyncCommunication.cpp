@@ -81,11 +81,12 @@ void SyncCommunication::initSlave()
 						   LL_HRTIM_SYNCOUT_SRC_TIMA_START);
 
 	/* The internal SYNCOUT signal feeds ITR10 independently of PB1.
-	 * Keep the physical output closed in slave mode.
+	 * TWIST connects SCOUT and SCIN to the shared SYNC line. Leave SCOUT
+	 * high impedance on the slave so it cannot clamp the master's pulses.
 	 */
 	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOB);
-	LL_GPIO_ResetOutputPin(GPIOB, LL_GPIO_PIN_1);
-	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_OUTPUT);
+	LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_1, LL_GPIO_MODE_INPUT);
+	LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_1, LL_GPIO_PULL_NO);
 
 	/* HRTIM_SCIN pin configuration */
 

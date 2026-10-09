@@ -131,7 +131,7 @@ uint16_t serial_rx_write_position();
 void serial_synchronous_mode(uint16_t reception_size);
 
 /** @brief Configure TIM2 CH1 to start a prepared TX after HRTIM ITR10.
- * Reserves TIM2 and DMA2 channel 1. Call after RS485 configuration.
+ * Reserves TIM2 and DMA1 channel 8. Call after RS485 configuration.
  * First configure the HRTIM critical task in either sync mode so its control
  * period is known. Delay must precede the ITR10 opening compare.
  * Returns 0 on success or a negative errno.

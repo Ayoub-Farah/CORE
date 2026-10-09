@@ -92,7 +92,7 @@ static bool synchronous_mode = false;
 
 /* TIM2 CH1 performs one word write to enable the USART-paced TX channel.
  * DMA1 channels 1..5 are used by ADC acquisition, 6..7 by USART3.
- * DMA2 channel 1 is reserved for this trigger and has no enabled IRQs.
+ * DMA1 channel 8 is reserved for this trigger and has no enabled IRQs.
  */
 static uint32_t sync_tx_enable;
 static bool tx_configured = false;
@@ -301,10 +301,8 @@ void dma_channel_init_tx()
 
     /* DMA data size */
     LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_TX, dma_buffer_size);
-    /* DMA channel priority */
-    LL_DMA_SetChannelPriorityLevel(DMA_USART,
-                                   LL_DMA_CHANNEL_TX,
-                                   LL_DMA_PRIORITY_VERYHIGH);
+    /* LL_DMA_Init writes the priority along with the channel settings. */
+    DMA_InitStruct.Priority = LL_DMA_PRIORITY_VERYHIGH;
 
     LL_DMA_Init(DMA_USART, LL_DMA_CHANNEL_TX, &DMA_InitStruct);
 
@@ -354,10 +352,8 @@ void dma_channel_init_rx()
 
     /* DMA data size */
     LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_RX, rx_buffer_size);
-    /* DMA channel priority */
-    LL_DMA_SetChannelPriorityLevel(DMA_USART,
-                                   LL_DMA_CHANNEL_RX,
-                                   LL_DMA_PRIORITY_VERYHIGH);
+    /* LL_DMA_Init writes the priority along with the channel settings. */
+    DMA_InitStruct.Priority = LL_DMA_PRIORITY_VERYHIGH;
 
     LL_DMA_Init(DMA_USART, LL_DMA_CHANNEL_RX, &DMA_InitStruct);
 
@@ -426,8 +422,8 @@ int serial_sync_tx_config(uint32_t delay_us)
         !LL_USART_IsActiveFlag_TC(USART3))
         return -EBUSY;
 
-    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_DMA2);
-    if (!sync_tx_configured && LL_DMA_IsEnabledChannel(DMA2, LL_DMA_CHANNEL_1))
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_DMA1);
+    if (!sync_tx_configured && LL_DMA_IsEnabledChannel(DMA1, LL_DMA_CHANNEL_8))
         return -EBUSY;
 
     serial_sync_tx_stop();
@@ -443,11 +439,11 @@ int serial_sync_tx_config(uint32_t delay_us)
     DMA_InitStruct.PeriphRequest = LL_DMAMUX_REQ_TIM2_CH1;
     DMA_InitStruct.NbData = 1;
     DMA_InitStruct.Priority = LL_DMA_PRIORITY_VERYHIGH;
-    LL_DMA_Init(DMA2, LL_DMA_CHANNEL_1, &DMA_InitStruct);
-    LL_DMA_DisableIT_TC(DMA2, LL_DMA_CHANNEL_1);
-    LL_DMA_DisableIT_HT(DMA2, LL_DMA_CHANNEL_1);
-    LL_DMA_DisableIT_TE(DMA2, LL_DMA_CHANNEL_1);
-    LL_DMA_ClearFlag_GI1(DMA2);
+    LL_DMA_Init(DMA1, LL_DMA_CHANNEL_8, &DMA_InitStruct);
+    LL_DMA_DisableIT_TC(DMA1, LL_DMA_CHANNEL_8);
+    LL_DMA_DisableIT_HT(DMA1, LL_DMA_CHANNEL_8);
+    LL_DMA_DisableIT_TE(DMA1, LL_DMA_CHANNEL_8);
+    LL_DMA_ClearFlag_GI8(DMA1);
 
     struct timer_config_t timer_cfg = {0};
     timer_cfg.timer_compare_t_usec = delay_us;
@@ -466,8 +462,8 @@ int serial_sync_tx_prepare()
     /* Completion is checked rather than CNDTR: the count can reach zero
      * before the peripheral write enabling TX has finished.
      */
-    if ((LL_DMA_IsEnabledChannel(DMA2, LL_DMA_CHANNEL_1) &&
-         !LL_DMA_IsActiveFlag_TC1(DMA2)) ||
+    if ((LL_DMA_IsEnabledChannel(DMA1, LL_DMA_CHANNEL_8) &&
+         !LL_DMA_IsActiveFlag_TC8(DMA1)) ||
         LL_DMA_IsEnabledChannel(DMA_USART, LL_DMA_CHANNEL_TX) ||
         !LL_USART_IsActiveFlag_TC(USART3))
         return -EBUSY;
@@ -479,10 +475,10 @@ int serial_sync_tx_prepare()
     LL_DMA_SetDataLength(DMA_USART, LL_DMA_CHANNEL_TX, dma_buffer_size);
     /* Snapshot all channel settings, adding only the enable bit. */
     sync_tx_enable = DMA1_Channel6->CCR | DMA_CCR_EN;
-    LL_DMA_ClearFlag_GI1(DMA2);
-    LL_DMA_SetDataLength(DMA2, LL_DMA_CHANNEL_1, 1);
+    LL_DMA_ClearFlag_GI8(DMA1);
+    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_8, 1);
     __DMB();
-    LL_DMA_EnableChannel(DMA2, LL_DMA_CHANNEL_1);
+    LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_8);
     timer_start(timer2);
     return 0;
 }
@@ -494,8 +490,8 @@ void serial_sync_tx_stop()
 
     /* Cancel TX without discarding the phase acquired from HRTIM sync. */
     timer2_compare_disarm();
-    LL_DMA_DisableChannel(DMA2, LL_DMA_CHANNEL_1);
-    LL_DMA_ClearFlag_GI1(DMA2);
+    LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_8);
+    LL_DMA_ClearFlag_GI8(DMA1);
 }
 
 /* Poll completion in synchronous mode; USART TC remains set until next TX. */
@@ -530,7 +526,7 @@ uint32_t serial_poll_errors()
         errors |= RS485_ERROR_RX_DMA;
     if (LL_DMA_IsActiveFlag_TE6(DMA_USART))
         errors |= RS485_ERROR_TX_DMA;
-    if (sync_tx_configured && LL_DMA_IsActiveFlag_TE1(DMA2))
+    if (sync_tx_configured && LL_DMA_IsActiveFlag_TE8(DMA1))
         errors |= RS485_ERROR_TRIGGER_DMA;
 
     if (errors & (RS485_ERROR_TX_DMA | RS485_ERROR_TRIGGER_DMA))
@@ -565,8 +561,8 @@ bool serial_tx_busy()
 {
     serial_tx_poll();
     return (sync_tx_configured &&
-            LL_DMA_IsEnabledChannel(DMA2, LL_DMA_CHANNEL_1) &&
-            !LL_DMA_IsActiveFlag_TC1(DMA2)) ||
+            LL_DMA_IsEnabledChannel(DMA1, LL_DMA_CHANNEL_8) &&
+            !LL_DMA_IsActiveFlag_TC8(DMA1)) ||
         (tx_configured && (LL_DMA_IsEnabledChannel(DMA_USART, LL_DMA_CHANNEL_TX) ||
          !LL_USART_IsActiveFlag_TC(USART3)));
 }
